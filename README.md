@@ -1,5 +1,7 @@
-# MemKeys (working name - brainstorm in progress)
+# MemKeys
 
 The attribute-based memory server: facts keyed by agent-supplied attributes, temporal validity, graph+vector as derived views, open contract, pluggable backends (Grail plugin as reference).
 
-Design home: Paperclip study ISI-5800. Project name under brainstorm.
+**Keyed-first invariant:** attribute keys bound the candidate set before any vector/graph work; the keyed/temporal store is the single source of truth; graph and vector are derived, rebuildable projections.
+
+See [`docs/architecture.md`](docs/architecture.md) for the architecture baseline — the landing pad for the WS-1…WS-6 ADRs.
