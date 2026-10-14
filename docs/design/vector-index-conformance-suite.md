@@ -128,7 +128,7 @@ Run over a **recording stub adapter** that returns scripted `ScoredID` lists (wi
 - **Assert:** final score = `Σ_i w_i / (k_rrf + rank_i)` with `k_rrf = 60`, equal default weights — the fact accumulates **both** contributions; a high-ranked digest boosts all its members. **Pass:** cross-tier ordering matches the formula exactly.
 
 ### CG-S3 — Over-fetch + final-k truncation (M4)
-- **Assert:** each tier over-fetched to `max(k, ceil(k · overfetch))` (default `overfetch ≈ 4`) before fusion; digests exploded to members; scores accumulated by `fact.id`; cross-tier de-dup; **then** truncate to final `k`. **Pass:** final list length == k, contains the true top-k by accumulated score (not top-k of either single tier).
+- **Assert the mechanism, not the constant:** each tier is over-fetched to `max(k, ceil(k · overfetch))` **for whatever `overfetch` is configured** before fusion; digests exploded to members; scores accumulated by `fact.id`; cross-tier de-dup; **then** truncate to final `k`. `overfetch` is a **server knob** — its shipped **default is ~4 (documentation, not an asserted literal)**; the gate drives it from config and asserts the over-fetch→explode→accumulate→truncate ordering holds at the configured value, so retuning the default never breaks the gate. **Pass:** final list length == k, contains the true top-k by accumulated score (not top-k of either single tier).
 
 ### CG-S4 — Never fuse across incomparable generations (H4, server half)
 - **Setup:** stub returns `gen1` and `gen2` `ScoredID`s for one query during a generation transition.
