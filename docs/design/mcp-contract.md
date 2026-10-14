@@ -518,7 +518,12 @@ are the spec owner's call (Winston); the Challenger filed descriptions only.
 - **F1 + F7 → WS-4 Invariant T (ISI-5869):** the principal-salt in the `fact_id` derivation and the
   supersede-target ownership check are properties of the *write/identity contract*, not just its MCP face. The
   MCP spec states them; WS-4 must make them Invariant-T-level guarantees so every surface (not just MCP)
-  inherits them. A follow-up is routed to ISI-5869.
+  inherits them. **RECONCILED (ISI-5889, 2026-10-14):** Invariant T now formally defined in
+  `architecture.md` §7.6 (T1 principal-salted/body-complete `fact.id` at §6 stage 1; T2 fail-closed
+  supersede-ownership at §6 stage 3); §9 decision-log entry 13.
 - **F5 + F6 → storage/pipeline (WS-4 §5.4.2 vector record + WS-3 summarizer):** the vector record must carry
   `tenant_id` and the digest rollup must be tenant-partitioned. The MCP contract *requires* these; the
-  owning docs must reflect them or the MCP isolation guarantee is unbacked.
+  owning docs must reflect them or the MCP isolation guarantee is unbacked. **RECONCILED (ISI-5889,
+  2026-10-14):** fact-vector record carries mandatory `tenant_id` + tenant-partitioned index
+  (`architecture.md` §5.4.2, §6 stage 5b); digest rollup tenant-qualified `(tenant_id, scope, scope_id)`
+  (§5.4.2, §6 stage 5c) and mirrored in the WS-3 summarizer contract (ADR-llm-pipeline Decision 2b).

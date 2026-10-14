@@ -281,6 +281,13 @@ provenance.principal, provenance.custody, provenance.trace_id, provenance.source
 keyed              // bool — false ⇒ semantic-only
 ```
 
+**`tenant_id` is the isolation key.** It is a component of the verified `provenance.principal`
+(server-stamped, never client-asserted, §3) and is the identity floor for Invariant T (§7.6):
+it is a mandatory input to the `fact.id` derivation (T1), the ownership boundary for
+`supersedes` (T2), and the partition key carried onto every derived projection — the graph edge
+rows (ADR-GRAPH, `tenant` column), the fact-vector records, and the digest rollups (§5.4.2).
+The derived tiers carry it explicitly because provenance is not projected onto them.
+
 **Append-only is a feature, not a limitation.** Grail records are immutable, so we do
 **not** mutate a prior fact to close its validity window. Instead:
 
@@ -421,15 +428,27 @@ deployments that only want precision search, violating the minimal-deployment pr
 
 When the module is enabled:
 - **Fact tier.** On each successful keyed write, the server enqueues `embed(fact.id, fact.body)`
-  (idempotent on `fact.id`). The fact-vector store holds `{fact.id, embedding, entity.*,
-  fact.type, derivation_version}` — **keys and vector only, never body text**.
+  (idempotent on `fact.id`). The fact-vector store holds `{fact.id, tenant_id, embedding,
+  entity.*, fact.type, derivation_version}` — **keys and vector only, never body text**.
+  `tenant_id` is mandatory on the record (Challenger F5, ISI-5878): the index MUST be
+  **tenant-partitioned, or the scope step MUST resolve to a hard id-set pre-filter** that is
+  applied *before* the ANN pass. A post-filtering HNSW/IVF index that ranks globally then drops
+  foreign hits does **not** satisfy "scope before the ANN pass" (§7.4) and is non-conformant —
+  the tenant boundary must bound the candidate set, not trim the result set.
 - **Digest tier** *(if `memory.semantic.digest` on).* The async scope-rollup summarizer (§5.5,
   pipeline stage 5c) produces one digest per `(scope, scope_id)` — e.g. per thread, per run,
   per entity — re-rolled as member facts arrive (debounced; not per-write). The digest-vector
-  store holds `{digest.id, scope, scope_id, embedding, member_fact_ids[], story_id,
+  store holds `{digest.id, tenant_id, scope, scope_id, embedding, member_fact_ids[], story_id,
   derivation_version}`. `member_fact_ids` is the resolve-down path that enforces the R1
   invariant; `story` is the server-generated processing-lineage artifact (§5.5), kept distinct
   from envelope provenance per the ISI-5801 ruling.
+  **Digest rollup is tenant-partitioned (Challenger F6, ISI-5878; WS-3 summarizer owner).**
+  `(scope, scope_id)` is **always tenant-qualified** — the rollup key is effectively
+  `(tenant_id, scope, scope_id)` — so the summarizer can never sweep two tenants' member facts
+  into one digest, story, or embedding. This is a hard precondition, not a post-check: because
+  `memory.recall` returns the digest `summary` text *directly* (MCP contract §3.4), a
+  cross-tenant rollup would leak before any member-fact id check runs. A digest's
+  `member_fact_ids` MUST all share the digest's `tenant_id`.
 - On disable (either flag), the affected index is dropped; re-enable triggers a replay/rebuild
   from `agentmesh_facts` (fact tier) and a re-rollup (digest tier).
 
@@ -551,12 +570,18 @@ only — an agent's write latency never depends on embedding, summarization, or 
 5-stage artifact is stamped with `derivation_version` (§5.5).
 
 1. **Normalize.** Validate envelope schema; canonicalize `fact.type`; stamp `ingested_at`;
-   assign `fact.id` (stable, idempotency key so retried flushes don't duplicate).
+   assign `fact.id` by the **principal-salted, body-complete derivation of Invariant T
+   (§7.6)** — a stable idempotency key so retried flushes don't duplicate, yet never
+   collidable across principals.
 2. **Key.** Resolve entity keys per §4 (verify → enrich → accept-low-trust). Mark `keyed`.
    Attach rejected hints.
 3. **Temporalize.** Set the event-time axis (`fact.event_time` or `emitted_at`). If
-   `supersedes` is set, validate the target shares `(entity, subject, type)`. Compute no
-   write-back — supersession is read-time (§5.1).
+   `supersedes` is set, apply the **Invariant T (§7.6) supersede-ownership check first**:
+   the target fact MUST be owned by the caller's tenant, else fail closed with `not_found`
+   (never a distinguishable permission error) — only then validate the target shares
+   `(entity, subject, type)`. Cross-agent-within-tenant supersession is allowed and
+   attributed; cross-tenant supersession is impossible. Compute no write-back —
+   supersession is read-time (§5.1).
 4. **Commit (keyed write).** Write the authoritative record into `agentmesh_facts` (Grail
    ingest). This is the **commit point**: `ack` is sent to the client as soon as this
    succeeds. The client is never blocked on derived-view maintenance.
@@ -568,16 +593,19 @@ only — an agent's write latency never depends on embedding, summarization, or 
      `temporal` bucket edge; write `a2a_participant` edge for resolved A2A counterparts. All
      idempotent on `fact.id` so retries are safe.
    - **5b — Fact-vector embedding** *(if `memory.semantic` enabled).* Enqueue
-     `embed(fact.id, fact.body)` to the configured embedder; write `{fact.id, embedding,
-     entity.*, fact.type, derivation_version}` to the fact-vector tier. Idempotent on `fact.id`.
+     `embed(fact.id, fact.body)` to the configured embedder; write `{fact.id, tenant_id,
+     embedding, entity.*, fact.type, derivation_version}` to the fact-vector tier —
+     `tenant_id` mandatory, index tenant-partitioned (§5.4.2, F5). Idempotent on `fact.id`.
      Skipped entirely when the module is disabled — no stub written.
    - **5c — Digest rollup** *(if `memory.semantic.digest` enabled).* Mark the fact's owning
      scopes (thread / run / entity) dirty and enqueue a **debounced** per-scope rollup — the
      summarizer regenerates the scope's digest + "story" lineage from its current member facts,
      the embedder embeds the summary, and the result is written to the digest tier as `{digest.id,
-     scope, scope_id, embedding, member_fact_ids[], story_id, derivation_version}`. Debounced and
-     coalesced per `(scope, scope_id)` so a burst of facts triggers one rollup, not N. Never on
-     the hot path (D2). Idempotent per scope version.
+     tenant_id, scope, scope_id, embedding, member_fact_ids[], story_id, derivation_version}`.
+     The rollup key is **tenant-qualified** — `(tenant_id, scope, scope_id)` — so a rollup never
+     sweeps two tenants' facts into one digest (§5.4.2, F6). Debounced and coalesced per
+     `(tenant_id, scope, scope_id)` so a burst of facts triggers one rollup, not N. Never on the
+     hot path (D2). Idempotent per scope version.
    - **5d — Categorize** *(if `memory.semantic` enabled).* Run the schema-constrained categorizer
      over `fact.body` → emergent labels; the periodic consolidation job folds them into the
      project-scoped controlled vocabulary and writes `category[]` facets back onto the keyed
@@ -706,6 +734,56 @@ store. Operations 3 and 4 never carry body text from the graph or vector index �
 ids; the hydration step in §5.2 is always the final authority. This is what allows callers
 to mix retrieval operations and still get coherent, authoritative results.
 
+### 7.6 Invariant T — tenant isolation of identity & supersession
+
+> **Provenance.** Reconciled from the WS-5 MCP contract Challenger red-team (ISI-5878 → ISI-5870
+> §9) via ISI-5889. Findings **F1** and **F7** assert properties of the *write/identity
+> contract itself*, not just its MCP face: the MCP spec (`docs/design/mcp-contract.md` §3,
+> §3.2, §4.1, §7) *requires* them, but only WS-4 can make them Invariant-level so **every
+> surface** — MCP, the direct gateway flush (reference-architecture Decision B), and any future
+> consumer — inherits them. Stated here once; §6 stages 1 and 3 enforce it on the write path.
+
+**The caller's tenant is the identity boundary.** The server always knows the caller's
+`tenant_id` from the verified principal (`provenance.principal`, §3) — it is never client-asserted
+— and it is the floor for every read (§7.4 R6) and now for identity and supersession on the
+write path. Two rules:
+
+**T1 — `fact.id` is principal-salted and body-complete (F1, CRITICAL).** The derivation that
+assigns `fact.id` at stage 1 (§6) MUST take `tenant_id` **and** `agent_id` (the authenticated
+`entity.agent`) as **mandatory** inputs, alongside the full `fact.body` and the identity-bearing
+keys. Formally the id is a hash over `(tenant_id, agent_id, entity-identity-keys, fact.type,
+fact.subject, fact.body)`. Consequences:
+
+- **No cross-tenant collision.** Two principals that push byte-identical bodies derive *different*
+  ids, so one tenant's write can never land on (or silently overwrite — the `conflict` path) a
+  fact owned by another. A content-only hash would make `fact.id` a **cross-tenant existence
+  oracle** (probe an id → learn another tenant wrote that exact content) and a **silent
+  write-loss** vector on the idempotent `conflict` return. The salt closes both.
+- **Body-complete.** Because `fact.body` is in the derivation, an identical retry maps to the
+  same id (idempotent — returns `conflict` with the caller's *own* id, MCP §4.1 F8), while a
+  changed body yields a new id and a new latest-wins version. Identity never forks on an axis the
+  body can change without the id changing.
+
+**T2 — `supersedes` target must be tenant-owned, checked fail-closed first (F7, CRITICAL).**
+When `fact.supersedes` is set, stage 3 (§6) MUST verify the **target fact is owned by the
+caller's tenant before** the `(entity, subject, type)` grain check. If the target is not
+tenant-owned (or does not exist), fail closed with `not_found` — the *same* code and shape as a
+genuinely absent fact, never a distinguishable "forbidden", so the boundary is not a probing
+oracle. Only a tenant-owned target proceeds to the grain check.
+
+- **Cross-agent-within-tenant supersession is allowed** and attributed to the superseding agent
+  via provenance — agents on the same tenant collaborate on a `(entity, subject)` statement.
+- **Cross-tenant supersession is impossible** by construction. This is the real confused-deputy
+  vector for writes: the write envelope carries no `fact.id` input the client controls (§3), so
+  the "retry with another tenant's id" path does not exist — the only id a write can name is a
+  `supersedes` target, and T2 fences it to the caller's tenant.
+
+**Backing the storage isolation (F5/F6).** Invariant T governs identity and supersession; the
+*retrieval* isolation it relies on is backed by the tenant-partitioned fact-vector index (§5.4.2,
+F5) and tenant-qualified digest rollup (§5.4.2 / §6 stage 5c, F6). Together they make the MCP
+isolation story (ISI-5870) fully backed by the owning WS-4/WS-3 contracts rather than asserted
+at the MCP layer alone.
+
 ## 8. What the first prototype proves
 
 **Roundtrip: flush → key → hydrate-by-issue.**
@@ -800,6 +878,17 @@ rebuilt from, so proving it first is the correct order.
     summarizer cost a precision-only deployment shouldn't pay); dual-tier results fused with
     **standard RRF (k=60), equal default weights (fact 1.0 / digest 1.0)**, tier weights a
     deployment knob (§5.4.2, §7.4).
+13. **Invariant T — tenant isolation of identity & supersession** — **RECONCILED (Architect,
+    ISI-5889, 2026-10-14):** folded four WS-5 MCP-contract Challenger findings (ISI-5878) into the
+    owning WS-4/WS-3 contracts so the MCP isolation story is backed, not merely asserted. **T1**
+    (F1): `fact.id` derivation is **principal-salted** — `tenant_id`+`agent_id` mandatory inputs —
+    and body-complete, killing the cross-tenant existence oracle and silent write-loss (§6 stage 1,
+    §7.6). **T2** (F7): `supersedes` target must be **tenant-owned, checked fail-closed (`not_found`)
+    before** the grain check; cross-agent-within-tenant allowed, cross-tenant impossible (§6 stage 3,
+    §7.6). **F5:** fact-vector record carries mandatory `tenant_id`; index tenant-partitioned (or hard
+    id-set pre-filter) — post-filtering is non-conformant (§5.4.2, §6 stage 5b). **F6:** digest rollup
+    tenant-partitioned — `(scope, scope_id)` always tenant-qualified so the summarizer never sweeps two
+    tenants into one `summary`/story/embedding (§5.4.2, §6 stage 5c; **routed to WS-3 summarizer owner**).
 
 ---
 

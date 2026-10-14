@@ -188,10 +188,17 @@ count); WS-4 defines its response shape.
 
 ### Decision 2b — W-digest, W-categorize, W-embed are as specified in §5.4.2 / §6
 
-No change to §6 stages 5b/5c/5d. W-digest is **debounced and coalesced per `(scope, scope_id)`**
-(a burst of facts → one rollup). The digest tier stays gated behind the `memory.semantic.digest`
-sub-flag (a deployment can buy fact-tier precision without paying for a summarizer). Digest hits
-always resolve down to `member_fact_ids` (R1).
+No change to §6 stages 5b/5c/5d. W-digest is **debounced and coalesced per the tenant-qualified
+key `(tenant_id, scope, scope_id)`** (a burst of facts → one rollup). The digest tier stays gated
+behind the `memory.semantic.digest` sub-flag (a deployment can buy fact-tier precision without
+paying for a summarizer). Digest hits always resolve down to `member_fact_ids` (R1).
+
+**Tenant-partitioned rollup is a hard summarizer precondition (WS-5 Challenger F6, ISI-5878 →
+ISI-5889).** The rollup key is tenant-qualified so the `summarize` task **never** sweeps two
+tenants' member facts into one digest, story, or embedding; every `member_fact_id` in a digest
+MUST share the digest's `tenant_id`. Because `memory.recall` returns the digest `summary` text
+directly (MCP contract §3.4), a cross-tenant rollup would leak *before* any member-fact id check
+— so this is enforced at rollup time, not as a read-time filter (§5.4.2, §6 stage 5c).
 
 **Untrusted-content influence paths beyond key-forging (F6, F7) — the R8 analysis extends past
 keys.** Decision 2a's R8 treatment covers key *authority*, but two derived surfaces carry a
