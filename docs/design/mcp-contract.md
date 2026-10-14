@@ -1,12 +1,13 @@
 # MemKeys — MCP Server + Skills (Contract Spec)
 
 **Status:** Draft (WS-5, ISI-5870). Depends on WS-4 (ISI-5869, retrieval contract) — drafted in
-parallel, finalized after. Grounded on `memory-organization.md` §7 (the authoritative retrieval
-contract) until WS-4 ratifies it; §9 flags every point that must reconcile with WS-4.
+parallel, finalized after. Grounded on `../architecture.md` §7 (the in-repo MemKeys architecture doc
+promoted by WS-0 / ISI-5865 — the authoritative retrieval contract) until WS-4 ratifies it; §9 flags
+every point that must reconcile with WS-4.
 **Workstream:** WS-5 — MCP server + skills (the adoption surface).
 **Owner:** Architect (Winston). **Co-owner:** Product Manager (consumer surface). **Review:** Challenger.
 **Layer:** Adoption surface over the retrieval contract. This doc specifies *how agents reach MemKeys*,
-not *what MemKeys stores* (that is `memory-organization.md`).
+not *what MemKeys stores* (that is `../architecture.md`). All `§` references below point into that doc.
 
 > **Design stance.** The MCP tools are **thin wrappers over the §7 HTTP retrieval contract** — they add
 > no new storage, no new modeling, no new authority. Every tool is a transport-and-ergonomics shell around
