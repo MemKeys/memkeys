@@ -193,6 +193,14 @@ Design rules:
   A2A's second participant is a **hint** — either enriched from the `thread`'s participant
   set or asserted in `counterpart_agent` and corroborated against it; it is never written
   as a verified custody key on one agent's say-so about another.
+- **The *resolved* A2A counterpart is server-owned and persisted (§5.1, Invariant T4).** The
+  `counterpart_agent` hint above is never persisted as-is. When the server corroborates the
+  counterpart against the thread's participant set it writes the outcome to the server-owned
+  record field `entity.counterpart_agent_resolved` (nullable). Corroboration that completes
+  *after* ingest (the counterpart had not yet appeared on the thread, §9 item 3) is persisted
+  as a durable append-only `a2a_counterpart_resolution` record (§5.1) rather than by mutating
+  the immutable fact. Persisting the resolution — at ingest or later — is what makes the
+  `a2a_participant` graph edge **rebuild-identical** (§5.4.1) instead of best-effort.
 - **`subject` is the supersession grain.** It groups facts that are successive versions of
   the same statement (e.g. "the chosen database"), so the server can link supersedes and
   the reader can ask for the *current* value. It is **required whenever `supersedes` is
@@ -277,9 +285,37 @@ entity.pr          //  │  (indexed filter targets)
 entity.agent       //  │
 entity.run         //  │
 entity.thread      // ─┘
+entity.counterpart_agent_resolved  // server-owned, nullable — the resolved A2A counterpart (§3, T4); null until/unless corroborated
 provenance.principal, provenance.custody, provenance.trace_id, provenance.source_kind
 keyed              // bool — false ⇒ semantic-only
 ```
+
+**A2A counterpart resolution is persisted, never recomputed (Invariant T4, F5).** The
+`a2a_participant` graph edge (§5.4.1) must rebuild to the same value on every replay. Because
+the record is immutable and the counterpart may corroborate only *after* ingest (§9 item 3),
+resolution is captured in durable data, not transient projection-time state:
+
+- **Resolved at ingest** → written into `entity.counterpart_agent_resolved` on the record itself.
+- **Resolved later** → appended as a first-class **`a2a_counterpart_resolution`** record
+  `{ fact_id, counterpart_agent, tenant_id, resolved_at, basis }` (`basis` = the corroboration
+  source, e.g. `thread_membership`). This is an append-only artifact keyed to `fact_id`, same
+  bucket discipline as a fact — it does not mutate the superseded-immutable record.
+
+The edge is then a pure function of durable inputs: `counterpart_agent_resolved` if non-null,
+else the latest `a2a_counterpart_resolution` for `fact_id`, else no edge. Replay is identical
+because both inputs are logged, not derived from live (mutable) thread membership.
+
+**Live-head coordination structure (Invariant T3).** At-most-one non-superseded fact per
+`(tenant_id, <entity-identity-keys>, subject, type)` (subject non-null — see T3) cannot be
+enforced on the append-only SoT by a read-time query (that is a check-then-write TOCTOU race,
+§7.6 T3). The write path maintains a small, **strongly-consistent live-head index** keyed on
+that tuple — the single serialization/compare-and-set point (§6 stage 3–4). It is a write-path
+*coordination* structure, **not** a second source of truth: Grail stays the authoritative
+append-only record, the live-head index only names which fact.id currently holds the head for
+a statement. It co-locates with the `fact.id` idempotency ledger in the strongly-consistent
+store (the single-Postgres default of the reference architecture, Decision A); the reference
+realization is a Postgres partial-unique index
+`UNIQUE (tenant_id, entity_identity, subject, type) WHERE NOT superseded`.
 
 **`tenant_id` is the isolation key.** It is a component of the verified `provenance.principal`
 (server-stamped, never client-asserted, §3) and is the identity floor for Invariant T (§7.6):
@@ -381,7 +417,7 @@ The graph is present in all deployments (no opt-in required). Each processed fac
 | `supersedes` | new fact node | prior fact node | when `fact.supersedes` is set |
 | `produced_by` | fact node | agent node | always (from `provenance.principal`) |
 | `temporal` | fact node | time-bucket node | for navigating by epoch |
-| `a2a_participant` | fact node | counterpart agent node | `a2a_exchange` facts with resolved counterpart |
+| `a2a_participant` | fact node | counterpart agent node | `a2a_exchange` facts with a *persisted* resolved counterpart (§5.1 `counterpart_agent_resolved` or an `a2a_counterpart_resolution` record) — **rebuild-identical** (T4) |
 
 **Graph traversal enables queries** that are awkward or expensive in pure DQL:
 - "What is the supersession chain for statement X on issue Y?" → walk `supersedes` edges
@@ -574,24 +610,48 @@ only — an agent's write latency never depends on embedding, summarization, or 
    (§7.6)** — a stable idempotency key so retried flushes don't duplicate, yet never
    collidable across principals.
 2. **Key.** Resolve entity keys per §4 (verify → enrich → accept-low-trust). Mark `keyed`.
-   Attach rejected hints.
-3. **Temporalize.** Set the event-time axis (`fact.event_time` or `emitted_at`). If
-   `supersedes` is set, apply the **Invariant T (§7.6) supersede-ownership check first**:
-   the target fact MUST be owned by the caller's tenant, else fail closed with `not_found`
-   (never a distinguishable permission error) — only then validate the target shares
-   `(entity, subject, type)`. Cross-agent-within-tenant supersession is allowed and
-   attributed; cross-tenant supersession is impossible. Compute no write-back —
+   Attach rejected hints. For `a2a_exchange`, corroborate the counterpart against the
+   thread's participant set: if it resolves now, stamp `entity.counterpart_agent_resolved`
+   on the record (§5.1, T4); if it cannot yet resolve, leave it null — a later corroboration
+   appends an `a2a_counterpart_resolution` record (handled by the reconciler / thread-join
+   path), never a mutation of this record.
+3. **Temporalize + live-head serialization.** Set the event-time axis (`fact.event_time` or
+   `emitted_at`). For a **subject-bearing** fact (`subject` non-null — the supersession grain),
+   enter the per-key critical section of the **live-head index** (§5.1) keyed on
+   `H = (tenant_id, <entity-identity-keys of T1>, subject, type)`. Serializing on `H` is the
+   only race-free point for the uniqueness invariant (§7.6 **T3**); a read-time check is a
+   check-then-write TOCTOU race and the SoT is append-only, so neither alone can hold it.
+   Inside the section, resolve the head via **compare-and-set** on the stored head id:
+   - `supersedes` set → apply the **Invariant T (§7.6 T2) tenant-ownership check first**: the
+     target MUST be owned by the caller's tenant, else fail closed with `not_found` (never a
+     distinguishable permission error); then it MUST equal the **current live head** for `H`
+     and share `(entity, subject, type)` — superseding a stale (already-superseded) or foreign
+     id is rejected `conflict`. This is what forecloses supersession **cycles** and the
+     two-writers-supersede-one-head fork.
+   - `supersedes` unset, `H` empty → this fact becomes the head.
+   - `supersedes` unset, `H` occupied → the server **auto-links** `fact.supersedes = <current
+     head>` (the server owns supersession, §3; a new value for an existing statement *is* a new
+     version). Identical retries never reach here — T1 makes them the same `fact.id`, deduped by
+     the idempotency ledger before this stage.
+
+   Cross-agent-within-tenant supersession is allowed and attributed; cross-tenant is impossible
+   (T2). Non-subject facts skip the section entirely — they are independent observations, never
+   versioned, and may legitimately share `(entity, null, type)`. No write-back to prior records —
    supersession is read-time (§5.1).
 4. **Commit (keyed write).** Write the authoritative record into `agentmesh_facts` (Grail
-   ingest). This is the **commit point**: `ack` is sent to the client as soon as this
+   ingest) and, in the same critical section, advance the live-head index CAS to this `fact.id`
+   (subject-bearing facts) — so the keyed record and the head pointer move together and no fork
+   can be observed. This is the **commit point**: `ack` is sent to the client as soon as this
    succeeds. The client is never blocked on derived-view maintenance.
 5. **Async derived-view maintenance** (post-commit, idempotent, retryable; each artifact
    stamped with `derivation_version`, §5.5):
    - **5a — Graph projection.** For each entity key in the committed record, upsert the
      corresponding entity node and write the `entity_fact` edge; write `supersedes` edge if
      `fact.supersedes` is set; write `produced_by` edge from `provenance.principal`; write
-     `temporal` bucket edge; write `a2a_participant` edge for resolved A2A counterparts. All
-     idempotent on `fact.id` so retries are safe.
+     `temporal` bucket edge; write `a2a_participant` edge from the **persisted** resolved
+     counterpart (`entity.counterpart_agent_resolved` or the latest `a2a_counterpart_resolution`
+     record, §5.1) — a late resolution re-fires this edge on its own ingest. All idempotent on
+     `fact.id` so retries are safe and the edge is rebuild-identical (T4).
    - **5b — Fact-vector embedding** *(if `memory.semantic` enabled).* Enqueue
      `embed(fact.id, fact.body)` to the configured embedder; write `{fact.id, tenant_id,
      embedding, entity.*, fact.type, derivation_version}` to the fact-vector tier —
@@ -778,6 +838,48 @@ oracle. Only a tenant-owned target proceeds to the grain check.
   the "retry with another tenant's id" path does not exist — the only id a write can name is a
   `supersedes` target, and T2 fences it to the caller's tenant.
 
+**T3 — live-head uniqueness for supersession (F1/F2/F3, CRITICAL).** For every subject-bearing
+statement there is **at most one non-superseded ("live-head") fact** per
+`H = (tenant_id, <the entity-identity-keys of T1>, subject, type)`. Read-time "latest
+non-superseded" (§5.2) *reports* the head; it cannot *enforce* uniqueness — two plain writes
+that never set `supersedes` each pass the T2 `supersedes`-conditioned check (it never fires)
+and both land live, a **fork**; a read-then-write check is a TOCTOU race; and the SoT is
+append-only, so there is no record to constrain after the fact. Enforcement therefore lives in
+the **write path only** (§6 stage 3–4), as either:
+
+- a **uniqueness constraint** on the live-head key — the reference realization is a Postgres
+  partial-unique index `UNIQUE (tenant_id, entity_identity, subject, type) WHERE NOT superseded`
+  in the strongly-consistent write-path store (reference-architecture Decision A); or
+- **key-level write serialization** on `H` — a per-key critical section performing a
+  compare-and-set on the live-head id.
+
+Both are backend-portable statements of the same invariant; a backend that offers neither
+cannot host the SoT write path. Within the gate (§6 stage 3): a plain write to an occupied `H`
+**auto-supersedes** the current head (server owns supersession, §3); an explicit `supersedes`
+MUST name the **current** head (not a stale/already-superseded id), which also forecloses
+**supersession cycles**. Consequences:
+
+- **No forks.** Concurrent different-body writes to one `H` are serialized; the second observes
+  the first's head and supersedes it — one live head survives, never two.
+- **No cycles.** `supersedes` can only advance from the current head, so the chain is a strict
+  line, never a loop.
+- **The graph reconciler's fork/cycle detection (ADR-GRAPH) becomes a should-never-fire
+  integrity monitor** rather than the only line of defense — prevention moves to the write
+  path (where ADR-GRAPH, as an *observer*, correctly said it could not live), detection stays
+  as defense-in-depth. This closes the F1/F2/F3 gap ADR-GRAPH routed here (ISI-5906).
+
+Subject-less facts are out of scope: they are independent observations, never versioned, and
+may legitimately share `(entity, null, type)`.
+
+**T4 — A2A counterpart resolution is persisted, not recomputed (F5).** The `a2a_participant`
+graph edge must rebuild identically on every replay. The resolved counterpart is captured in
+durable data — `entity.counterpart_agent_resolved` on the record when known at ingest, else an
+append-only `a2a_counterpart_resolution` record keyed to `fact_id` when it corroborates later
+(§3, §5.1). The edge is a pure function of these logged inputs, never of live (mutable) thread
+membership read at projection time. This flips the ADR-GRAPH `a2a_participant` rebuild from
+**best-effort** to **rebuild-identical** (ISI-5906, F5). The envelope `counterpart_agent` stays
+a client *hint* and is never persisted as-is (§3) — only the server-corroborated value is.
+
 **Backing the storage isolation (F5/F6).** Invariant T governs identity and supersession; the
 *retrieval* isolation it relies on is backed by the tenant-partitioned fact-vector index (§5.4.2,
 F5) and tenant-qualified digest rollup (§5.4.2 / §6 stage 5c, F6). Together they make the MCP
@@ -889,6 +991,19 @@ rebuilt from, so proving it first is the correct order.
     id-set pre-filter) — post-filtering is non-conformant (§5.4.2, §6 stage 5b). **F6:** digest rollup
     tenant-partitioned — `(scope, scope_id)` always tenant-qualified so the summarizer never sweeps two
     tenants into one `summary`/story/embedding (§5.4.2, §6 stage 5c; **routed to WS-3 summarizer owner**).
+14. **Invariant T3/T4 — live-head uniqueness + persisted A2A resolution** — **RULED (Architect,
+    ISI-5906, 2026-10-14):** folds the four write-path invariants the ADR-GRAPH Challenger
+    (ISI-5898, F1/F2/F3/F5) routed out of WS-2 because a *graph* can observe but not prevent them.
+    **T3** (F1/F2/F3): at most one non-superseded fact per `(tenant_id, entity-identity, subject,
+    type)`; enforced in the write path only (§6 stage 3–4) by a uniqueness constraint *or* key-level
+    serialization/CAS on the live-head index (§5.1, §7.6) — reference realization a Postgres partial-
+    unique index under the single-Postgres default. Plain write to an occupied head auto-supersedes;
+    explicit `supersedes` must name the current head → no forks, no cycles. The graph reconciler's
+    fork/cycle detection downgrades to a should-never-fire monitor. **T4** (F5): A2A counterpart
+    resolution is persisted (`entity.counterpart_agent_resolved` at ingest, else an append-only
+    `a2a_counterpart_resolution` record), flipping the `a2a_participant` edge from best-effort to
+    rebuild-identical (§3, §5.1, §5.4.1, §7.6). **Implementation routed to WS-3 pipeline** (live-head
+    gate + resolution-record emission); invariant verification routed to Challenger.
 
 ---
 
