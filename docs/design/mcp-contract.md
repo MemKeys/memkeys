@@ -254,9 +254,10 @@ the token-budget posture, not merely to name the endpoint.
   narrow. Precision tier: returns the specific facts that match. Prefer memory.get when you actually know the
   key."*
 - **`memory.recall`** — *"Get the story of a span — everything that happened in this thread, run, or entity —
-  as a short digest that points you to the underlying facts. Use at the start of picking up work to orient
-  fast without reading every record. You get summaries plus pointers; pull full facts with memory.get only for
-  the ones you need."*
+  as a short digest that points you to the underlying facts. Use at the start of picking up work to orient fast
+  when a span is too large to read fact-by-fact; if you already have one clean key (an issue, PR, or run) and
+  just need its records, memory.get is cheaper and comes first. You get summaries plus pointers; pull full facts
+  with memory.get only for the ones you need."*
 
 > **PM co-ownership hook (§Collaboration):** these strings are the consumer-facing surface the PM co-owns. They
 > are versioned with the tool schema; a wording change that alters *when* an agent calls a tool is a contract
@@ -293,7 +294,12 @@ both *how many* records and *how many tokens* it pulls.
    rest before serialization.
 4. **Hard server ceiling on bytes-per-response.** Independent of page size, the server caps total body bytes in
    a single response and pages the overflow via `next_cursor`. This is the backstop that guarantees one call
-   can never blow a context window regardless of how the caller set the other knobs.
+   can never blow a context window regardless of how the caller set the other knobs. **PM ruling (ISI-5879):
+   default ceiling 64 KB of body bytes per response (≈16k tokens at ~4 chars/token), deployment-configurable.**
+   Enforced on bytes (deterministic server-side), **not** on the `token_estimate` approximation — the byte
+   figure is chosen so its token-equivalent stays a safe fraction of even a modest 32–64k context window,
+   leaving room for the agent's own working context. Deployments on large-context fleets may raise it; overflow
+   always pages via `next_cursor`, and `token_estimate` remains the agent-facing budgeting signal.
 
 Every response carries **`token_estimate`** (approx tokens in this payload) so an agent can budget the next
 call. `recall` additionally defaults to `resolve: snippets` (§4.5) — the single biggest token win, since the
@@ -366,10 +372,14 @@ the design.
 - **[WS-4]** RRF tier weights and the `tiers=auto` fusion default live in WS-4 / §7.4; `search`/`recall`
   inherit them. If WS-4 exposes a per-call weight override, decide whether the MCP layer surfaces it or pins it
   (lean: **pin it** — a per-call ranking knob is not an agent-facing concern).
-- **[PM]** Ratify the five skill-description strings (§5) — the consumer surface the PM co-owns. Specifically:
-  is the keyed-first framing strong enough that agents won't default to `search`?
-- **[PM]** Pagination defaults and the body-bytes ceiling (§6) are a cost/UX tradeoff — PM input on the
-  numbers.
+- **[PM — RATIFIED 2026-10-14, ISI-5879]** Five skill-description strings (§5) ratified. Keyed-first framing
+  approved as strong enough (`get`="first choice", explicit deflections). One change applied: `memory.recall`
+  gained a get-deflection clause (it overlapped `get`'s "pick up context" job and previously had no tiebreaker
+  toward the cheap keyed path). That clause alters *when* `recall` is called → **contract change, needs
+  Challenger ack** (routed to ISI-5878) before finalize; the rest are ratified as-is.
+- **[PM — RATIFIED 2026-10-14, ISI-5879]** Pagination defaults (page 50, k 10/5), compact-default view, and
+  `token_estimate`-on-every-response all approved. Body-bytes ceiling set: **64 KB default (≈16k tokens),
+  deployment-configurable** (§6.2.4) — enforced on bytes, documented in token-equivalent.
 - **[Challenger]** Red-team the tenant floor (§3): can any combination of `scope`/`entity`/`as_of`/cursor
   arguments, across transports, surface a fact the caller's tenant doesn't own? The `not_found`-not-`forbidden`
   rule and the pre-ANN pre-filter are the two load-bearing claims to attack.

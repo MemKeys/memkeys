@@ -4,7 +4,7 @@
 - **Date:** 2026-10-14
 - **Owner:** Observability Agent
 - **Workstream:** WS-7 (cross-cutting) — Paperclip issue ISI-5872
-- **Supersedes / relates to:** Design study ISI-5800 (memory organization), roadmap ISI-5803
+- **Relates to:** [`docs/architecture.md`](../architecture.md) (WS-0 baseline — keyed-first & D3 invariants), [`docs/reference-architecture.md`](../reference-architecture.md) (WS-6), design study ISI-5800, roadmap ISI-5803
 - **Deciders:** Observability Agent (author), Architect (alignment), WS-1/WS-2/WS-3/WS-4 owners (instrument against this contract)
 
 ---
@@ -16,8 +16,11 @@ entity attributes (project / issue / PR / agent / run / time-range), carry tempo
 validity, and expose a two-layer retrieval model — **keyed/structured first, semantic
 second** (ISI-5800). The Source of Truth (SoT) is the entity-keyed temporal store;
 the graph and vector indexes are **derived views (projections)** maintained
-asynchronously. This CQRS-style split means a projection necessarily **lags** the SoT,
-and the design commits to that lag being **bounded and observable** — the **D3
+asynchronously. This is exactly the architecture baseline's **D3 invariant** —
+*source-of-truth + async rebuildable projections* ([`docs/architecture.md`](../architecture.md),
+keyed-first / §5.4), with the retention rule *projection ≤ SoT* (§5.6). This CQRS-style
+split means a projection necessarily **lags** the SoT; WS-7 makes that lag **bounded and
+observable** — the operational, measured form of D3 that this ADR calls the **D3
 observable-lag invariant**.
 
 The board asked (ISI-5872) that MemKeys emit spans, metrics, and logs via
