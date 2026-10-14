@@ -60,7 +60,7 @@ correlate to the triggering write. Key structured events:
 | Attribute | Values |
 |---|---|
 | `memkeys.tenant.id` | opaque id/hash (never a name) |
-| `memkeys.entity.kind` | project · issue · pr · agent · run |
+| `memkeys.entity.kind` | project · issue · pr · agent · run · thread · service |
 | `memkeys.pipeline.stage` | normalize · key · temporalize · commit |
 | `memkeys.retrieval.op` | keyed · graph · semantic |
 | `memkeys.projection.kind` | graph · summary · embedding · category |

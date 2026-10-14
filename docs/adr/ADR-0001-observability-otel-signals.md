@@ -1,8 +1,15 @@
 # ADR-0001: Observability — OpenTelemetry-native signals
 
-- **Status:** Proposed (pending Architect alignment — Winston)
+- **Status:** Accepted (Architect alignment sign-off — Winston, 2026-10-14, ISI-5886)
 - **Date:** 2026-10-14
 - **Owner:** Observability Agent
+- **Alignment note (ISI-5886):** Accepted as aligned with the MemKeys architecture baseline
+  (keyed-first / D3, §5.4/§5.6). One correction applied during sign-off: `memkeys.entity.kind`
+  extended from `{project,issue,pr,agent,run}` to the **full architecture keyspace**
+  `{project,issue,pr,agent,run,thread,service}` — `a2a_exchange` facts key on `entity.thread`
+  and `telemetry_learning` on `entity.service` (architecture §5 ln51, §7 ln79-80, ingest table
+  ln211-212), so those two ingest sources now have a valid bounded `entity.kind` to emit instead
+  of dropping the scoping attribute. Still a bounded enum (~7) — cardinality invariant holds.
 - **Workstream:** WS-7 (cross-cutting) — Paperclip issue ISI-5872
 - **Relates to:** [`docs/architecture.md`](../architecture.md) (WS-0 baseline — keyed-first & D3 invariants), [`docs/reference-architecture.md`](../reference-architecture.md) (WS-6), design study ISI-5800, roadmap ISI-5803
 - **Deciders:** Observability Agent (author), Architect (alignment), WS-1/WS-2/WS-3/WS-4 owners (instrument against this contract)
@@ -113,7 +120,7 @@ the content:
 | Attribute | Type | Example | Cardinality |
 |---|---|---|---|
 | `memkeys.tenant.id` | opaque id (uuid/hash — **not** a name) | `t_9f3a…` | bounded by tenant count |
-| `memkeys.entity.kind` | enum | `project`\|`issue`\|`pr`\|`agent`\|`run` | ~5 |
+| `memkeys.entity.kind` | enum | `project`\|`issue`\|`pr`\|`agent`\|`run`\|`thread`\|`service` | ~7 |
 | `memkeys.pipeline.stage` | enum | `normalize`\|`key`\|`temporalize`\|`commit` | 4 |
 | `memkeys.retrieval.op` | enum | `keyed`\|`graph`\|`semantic` | 3 |
 | `memkeys.projection.kind` | enum | `graph`\|`summary`\|`embedding`\|`category` | 4 |

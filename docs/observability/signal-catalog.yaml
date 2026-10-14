@@ -42,7 +42,7 @@ attributes:
     cardinality: bounded(tenants)
   memkeys.entity.kind:
     type: enum
-    values: [project, issue, pr, agent, run]
+    values: [project, issue, pr, agent, run, thread, service]   # full architecture keyspace (§5 ln51, §7 ln79): a2a_exchange keys on thread, telemetry_learning on service
     desc: The KIND of entity a fact is keyed to. The entity VALUE is never emitted.
   memkeys.pipeline.stage:
     type: enum
