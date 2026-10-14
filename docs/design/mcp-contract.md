@@ -56,6 +56,10 @@ many tenants a server instance serves.
   stdio — the pipe *is* the trust boundary (same-host, same-launch).
 - The subprocess holds the verified tenant/agent/run claims for its whole lifetime; every tool call inherits
   them. A stdio server **cannot** serve a second tenant — switching tenants means a new subprocess.
+- **Lifetime is bounded by the token's validity window (F12).** The subprocess is not "verified forever" — the
+  bound token carries a validity window (§3), and the server **stops serving when that window closes**: it
+  self-terminates, and any tool call attempted past expiry hard-fails with `unauthenticated` (§7, "subprocess
+  relaunch"). A long-lived stdio server must never answer calls under an expired run token.
 - Intended for: an agent runtime colocated with its memory server, dev loops, air-gapped/minimal deployments
   (keyed+graph only, no shared infra).
 
@@ -85,6 +89,20 @@ search with no finer key runs against everything that tenant owns, never global.
 `tenant_id` (≈ company), `agent_id`, `run_id`, and token validity window — exactly the claim set already in the
 run-scoped JWT. stdio binds it at launch (§2.1); HTTP verifies it per request (§2.2).
 
+**`fact_id` derivation is principal-salted and content-complete (F1, F8).** The server-assigned `fact_id` (the
+idempotency key, §4.1 / §6 stage 1) is `hash(tenant_id, agent_id, resolved-entity-anchor, fact.subject,
+fact.type, fact.body, source.emitted_at)` — the verified `tenant_id`+`agent_id` are **mandatory salt** and the
+`fact.body` is **in the hash**. Two consequences this contract requires:
+- *Cross-principal collision is impossible by construction.* Two tenants (or two agents) emitting the same
+  body+keys derive **different** ids, so a `conflict` (§7) can only ever return the **caller's own** prior
+  fact — never another principal's. This closes the cross-tenant existence-oracle + silent-write-loss hole
+  (F1): the `not_found` fail-closed rule (point 3) is not bypassable via the `conflict` path.
+- *Retry vs. update is unambiguous (F8).* A byte-identical re-emission derives the same id → `conflict`
+  returning that id (the retry already landed, no duplicate). A **changed body** from the same principal at the
+  same `(entity, subject, type)` grain derives a **new** id → it is a *new fact*, not a conflict; read-time
+  latest-wins (§5.2) returns the newer one, so an update needs no explicit `supersedes` within a grain.
+  `supersedes` is reserved for cross-grain or audit-explicit replacement (§4.1, F7).
+
 **The tenant floor is server-derived and non-negotiable:**
 
 1. **No tool argument can widen scope beyond the caller's tenant.** `scope`/`entity` arguments on any read tool
@@ -92,15 +110,43 @@ run-scoped JWT. stdio binds it at launch (§2.1); HTTP verifies it per request (
    "global" value, no wildcard tenant, no argument the client can set to escape its tenant. A call that omits
    all finer keys runs against *everything the caller's tenant owns* (including `unkeyed` and sparsely-keyed
    facts, closing the R6 recall hole) — but still only that tenant.
-2. **Write identity is bound to the principal.** On `memory.write`, `source.producer` and `entity.agent` are
-   overwritten from the verified principal (§3.1 of the design). A client-asserted `agent` is advisory and
-   discarded on conflict; `provenance` in the envelope is rejected-if-populated. The MCP tool does not expose
-   any way to write a fact *as another agent*.
-3. **Cross-tenant ids fail closed.** If a `memory.get` / `memory.traverse` call names an `entity.*` id or a
-   `fact.id` / node id the caller's tenant does not own, the server returns `not_found` (§7) — **never** a
-   `forbidden` that would leak the id's existence across the tenant boundary.
-4. **Tenant scoping is applied before the ANN pass** for `search`/`recall` (§5.4.2 candidate pre-filter) — team
-   A's vectors are never in team B's candidate set, so isolation holds even under semantic recall.
+2. **Write identity *and supersede targeting* are bound to the principal (F7).** On `memory.write`,
+   `source.producer` and `entity.agent` are overwritten from the verified principal (§3.1 of the design); a
+   client-asserted `agent` is advisory and discarded on conflict; `provenance` is rejected-if-populated; there
+   is no way to write a fact *as another agent*. **The `supersedes` target is the real confused-deputy vector,
+   and it is checked here:** a `supersedes: <prior fact.id>` is validated for *ownership* before the grain
+   check — the target MUST be owned by the caller's tenant, else the write fails closed as `not_found` (§7),
+   never `forbidden` (no existence leak). Within a tenant, an agent **may** supersede another agent's fact at a
+   matching grain (cross-agent-within-tenant supersession is an allowed collaboration pattern — handoffs
+   correct each other), but the superseding record's identity is still the acting principal's, so the audit
+   trail attributes the change correctly. Cross-tenant supersession is impossible (fails `not_found`).
+3. **Cross-tenant ids fail closed, and boundary crossings are audited (F15).** If a `memory.get` /
+   `memory.traverse` / `memory.write`-supersede call names an `entity.*` id, a `fact.id` / node id, or a
+   supersede target the caller's tenant does not own, the server returns `not_found` (§7) — **never** a
+   `forbidden` that would leak the id's existence across the tenant boundary. Because a silent `not_found` on
+   every boundary crossing is also an unlogged id-probing oracle, **every boundary-crossing `not_found` is
+   written to a read-side audit log** (the read path carries no provenance otherwise) and is **coupled to
+   `rate_limited`** (§7): a principal generating repeated boundary-crossing `not_found`s is throttled. This
+   denies the existence-oracle its unlimited, invisible probing budget.
+4. **Tenant isolation holds under semantic recall by *partitioning*, not by hoping the ANN drops the right rows
+   (F5, F6).** "Scope before the ANN pass" is only satisfiable if the vector/digest backend supports **true
+   id-set pre-filtering or per-tenant partitioning** — a classic HNSW/IVF index that *post*-filters (retrieve
+   top-k by vector, then drop non-matching ids) scores team B's vectors against team A's query and can starve
+   A's real results to empty. This contract therefore **requires**:
+   - *Fact-vector tier (F5):* a **tenant-partitioned index** (per-tenant namespace/collection) OR a backend
+     that does hard id-set pre-filtering. The fact-vector record MUST carry `tenant_id` (the §5.4.2 record
+     shape omits it today — reconcile with WS-4). "Scope before ANN" is **not** satisfied by post-filtering.
+   - *Digest tier (F6):* every digest is **tenant-partitioned at rollup** — `(scope, scope_id)` is always
+     tenant-qualified, and the summarizer **never** sweeps two tenants' facts into one digest/story/embedding.
+     This is load-bearing because `memory.recall` returns the digest `summary` text *directly* (§4.5), so a
+     cross-tenant rollup would leak B's content into A's summary **before** any member-fact id check — the one
+     path where the member-fact resolve-down guard (R1) cannot save isolation.
+5. **`memory.traverse` applies the tenant floor on *every hop*, not just at `start` (F4).** Fail-closing the
+   `start` node (point 3) is necessary but not sufficient: entity nodes keyed on shared strings
+   (`project`/`pr`/`agent` ids reused across tenants) are cross-tenant bridges if neighbors are walked
+   unfiltered. The per-hop filter `node.tenant == caller.tenant` is a **first-class MCP traverse invariant**
+   (not merely inherited from `architecture.md` ADR-GRAPH): any hop to a node outside the floor is pruned as if
+   the edge did not exist. An implementer reading only this contract must apply it.
 
 **What the MCP layer deliberately does *not* own:** token issuance, rotation, and the OAuth2 flow for HTTP are
 the deployment's auth system (the existing Paperclip run-token issuer for the reference deployment). The MCP
@@ -124,20 +170,28 @@ the §6 shaping controls and the §7.5 fact shape.
     "entity":     { /* send AT LEAST this source's anchor (§3.1): run | thread | service|project.
                        Other keys are hints; server enriches. agent/producer are server-derived. */ },
     "fact":       { "body": "<text|structured>",      // REQUIRED — the only thing only the producer knows
+                                                      //   server-capped: body > max_body_bytes → invalid_envelope (F14)
                     "type": "<decision|outcome|observation|learning|context>",  // optional, server-defaulted
                     "subject": "<string>",            // REQUIRED when `supersedes` is set
                     "event_time": "<RFC3339>",        // optional
                     "confidence": 0.0,                // optional; SHOULD set for type=learning
-                    "supersedes": "<prior fact.id>" },// optional
-    "attachments": [ "<ref>" ]                        // optional; refs only, never inlined
+                    "supersedes": "<prior fact.id>" },// optional; target MUST be tenant-owned (§3.2) else not_found
+    "attachments": [ "<ref>" ]                        // optional; refs only, never inlined; count-capped (F14)
     // server-derived (NOT in schema): source.producer, entity.agent, provenance.*
   }
 }
 // → { "fact_id": "...", "keyed": true, "entity_keys_resolved": { ... }, "rejected_hints": [ ... ] }
 ```
 
-Idempotent on the server-assigned `fact_id` derivation (retried flush = no duplicate, §6 stage 1). `write`
-returns the resolved keys so a caller can cache them for subsequent `memory.get` without a lookup round-trip.
+Idempotent on the server-assigned `fact_id` derivation (retried flush = no duplicate, §6 stage 1); the
+derivation is **principal-salted and body-complete** (§3, F1/F8), so a byte-identical retry collides to a
+`conflict` returning the caller's own id while a content change at the same grain is a new fact resolved by
+latest-wins (§5.2). `write` returns the resolved keys so a caller can cache them for subsequent `memory.get`
+without a lookup round-trip. **Write size is bounded (F14):** `fact.body` over `max_body_bytes` and
+`attachments[]` over `max_attachments` are rejected `invalid_envelope` (§7) — the write side must not be able
+to plant an unbounded body that later blows the embedder, the digest summarizer, and every `view:full` read.
+Defaults are deployment-configurable; the body cap SHOULD align with the §6.2.4 read ceiling so a single fact
+is always readable in one `view:full` call.
 
 ### 4.2 `memory.get` → `GET /memory/facts`
 
@@ -182,7 +236,18 @@ scan — that is what `search` is for). Maps directly to the §5.2 / §5.3 DQL.
 ```
 
 `hydrate: false` is the token-cheap mode (ids + topology only). Graph bodies always resolve from the SoT
-(§7.5) — the graph store carries no body text.
+(§7.5) — the graph store carries no body text. **Every hop is tenant-filtered (§3.5, F4):** `start` ownership
+is necessary but not sufficient; nodes outside the caller's floor are pruned as if the edge did not exist, so
+entity nodes keyed on shared strings cannot bridge tenants.
+
+**Supersession chains do not degrade silently (F9).** The graph projection lags (edge writes are async,
+§5.4), so a plain `freshness_lag` warning on a `supersedes`-edge walk could hand back a *superseded* fact as
+the chain head — turning a correctness error (agent acts on a reversed decision) into a benign-looking lag.
+For traversals over the `supersedes` edge, the server therefore **resolves the collapse head from the SoT**
+(authoritative latest-wins, §5.2) rather than trusting graph topology; if it cannot, it returns a
+**supersession-specific** `supersession_stale` flag (distinct from the generic `freshness_lag`) that explicitly
+means "a newer version of this exact fact may exist." A generic lag warning is never sufficient for a
+supersession query.
 
 ### 4.4 `memory.search` → `POST /memory/search` (fact tier)
 
@@ -228,9 +293,22 @@ Fact tier only (`tiers=fact`). Returns ranked raw facts, hydrated from SoT (§7.
 
 Digest tier (`tiers=digest`). **R1 invariant at the MCP layer:** every digest carries its `members` (resolved
 `member_fact_ids`) so the summary is always a pointer into ground truth; the agent pulls full bodies
-selectively via `memory.get`. `resolve` controls how much comes back (§6). When `memory.semantic.digest` is
-off, `recall` **degrades to a fact-tier scope recall with a `degraded: "digest_disabled"` warning** (per §7.4),
-not a hard error; when the whole `memory.semantic` module is off, it returns `feature_disabled`.
+selectively via `memory.get`. `resolve` controls how much comes back (§6).
+
+**The digest-disabled degrade has a defined shape and a queryless fallback (F10).** When
+`memory.semantic.digest` is off, `recall` does **not** silently swap to a `hits[]` fact-tier body — an agent
+parsing `response.digests` would read an empty array and wrongly conclude "nothing happened in this span."
+Instead the degraded response **keeps the `digests: []` envelope** and adds a top-level `facts: [ <fact shape
+§7.5> ]` array plus `degraded: "digest_disabled"`, so the shape is self-describing. The fallback source
+depends on whether a query is present:
+- *queryless recall* (the common scope-centric case — `query` omitted): fact-tier ANN has no similarity axis,
+  so the server falls back to a **keyed scope fetch** (the §4.2 `memory.get` path over the same `scope`),
+  **never** fact-tier ANN. An existing span always reads back as its facts, never as empty.
+- *recall with a `query`*: may use fact-tier semantic search scoped to the span, returning the ranked facts in
+  the same `facts[]` field.
+
+When the whole `memory.semantic` module is off, `recall` returns `feature_disabled` (§7) — never a silent
+empty result.
 
 ## 5. Skill descriptions (the natural-language the agent reads)
 
@@ -272,10 +350,26 @@ both *how many* records and *how many tokens* it pulls.
 
 - **Cursor-based, never offset.** The SoT is append-only, bi-temporal, and supersession-collapsed at read time
   (§5.1); offset pagination would be unstable as new facts arrive and as latest-wins shifts. The cursor is an
-  **opaque token** encoding `(as_of snapshot pin, last sort key, tier/fusion state, page size)`.
+  **opaque, server-signed token** (HMAC/AEAD under a server key) encoding `(as_of snapshot pin, last sort key,
+  tier/fusion state, page size)` — **plus query intent, never a pre-authorized id set.**
+- **Integrity-protected, not merely opaque (F2).** "Opaque" is obscurity, not tamper-resistance: a plain
+  base64 blob can be decoded, widened, and re-encoded. The cursor is therefore **cryptographically sealed**;
+  any client edit fails verification → `bad_cursor` (§7). This is what makes the "replay against a different
+  tool / tenant → `bad_cursor`" rule actually enforceable.
+- **The tenant floor is re-derived and re-intersected on every page — the cursor never carries authority (F3).**
+  Authority changes (scope revoked/narrowed between pages) are **not** writes, so the `as_of` data-snapshot pin
+  does not freeze them. On each page the server re-derives the floor from *that page's* token (HTTP re-verifies
+  per request, §2.2) and re-intersects it with the query. The cursor carries only *what was being asked*
+  (query + sort position), so a principal whose scope narrows mid-walk immediately stops draining results it is
+  no longer entitled to. Because the floor is re-derived rather than cursor-carried, a forged floor is not a
+  reachable state; the seal (F2) protects query intent and sort position.
+- **`as_of` must not be in the future (F13).** A future `as_of` would let facts ingested *after* page 1 satisfy
+  the `ingested_at <= as_of` filter (§5.3), growing the "stable snapshot" across pages and defeating the one
+  property pagination promises. The server rejects a future `as_of` as `invalid_argument` (§7) — or clamps to
+  request time; it never pins a future snapshot.
 - **`as_of` is pinned into the cursor** on the first page, so paging through a large result is a stable
-  point-in-time snapshot even while writes continue. (A caller who wants to see newer facts starts a fresh
-  query, not a continued page.)
+  point-in-time *data* snapshot even while writes continue. (A caller who wants to see newer facts starts a
+  fresh query, not a continued page.)
 - `next_cursor` is present when more results exist, **absent when exhausted** — the absence *is* the
   end-of-results signal. A cursor is opaque and single-query-scoped; replaying it against a different tool or
   tenant is a `bad_cursor` error (§7).
@@ -314,14 +408,14 @@ deployment-independent.
 | Code | Meaning | HTTP origin | Retriable | Notes |
 |---|---|---|---|---|
 | `unauthenticated` | No/invalid/expired token. | 401 | no (re-auth) | HTTP: refresh token. stdio: subprocess relaunch. |
-| `forbidden` | Authenticated but action not allowed (e.g. write with a bad `source.kind`). | 403 | no | Never used for cross-tenant ids — those are `not_found` (§3). |
-| `not_found` | Id not found *within the caller's tenant* (includes cross-tenant ids — fail-closed, §3). | 404 | no | Does not leak existence across tenant. |
-| `invalid_envelope` | Write failed schema/anchor validation (missing anchor, `supersedes` without `subject`, supersedes target mismatch). | 422 | no | `detail` names the field; `rejected_hints` in the write response for soft key failures. |
-| `invalid_argument` | Read arg malformed (no `entity.*` on `get`, bad `as_of`, depth over cap). | 400 | no | — |
-| `bad_cursor` | Cursor opaque-decode failed / wrong tool / wrong tenant / expired snapshot. | 400 | no | Restart the query. |
-| `feature_disabled` | Semantic module off for `search`; whole semantic module off for `recall`. | 501 | no | **Not** a silent empty result — lets callers degrade. Digest-off `recall` *degrades* with a warning instead (§4.5), not this error. |
-| `rate_limited` / `budget_exceeded` | Caller over its request or token budget. | 429 | yes (backoff) | `detail` carries retry-after when known. |
-| `backend_unavailable` | SoT (Grail) write/read path down. | 503 | yes | Only the SoT path. A **derived-view lag is never an error** — keyed reads still serve; a stale graph/vector returns results with a `freshness_lag` warning, not a failure (§5.4 invariant 2). |
+| `forbidden` | Authenticated but the action itself is not allowed by deployment policy (e.g. write to a read-only instance, a disabled tool). | 403 | no | Never used for cross-tenant ids — those are `not_found` (§3). **Not** used for a bad `source.kind` either — that is `invalid_envelope` (F16). |
+| `not_found` | Id not found *within the caller's tenant* — includes cross-tenant `entity.*`/`fact.id`/node ids **and a `supersedes` target the caller's tenant does not own** (fail-closed, §3.2–3.3, F7). | 404 | no | Does not leak existence across tenant. Boundary-crossing `not_found`s are audited and rate-coupled (§3.3, F15). |
+| `invalid_envelope` | Write failed schema/anchor/size validation: missing anchor, `supersedes` without `subject`, supersede **grain** mismatch, **unknown `source.kind`** (F16, the single home for it — it gates the §3.1 anchor-required row), **`fact.body` over `max_body_bytes` or `attachments[]` over `max_attachments`** (F14). | 422 | no | `detail` names the field; `rejected_hints` in the write response for soft key failures. (Supersede target *not owned* is `not_found`, not this — F7.) |
+| `invalid_argument` | Read arg malformed (no `entity.*` on `get`, bad `as_of`, **`as_of` in the future** (F13), depth over cap). | 400 | no | — |
+| `bad_cursor` | Cursor signature-verify failed (tamper) / wrong tool / wrong tenant / expired snapshot. | 400 | no | Cursor is server-signed (§6.1, F2); any client edit fails here. Restart the query. |
+| `feature_disabled` | Semantic module off for `search`; whole semantic module off for `recall`. | 501 | no | **Not** a silent empty result — lets callers degrade. Digest-off `recall` *degrades* with a defined `digests:[]`+`facts:[]` shape and a warning instead (§4.5, F10), not this error. |
+| `rate_limited` / `budget_exceeded` | Caller over its request or token budget, **or over the boundary-crossing-`not_found` probe threshold** (§3.3, F15). | 429 | yes (backoff) | `detail` carries retry-after when known. |
+| `backend_unavailable` | SoT (Grail) write/read path down. | 503 | yes | Only the SoT path. A **derived-view lag is never an error** — keyed reads still serve; a stale graph/vector returns results with a `freshness_lag` warning (§5.4 invariant 2) — **except a `supersedes`-chain walk, which resolves the head from the SoT or returns `supersession_stale`, never a bare lag (§4.3, F9).** A **partial** SoT hydrate (some ids serve, some 503) returns the partial set with `incomplete: true` + `unresolved_count`, **never a silent short set** that reads as "no match" (F11). |
 | `conflict` | Idempotency/version conflict on write. | 409 | no | Returns the existing `fact_id`; the retry already succeeded. |
 
 **Design rule — degrade, don't fail, wherever the SoT can still answer.** The only hard failures are auth,
@@ -362,7 +456,12 @@ the design.
 6. **Token-budget shaping is first-class:** compact default view, `body_max_chars`+`truncated`, `fields`
    projection, a hard server bytes ceiling, `token_estimate` on every response, and `recall`'s snippet-default.
 7. **Degrade-don't-fail:** only auth/validation/SoT-down are hard errors; derived-view gaps degrade to warnings
-   on a successful keyed response.
+   on a successful keyed response — **except supersession-chain staleness, which is never a bare lag** (F9).
+8. **Isolation is mechanism, not assertion (Challenger fold-in, ISI-5878):** principal-salted `fact_id`
+   derivation (F1/F8), signed cursors with per-page floor re-derivation (F2/F3), tenant-partitioned
+   vector/digest indexes (F5/F6), per-hop traverse filtering (F4), owned-only supersede targets (F7),
+   stdio token-lifetime bound (F12), and write-side size caps (F14) are all first-class contract requirements,
+   not inherited hopes. See the fold-in log below.
 
 **Open items — reconcile before finalize (this is the WS-4 "finalized after" dependency):**
 
@@ -380,10 +479,46 @@ the design.
 - **[PM — RATIFIED 2026-10-14, ISI-5879]** Pagination defaults (page 50, k 10/5), compact-default view, and
   `token_estimate`-on-every-response all approved. Body-bytes ceiling set: **64 KB default (≈16k tokens),
   deployment-configurable** (§6.2.4) — enforced on bytes, documented in token-equivalent.
-- **[Challenger]** Red-team the tenant floor (§3): can any combination of `scope`/`entity`/`as_of`/cursor
-  arguments, across transports, surface a fact the caller's tenant doesn't own? The `not_found`-not-`forbidden`
-  rule and the pre-ANN pre-filter are the two load-bearing claims to attack.
-- **[Challenger]** Is `conflict`-returns-existing-`fact_id` on retry safe against a confused-deputy write (A
-  retries B's fact id)? Validate against §3.1 identity binding.
+- **[Challenger — COMPLETE 2026-10-14, ISI-5878]** Red-team done: 16 findings (4 critical). All folded into
+  §2–§7 above; see the **Challenger fold-in log** below for the per-finding resolution. The two seed questions
+  (tenant-floor attack surface; `conflict`-on-retry confused-deputy) resolved as F1–F7: the real
+  confused-deputy vector was `supersedes` targeting (F7), not a `fact.id` retry (write has no `fact.id` input),
+  and the tenant-floor claims were tightened from assertion to enforceable mechanism (principal-salted ids,
+  signed cursors with per-page floor re-derivation, partitioned vector/digest indexes, per-hop traverse
+  filter).
 - **[board/product]** stdio single-principal assumption: confirm no local deployment needs one subprocess to
   serve multiple tenants (the design assumes not; a shared local gateway might).
+
+### Challenger fold-in log (ISI-5878 → this spec)
+
+Every finding resolved in-spec; nothing deferred except the two WS-4 reconciliations called out below. Resolutions
+are the spec owner's call (Winston); the Challenger filed descriptions only.
+
+| # | Sev | Finding (one line) | Resolution in this spec |
+|---|---|---|---|
+| F1 | CRIT | `fact_id` derivation inputs unspecified → cross-tenant existence oracle + silent write-loss | §3: derivation is **principal-salted** (`tenant_id`+`agent_id` mandatory) & body-complete → cross-principal collision impossible. **↳ WS-4 Invariant T.** |
+| F2 | HIGH | "Opaque" cursor ≠ tamper-proof; wrong-tenant check unimplementable | §6.1: cursor is **server-signed** (seal → `bad_cursor` on edit); carries query intent only. |
+| F3 | HIGH | Floor not re-derived per page → stale broad authority mid-walk | §6.1: floor **re-derived + re-intersected every page**; cursor never carries a pre-authorized id set. |
+| F4 | MED/HIGH | `traverse` guards only `start`, not per-hop | §3.5 + §4.3: per-hop `node.tenant == caller` is a **first-class MCP invariant**. |
+| F5 | CRIT | "Pre-ANN pre-filter" assumes a backend neither doc requires; vector record lacks `tenant` | §3.4: **require tenant-partitioned index or hard pre-filter**; vector record MUST carry `tenant_id`. **↳ WS-4 (§5.4.2 record shape).** |
+| F6 | CRIT | Digest `scope_id` not tenant-qualified → `summary` leaks cross-tenant | §3.4: digests **tenant-partitioned at rollup**; `(scope, scope_id)` always tenant-qualified; summarizer never crosses floor. **↳ WS-3 summarizer.** |
+| F7 | CRIT | `supersedes` target ownership unchecked (the real confused-deputy) | §3.2 + §4.1 + §7: target **MUST be tenant-owned** else `not_found`; cross-agent-within-tenant allowed & attributed. **↳ WS-4 Invariant T.** |
+| F8 | HIGH | Derivation undefined on body axis → fork-or-swallow | §3 + §4.1: body **in** derivation; identical retry → `conflict`(own id), content change → new fact via latest-wins. |
+| F9 | HIGH | Stale graph masks a *missing supersession* behind generic lag | §4.3 + §7: supersede-chain walk resolves head from **SoT** or returns `supersession_stale` (not bare `freshness_lag`). |
+| F10 | MED/HIGH | `recall` digest-disabled degrade changes shape; queryless undefined | §4.5: keeps `digests:[]`+adds `facts:[]`+`degraded`; **queryless → keyed scope fetch**, never fact-tier ANN. |
+| F11 | MED | Partial SoT hydrate masks missing facts as "no match" | §7: partial hydrate returns partial + `incomplete:true`+`unresolved_count`, never a silent short set. |
+| F12 | HIGH | stdio principal never re-validated → serves expired authority | §2.1: server **stops serving when the token validity window closes** (self-terminate / `unauthenticated`). |
+| F13 | MED | No `as_of <= now` check → breaks snapshot stability | §6.1 + §7: future `as_of` rejected `invalid_argument` (or clamped to request time). |
+| F14 | MED | Writes unbounded (body/attachments) | §4.1 + §7: `max_body_bytes` / `max_attachments` → `invalid_envelope`. |
+| F15 | LOW/MED | Fail-closed `not_found` is an unlogged probing oracle | §3.3: boundary-crossing `not_found` is **audited and rate-coupled**. |
+| F16 | LOW | Bad `source.kind` classified under three codes | §7: pinned to **`invalid_envelope`** (it gates the §3.1 anchor row). |
+
+**Two findings also cross into WS-4 (ISI-5869, Invariant T) and WS-3 — not closable in the MCP layer alone:**
+
+- **F1 + F7 → WS-4 Invariant T (ISI-5869):** the principal-salt in the `fact_id` derivation and the
+  supersede-target ownership check are properties of the *write/identity contract*, not just its MCP face. The
+  MCP spec states them; WS-4 must make them Invariant-T-level guarantees so every surface (not just MCP)
+  inherits them. A follow-up is routed to ISI-5869.
+- **F5 + F6 → storage/pipeline (WS-4 §5.4.2 vector record + WS-3 summarizer):** the vector record must carry
+  `tenant_id` and the digest rollup must be tenant-partitioned. The MCP contract *requires* these; the
+  owning docs must reflect them or the MCP isolation guarantee is unbacked.
