@@ -312,8 +312,11 @@ enforced on the append-only SoT by a read-time query (that is a check-then-write
 that tuple — the single serialization/compare-and-set point (§6 stage 3–4). It is a write-path
 *coordination* structure, **not** a second source of truth: Grail stays the authoritative
 append-only record, the live-head index only names which fact.id currently holds the head for
-a statement. It co-locates with the `fact.id` idempotency ledger in the strongly-consistent
-store (the single-Postgres default of the reference architecture, Decision A); the reference
+a statement. The entity component of the key is the T1 entity-identity-keys composite
+**excluding `entity.agent`** (pinned normatively in §7.6 T3): the head is per *statement*,
+not per producing agent, and the reference index's `entity_identity` column is the same
+agent-excluded composite. It co-locates with the `fact.id` idempotency ledger in the
+strongly-consistent store (the single-Postgres default of the reference architecture, Decision A); the reference
 realization is a Postgres partial-unique index
 `UNIQUE (tenant_id, entity_identity, subject, type) WHERE NOT superseded`.
 
@@ -618,8 +621,10 @@ only — an agent's write latency never depends on embedding, summarization, or 
 3. **Temporalize + live-head serialization.** Set the event-time axis (`fact.event_time` or
    `emitted_at`). For a **subject-bearing** fact (`subject` non-null — the supersession grain),
    enter the per-key critical section of the **live-head index** (§5.1) keyed on
-   `H = (tenant_id, <entity-identity-keys of T1>, subject, type)`. Serializing on `H` is the
-   only race-free point for the uniqueness invariant (§7.6 **T3**); a read-time check is a
+   `H = (tenant_id, <entity-identity-keys of T1>, subject, type)` — the entity component
+   **excludes `entity.agent`** (§7.6 T3): one head per *statement*, not per producing agent.
+   Serializing on `H` is the only race-free point for the uniqueness invariant (§7.6 **T3**);
+   a read-time check is a
    check-then-write TOCTOU race and the SoT is append-only, so neither alone can hold it.
    Inside the section, resolve the head via **compare-and-set** on the stored head id:
    - `supersedes` set → apply the **Invariant T (§7.6 T2) tenant-ownership check first**: the
@@ -635,7 +640,10 @@ only — an agent's write latency never depends on embedding, summarization, or 
      the idempotency ledger before this stage.
 
    Cross-agent-within-tenant supersession is allowed and attributed; cross-tenant is impossible
-   (T2). Non-subject facts skip the section entirely — they are independent observations, never
+   (T2). Because `entity.agent` is not a component of `H`, two agents on a tenant writing the
+   same-subject fact on one entity chain by latest-wins (auto-supersede on the occupied head) —
+   the intended collaboration model. Non-subject facts skip the section entirely — they are
+   independent observations, never
    versioned, and may legitimately share `(entity, null, type)`. No write-back to prior records —
    supersession is read-time (§5.1).
 4. **Commit (keyed write).** Write the authoritative record into `agentmesh_facts` (Grail
@@ -671,7 +679,10 @@ only — an agent's write latency never depends on embedding, summarization, or 
      project-scoped controlled vocabulary and writes `category[]` facets back onto the keyed
      record's derived-attribute projection (§5.4.3). Idempotent on `(fact.id, derivation_version)`.
 
-Stages 1–3 are pure and backend-agnostic. Stage 4 is the only synchronous backend write.
+Stages 1–2 are pure and backend-agnostic. Stage 3 is the coordination stage — strongly
+consistent and backend-aware, but not a record write: it serializes on the live-head key `H`
+(§5.1) and resolves the head via compare-and-set. Stage 4 is the only synchronous SoT write:
+the keyed record and the live-head pointer advance together in the same critical section.
 Stages 5a–5d run in the ingest queue: order-independent per fact, serialized per supersedes
 chain (so the `supersedes` edge is written only after both endpoints are committed) and
 debounced per scope (5c). A derived-view outage never blocks writes or keyed reads; it only
@@ -812,7 +823,9 @@ write path. Two rules:
 assigns `fact.id` at stage 1 (§6) MUST take `tenant_id` **and** `agent_id` (the authenticated
 `entity.agent`) as **mandatory** inputs, alongside the full `fact.body` and the identity-bearing
 keys. Formally the id is a hash over `(tenant_id, agent_id, entity-identity-keys, fact.type,
-fact.subject, fact.body)`. Consequences:
+fact.subject, fact.body)`. The `agent_id` input is the **agent salt** — identity for
+idempotency purposes; it is deliberately **not** a component of the live-head key `H`
+(see T3). Consequences:
 
 - **No cross-tenant collision.** Two principals that push byte-identical bodies derive *different*
   ids, so one tenant's write can never land on (or silently overwrite — the `conflict` path) a
@@ -840,7 +853,16 @@ oracle. Only a tenant-owned target proceeds to the grain check.
 
 **T3 — live-head uniqueness for supersession (F1/F2/F3, CRITICAL).** For every subject-bearing
 statement there is **at most one non-superseded ("live-head") fact** per
-`H = (tenant_id, <the entity-identity-keys of T1>, subject, type)`. Read-time "latest
+`H = (tenant_id, <the entity-identity-keys of T1>, subject, type)`. **The entity component
+of `H` excludes `entity.agent`** — it is exactly the T1 entity-identity-keys composite (the
+identity-bearing entity keys of §4), with the producing agent carried in the T1 `fact.id`
+salt (§7.6 T1) but never in `H`: the head is per *statement*, not per producing agent. The
+semantic consequence is intended — two agents on a tenant writing the same-subject fact on
+one entity chain by latest-wins (auto-supersede on the occupied head), the collaboration
+model of T2; the opposite composition (agent in `H`) would leave both agents' facts live on
+one statement, the fork T3 exists to prevent. In the reference realization, the
+`entity_identity` column of the partial-unique index is likewise the agent-excluded composite.
+Read-time "latest
 non-superseded" (§5.2) *reports* the head; it cannot *enforce* uniqueness — two plain writes
 that never set `supersedes` each pass the T2 `supersedes`-conditioned check (it never fires)
 and both land live, a **fork**; a read-then-write check is a TOCTOU race; and the SoT is
@@ -1004,6 +1026,17 @@ rebuilt from, so proving it first is the correct order.
     `a2a_counterpart_resolution` record), flipping the `a2a_participant` edge from best-effort to
     rebuild-identical (§3, §5.1, §5.4.1, §7.6). **Implementation routed to WS-3 pipeline** (live-head
     gate + resolution-record emission); invariant verification routed to Challenger.
+15. **T3 polish — `H` composition pinned (agent-excluded) + §6 stage-purity correction** —
+    **RULED (Architect, ISI-6053, 2026-10-16):** folds the two doc-level residuals from the
+    ISI-5906 Challenger verification (ISI-5913, PASS — work product
+    `6a39cca3-b1cb-40f9-ae66-ba357450dbfa`). **R1:** the live-head key
+    `H = (tenant_id, <entity-identity-keys of T1>, subject, type)` explicitly **excludes
+    `entity.agent`** — the agent stays in the T1 `fact.id` salt, so two agents' same-subject
+    facts on one entity chain by latest-wins (the intended collaboration model, §7.6 T3);
+    the reference partial-unique index's `entity_identity` column is the same agent-excluded
+    composite (§5.1). **R2:** the §6 tail no longer claims stages 1–3 pure — stages 1–2 pure
+    and backend-agnostic, stage 3 the strongly-consistent coordination stage (per-key critical
+    section + head CAS on the live-head index, §5.1), stage 4 the only synchronous SoT write.
 
 ---
 
