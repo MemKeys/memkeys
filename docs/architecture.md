@@ -316,8 +316,8 @@ a statement. The entity component of the key is the T1 entity-identity-keys comp
 **excluding `entity.agent`** (pinned normatively in §7.6 T3): the head is per *statement*,
 not per producing agent, and the reference index's `entity_identity` column is the same
 agent-excluded composite. It co-locates with the `fact.id` idempotency ledger in the
-strongly-consistent store (the single-Postgres default of the reference architecture, Decision A); the reference
-realization is a Postgres partial-unique index
+strongly-consistent store (the single-Postgres default of the reference architecture,
+Decision A); the reference realization is a Postgres partial-unique index
 `UNIQUE (tenant_id, entity_identity, subject, type) WHERE NOT superseded`.
 
 **`tenant_id` is the isolation key.** It is a component of the verified `provenance.principal`
@@ -624,8 +624,8 @@ only — an agent's write latency never depends on embedding, summarization, or 
    `H = (tenant_id, <entity-identity-keys of T1>, subject, type)` — the entity component
    **excludes `entity.agent`** (§7.6 T3): one head per *statement*, not per producing agent.
    Serializing on `H` is the only race-free point for the uniqueness invariant (§7.6 **T3**);
-   a read-time check is a
-   check-then-write TOCTOU race and the SoT is append-only, so neither alone can hold it.
+   a read-time check is a check-then-write TOCTOU race and the SoT is append-only, so neither
+   alone can hold it.
    Inside the section, resolve the head via **compare-and-set** on the stored head id:
    - `supersedes` set → apply the **Invariant T (§7.6 T2) tenant-ownership check first**: the
      target MUST be owned by the caller's tenant, else fail closed with `not_found` (never a
@@ -643,9 +643,8 @@ only — an agent's write latency never depends on embedding, summarization, or 
    (T2). Because `entity.agent` is not a component of `H`, two agents on a tenant writing the
    same-subject fact on one entity chain by latest-wins (auto-supersede on the occupied head) —
    the intended collaboration model. Non-subject facts skip the section entirely — they are
-   independent observations, never
-   versioned, and may legitimately share `(entity, null, type)`. No write-back to prior records —
-   supersession is read-time (§5.1).
+   independent observations, never versioned, and may legitimately share `(entity, null, type)`.
+   No write-back to prior records — supersession is read-time (§5.1).
 4. **Commit (keyed write).** Write the authoritative record into `agentmesh_facts` (Grail
    ingest) and, in the same critical section, advance the live-head index CAS to this `fact.id`
    (subject-bearing facts) — so the keyed record and the head pointer move together and no fork
