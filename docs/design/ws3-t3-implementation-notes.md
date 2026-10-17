@@ -1,8 +1,15 @@
 # WS-3 / ISI-5914 — T3 live-head CAS gate + T4 A2A resolution: implementation notes
 
 Status: **implemented** (realization (b)); `entity_identity`/`H` composition
-pinned to a defensible default (see §3) **pending Architect ratification**
-(ISI-6131). Owner: WS-3 pipeline. Reference contract: `docs/architecture.md`
+**ratified by the Architect (ISI-6131, §7.6 T3-pin)**:
+`H = (tenant_id, {project,issue,pr,thread,service}, subject, type)` — `agent`
+and `run` excluded (`run` is lifted by §4 enrichment into project/issue/pr
+before `H`; `thread` stays as the durable a2a anchor-of-record); an empty
+composite ⇒ unkeyed-for-`H` ⇒ gate bypassed. Q2: stage-3 grain is unified on
+`H`-equality (the "shares ≥1 anchor" rule is retired as authoritative and
+remains only as an early pre-filter). Q3: realization (b); `fact.id` ⊥ `H`
+(M1's shipped `fact.id` is unchanged — it already meets the T1 security floor).
+Owner: WS-3 pipeline. Reference contract: `docs/architecture.md`
 §7.6 (Invariant T), §6 stage 3–4, §5.1 — as pinned on
 `isi-5906/live-head-uniqueness` @ `583082a` and polished by ISI-6053
 (`8d6d165`: *H excludes `entity.agent`*).

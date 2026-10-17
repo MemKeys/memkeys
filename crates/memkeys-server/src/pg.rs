@@ -66,51 +66,49 @@ FOR UPDATE";
 /// (never valid inside an opaque entity-key value).
 const EID_SEP: &str = "\u{1f}";
 
-/// The durable entity component of the live-head key `H` (§7.6 T3) for a
-/// subject-bearing keyed fact, else `None` (the fact skips the gate).
+/// The entity component of the live-head key `H` (§7.6 **T3-pin**, ratified by
+/// ISI-6131) for a subject-bearing fact, else `None` (the fact skips the gate).
 ///
-/// Composition (ISI-5914; pending Architect ratification in ISI-6131): the
-/// DURABLE keyed dimensions `project/issue/pr/service` — a *statement's*
-/// identity — excluding `entity.agent` (ISI-6053 R1: head is per statement,
-/// not per producing agent) and the episodic `entity.run`/`entity.thread`
-/// (the same statement chains by latest-wins across runs). When no durable key
-/// resolved, the run/thread anchor is the fallback so run-only / thread-only
-/// facts never cross-collide on `(subject, type)` alone. The value is written
-/// once at commit and is immutable (append-only SoT preserved).
+/// Composition: the durable keyed dimensions `project/issue/pr/thread/service`
+/// — a *statement's* identity. Excluded: `entity.agent` (ISI-6053 R1: the head
+/// is per statement, not per producing agent; agent stays in the `fact.id`
+/// salt only) and `entity.run` (episodic — §4 enrichment lifts a resolvable
+/// run into project/issue/pr *before* `H` is computed, so a run keeps chaining
+/// the same durable statement; `thread` is kept as the durable a2a
+/// anchor-of-record). An **empty composite ⇒ unkeyed for `H` ⇒ gate bypassed**
+/// (`None`) — a run-only fact that enrichment could not lift is not gated. The
+/// value is written once at commit and is immutable (append-only SoT preserved).
 fn entity_identity(fact: &ProcessedFact) -> Option<String> {
-    // Gate scope: subject-bearing (the supersession grain) and keyed.
-    let subject = fact.subject.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if subject.is_none() || !fact.keyed {
+    // Gate scope: subject-bearing (the supersession grain).
+    let has_subject = fact
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if !has_subject {
         return None;
     }
     let e = &fact.entity;
-    let compose = |keys: &[(&str, &Option<String>)]| -> Vec<String> {
-        keys.iter()
-            .filter_map(|(k, v)| {
-                v.as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|v| format!("{k}={v}"))
-            })
-            .collect()
-    };
-    let durable = compose(&[
+    let durable: Vec<String> = [
         ("project", &e.project),
         ("issue", &e.issue),
         ("pr", &e.pr),
+        ("thread", &e.thread),
         ("service", &e.service),
-    ]);
-    let parts = if durable.is_empty() {
-        compose(&[("run", &e.run), ("thread", &e.thread)])
-    } else {
-        durable
-    };
-    if parts.is_empty() {
-        // Keyed only by agent (not an anchor) — cannot happen for a keyed
-        // fact, but stay total rather than forge an empty identity.
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|v| format!("{k}={v}"))
+    })
+    .collect();
+    if durable.is_empty() {
+        // Unkeyed for H (e.g. an unlifted run-only fact) — skip the gate.
         return None;
     }
-    Some(parts.join(EID_SEP))
+    Some(durable.join(EID_SEP))
 }
 
 /// A stable 64-bit key for `pg_advisory_xact_lock` derived from the full
@@ -451,20 +449,44 @@ mod tests {
     }
 
     #[test]
-    fn entity_identity_falls_back_to_anchor_without_a_durable_key() {
-        // Run-only facts must not cross-collide on (subject, type) alone.
-        let a = keys(None, None, Some("r1"), None);
-        let b = keys(None, None, Some("r2"), None);
-        let ha = entity_identity(&gated_fact(a, Some("s")));
-        let hb = entity_identity(&gated_fact(b, Some("s")));
-        assert_ne!(ha, hb);
-        assert_eq!(ha.as_deref(), Some("run=r1"));
+    fn entity_identity_excludes_run_so_an_unlifted_run_only_fact_is_not_gated() {
+        // §4 enrichment lifts a resolvable run into project/issue/pr before H;
+        // a run that was not lifted leaves an empty durable composite → the
+        // fact is unkeyed for H and skips the gate (T3-pin / ISI-6131).
+        let run_only = keys(None, None, Some("r1"), None);
+        assert!(entity_identity(&gated_fact(run_only, Some("s"))).is_none());
+    }
+
+    #[test]
+    fn entity_identity_includes_thread_as_the_durable_a2a_anchor() {
+        let t1 = EntityKeys {
+            thread: Some("T1".into()),
+            ..Default::default()
+        };
+        let t2 = EntityKeys {
+            thread: Some("T2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            entity_identity(&gated_fact(t1, Some("s"))).as_deref(),
+            Some("thread=T1")
+        );
+        assert_ne!(
+            entity_identity(&gated_fact(t2, Some("s"))),
+            entity_identity(&gated_fact(
+                EntityKeys {
+                    thread: Some("T1".into()),
+                    ..Default::default()
+                },
+                Some("s")
+            ))
+        );
     }
 
     #[test]
     fn entity_identity_is_none_for_subjectless_or_unkeyed() {
         assert!(entity_identity(&gated_fact(keys(None, Some("I1"), None, None), None)).is_none());
-        // Unkeyed (no anchor) → None even with a subject.
+        // Unkeyed for H (no durable key) → None even with a subject.
         assert!(entity_identity(&gated_fact(EntityKeys::default(), Some("s"))).is_none());
     }
 
