@@ -76,6 +76,22 @@ pub fn start_span(name: &'static str, kind: SpanKind, attrs: Vec<KeyValue>) -> g
         .start(&tracer())
 }
 
+/// Start a child span under an explicit parent context. The write path uses
+/// this (not thread-local attach) so spans parent correctly across `.await`
+/// boundaries without making the pipeline future `!Send`.
+pub fn start_child_span(
+    name: &'static str,
+    kind: SpanKind,
+    attrs: Vec<KeyValue>,
+    parent: &opentelemetry::Context,
+) -> global::BoxedSpan {
+    tracer()
+        .span_builder(name)
+        .with_kind(kind)
+        .with_attributes(attrs)
+        .start_with_context(&tracer(), parent)
+}
+
 /// The M1 instrument set, built once per process from the global meter.
 #[derive(Debug, Clone)]
 pub struct Instruments {

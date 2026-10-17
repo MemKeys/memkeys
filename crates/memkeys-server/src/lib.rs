@@ -15,12 +15,14 @@
 
 pub mod envelope;
 pub mod error;
+pub mod memstore;
 pub mod model;
 pub mod pg;
 pub mod pipeline;
 pub mod service;
 pub mod store;
 pub mod telemetry;
+pub mod telemetry_setup;
 
 pub use envelope::{EntityHints, Envelope, FactBlock, SourceBlock, SourceKind};
 pub use error::{IngestError, QueryError};
