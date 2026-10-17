@@ -44,6 +44,12 @@ pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
 pub const OUTCOME_DUPLICATE: &str = "duplicate";
 
+/// M3 protocol-surface attribute values (`memkeys.transport`). stdio = a
+/// launch-bound single-principal subprocess; http = the per-request-auth
+/// Streamable-HTTP shared server (WS-5 §2).
+pub const TRANSPORT_STDIO: &str = "stdio";
+pub const TRANSPORT_HTTP: &str = "http";
+
 /// The complete attribute-key registry every signal may carry (signal-catalog
 /// "Custom attribute registry" + the pinned stable db.* group). Anything not
 /// listed is a catalog violation and is refused in debug builds.
@@ -56,6 +62,11 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memkeys.projection.kind",
     "memkeys.graph.depth",
     "memkeys.graph.truncate.reason",
+    // M3 protocol surface (WS-5 §2/§7): the transport the request arrived on
+    // and the MCP tool name. Kinds/names only — never argument VALUES (the
+    // deny-list still holds: no bodies, no entity-key values, no query text).
+    "memkeys.transport",
+    "memkeys.mcp.tool",
     "outcome",
     // Pinned stable db.* group (semconv-pins.yaml; db.query.text is DISABLED).
     "db.system.name",

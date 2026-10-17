@@ -1,16 +1,17 @@
-//! memkeys-server binary — M2 bootstrap with M4 OTel wiring.
+//! memkeys-server binary — M3 HTTP + MCP transport.
 //!
-//! M1 shipped the FactStore + pipeline + keyed read as a library with a
-//! minimal entry point. M2 adds the graph projection: wire OTel (OTLP when
-//! OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise no-op), connect, apply
-//! migrations (FactStore + edges), then run the stage-5a projection worker —
-//! an initial SoT catch-up scan (the projection is built FROM the FactStore)
-//! followed by a periodic drain + hole scan. The transport (HTTP/MCP) is M3;
-//! the open contract is not part of M2.
+//! M1 shipped the FactStore + pipeline + keyed read as a library. M2 added
+//! the graph projection with OTel wiring. M3 adds:
+//!   - axum HTTP server on `MEMKEYS_HTTP_PORT` (default 3000) serving
+//!     `/memory/*` routes.
+//!   - MCP stdio server: JSON-RPC 2.0 over stdin/stdout, WS-5 tools.
+//!   - Admission control: `X-MemKeys-Tenant` (required) + `X-MemKeys-Token`
+//!     bearer check when `MEMKEYS_AUTH_TOKEN` is set.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use memkeys_server::http::AppState;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
 use memkeys_server::service::MemKeysService;
@@ -27,11 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("MEMKEYS_DATABASE_URL").map_err(|_| "MEMKEYS_DATABASE_URL is required")?;
     let store = PgStore::connect(&database_url).await?;
     let graph = Arc::new(PgGraph::from_pool(store.pool().clone()));
-    let service = MemKeysService::with_graph_projection(
+    let service = Arc::new(MemKeysService::with_graph_projection(
         Arc::new(store),
         Arc::new(memkeys_server::pipeline::NoopResolver),
         graph.clone(),
-    );
+    ));
     let worker = service
         .projection_worker()
         .expect("worker is wired with the graph projection");
@@ -46,9 +47,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Steady state: drain the post-commit queue + rescan for holes (the
-    // reconciler/backfill of M7 subsumes the rescan; the queue drain is the
-    // §6 stage-5a hot path).
+    // M3: HTTP server.
+    let http_port: u16 = std::env::var("MEMKEYS_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let app_state = AppState::new(service.clone());
+    let router = memkeys_server::http::router(app_state);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_port)).await?;
+    println!("memkeys-server: HTTP listening on :{http_port}");
+    let http_server = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, router).await {
+            tracing::error!(target: "memkeys", "HTTP server error: {e}");
+        }
+    });
+
+    // M3: MCP stdio server (spawned as a concurrent task).
+    let mcp_service = service.clone();
+    let mcp_task = tokio::spawn(async move {
+        memkeys_server::mcp::run_stdio(mcp_service).await;
+    });
+
+    // Steady state: drain the post-commit queue + rescan for holes.
     let loop_worker = worker.clone();
     let maintenance = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -66,6 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::signal::ctrl_c().await?;
     maintenance.abort();
+    http_server.abort();
+    mcp_task.abort();
     println!("memkeys-server: shut down");
     // The OTel guard drops here at scope end — M4 Drop flushes providers/exporters.
     drop(otel);
