@@ -1,0 +1,61 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: memkeys
+
+jobs:
+  docker:
+    name: docker-build + sbom + grype
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom-memkeys.spdx.json
+
+      - name: Scan image with grype (fail on critical)
+        uses: anchore/scan-action@v6
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories, licenses, bans)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: advisories bans licenses
