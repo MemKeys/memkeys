@@ -112,7 +112,7 @@ impl FactStore for MemStore {
             .collect();
 
         // Newest event first, bounded (same contract as the Postgres read).
-        rows.sort_by(|a, b| b.event_time.cmp(&a.event_time));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.event_time));
         rows.truncate(query.limit as usize);
 
         // Read-time supersession collapse (§5.2, `valid=current`): drop records
