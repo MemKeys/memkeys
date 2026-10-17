@@ -1,10 +1,13 @@
 # WS-3 / ISI-5914 — T3 live-head CAS gate + T4 A2A resolution: implementation notes
 
 Status: **implemented** (realization (b)); `entity_identity`/`H` composition
-**ratified by the Architect (ISI-6131, §7.6 T3-pin)**:
-`H = (tenant_id, {project,issue,pr,thread,service}, subject, type)` — `agent`
-and `run` excluded (`run` is lifted by §4 enrichment into project/issue/pr
-before `H`; `thread` stays as the durable a2a anchor-of-record); an empty
+**ratified by the Architect (ISI-6131, §7.6 T3-pin; Q1 corrected at `a4d3522`)**:
+`H = (tenant_id, (project,issue,pr), subject, type)` — `entity_identity` is the
+work-item coordinate tuple; `agent` and **all three §4 per-source transport
+anchors `run`/`thread`/`service`** are excluded (enrichment lifts a resolvable
+anchor into project/issue/pr before `H`, so the same statement keeps chaining
+across runs/threads/services; keeping `thread`/`service` would re-fork
+cross-thread / cross-service versioning of one work-item statement). An empty
 composite ⇒ unkeyed-for-`H` ⇒ gate bypassed. Q2: stage-3 grain is unified on
 `H`-equality (the "shares ≥1 anchor" rule is retired as authoritative and
 remains only as an early pre-filter). Q3: realization (b); `fact.id` ⊥ `H`
@@ -28,7 +31,8 @@ Owner: WS-3 pipeline. Reference contract: `docs/architecture.md`
 
 Verified by CI on the PR (fmt + clippy `-D warnings` + `cargo test --workspace`
 against a Postgres service) — this environment has no local Rust toolchain/PG.
-The **only** open item is Architect ratification of the §3 `H` composition.
+The §3 `H` composition is now **ratified** (ISI-6131, §7.6 T3-pin; Q1 corrected
+at `a4d3522`) — see the resolution note in §3.
 
 This note is the handoff artifact for the T3 pipeline change. It records the
 chosen realization and exact write-path logic (ready to code), and the single
@@ -129,6 +133,22 @@ defense-in-depth for the grain/error-message path; the current-head decision
 is authoritative and lives in the locked section.
 
 ## 3. The blocker — `entity_identity` (`H`) is undefined against shipped M1
+
+> **RESOLVED (ISI-6131, §7.6 T3-pin; Q1 corrected at `a4d3522`).**
+> **Q1:** `entity_identity = (project, issue, pr)` — the work-item coordinate
+> tuple. `agent` is excluded (producer, not statement — ISI-6053) and **all
+> three §4 per-source transport anchors `run`/`thread`/`service`** are excluded
+> (how a fact arrived, not what it is about). §4 enrichment lifts a resolvable
+> anchor into project/issue/pr *before* `H`, so the same statement keeps
+> chaining across runs/threads/services; an anchor-only fact enrichment cannot
+> lift has an empty composite and is gate-skipped as an independent observation.
+> (The earlier pin at `4724477` kept `thread`/`service`; that was corrected
+> because it forks cross-thread / cross-service decisions on one issue into two
+> live heads.) **Q2:** the stage-3 grain is unified on `H`-equality — an
+> explicit `supersedes` is valid iff the target shares `entity_identity`
+> (project/issue/pr), subject, and type; "shares ≥1 anchor" is retired.
+> **Q3:** realization (b); `fact.id` ⊥ `H` (M1's idempotency-key `fact.id`
+> stays as-is). The open sub-questions below are kept as the rationale record.
 
 §7.6 T1 defines `fact.id` as a hash over `(tenant_id, agent_id,
 entity-identity-keys, type, subject, body)`, and `H` reuses that

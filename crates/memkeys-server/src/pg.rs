@@ -69,15 +69,20 @@ const EID_SEP: &str = "\u{1f}";
 /// The entity component of the live-head key `H` (§7.6 **T3-pin**, ratified by
 /// ISI-6131) for a subject-bearing fact, else `None` (the fact skips the gate).
 ///
-/// Composition: the durable keyed dimensions `project/issue/pr/thread/service`
-/// — a *statement's* identity. Excluded: `entity.agent` (ISI-6053 R1: the head
-/// is per statement, not per producing agent; agent stays in the `fact.id`
-/// salt only) and `entity.run` (episodic — §4 enrichment lifts a resolvable
-/// run into project/issue/pr *before* `H` is computed, so a run keeps chaining
-/// the same durable statement; `thread` is kept as the durable a2a
-/// anchor-of-record). An **empty composite ⇒ unkeyed for `H` ⇒ gate bypassed**
-/// (`None`) — a run-only fact that enrichment could not lift is not gated. The
-/// value is written once at commit and is immutable (append-only SoT preserved).
+/// Composition: the **work-item coordinate tuple** `(project, issue, pr)` — the
+/// §4 keys that identify *what the fact is about* — taken from the **enriched**
+/// entity (this runs after §4 enrichment). Excluded: `entity.agent` (ISI-6053
+/// R1: the head is per statement, not per producing agent; agent stays in the
+/// `fact.id` salt only) and **all three per-source transport anchors `run`,
+/// `thread`, `service`** (how the fact arrived, not what it is about). §4
+/// enrichment lifts a resolvable anchor to its work-item container *before* `H`
+/// is computed, so the same statement keeps chaining across runs/threads/
+/// services; keeping `thread`/`service` would re-fork cross-thread / cross-
+/// service versioning of one work-item statement (ISI-6131 Q1 correction,
+/// a4d3522). An **empty composite ⇒ unkeyed for `H` ⇒ gate bypassed** (`None`)
+/// — an anchor-only fact enrichment could not lift is an independent
+/// observation, not a competing head. The value is written once at commit and
+/// is immutable (append-only SoT preserved).
 fn entity_identity(fact: &ProcessedFact) -> Option<String> {
     // Gate scope: subject-bearing (the supersession grain).
     let has_subject = fact
@@ -89,12 +94,10 @@ fn entity_identity(fact: &ProcessedFact) -> Option<String> {
         return None;
     }
     let e = &fact.entity;
-    let durable: Vec<String> = [
+    let coordinate: Vec<String> = [
         ("project", &e.project),
         ("issue", &e.issue),
         ("pr", &e.pr),
-        ("thread", &e.thread),
-        ("service", &e.service),
     ]
     .into_iter()
     .filter_map(|(k, v)| {
@@ -104,11 +107,11 @@ fn entity_identity(fact: &ProcessedFact) -> Option<String> {
             .map(|v| format!("{k}={v}"))
     })
     .collect();
-    if durable.is_empty() {
-        // Unkeyed for H (e.g. an unlifted run-only fact) — skip the gate.
+    if coordinate.is_empty() {
+        // Unkeyed for H (e.g. an unlifted anchor-only fact) — skip the gate.
         return None;
     }
-    Some(durable.join(EID_SEP))
+    Some(coordinate.join(EID_SEP))
 }
 
 /// A stable 64-bit key for `pg_advisory_xact_lock` derived from the full
@@ -451,42 +454,63 @@ mod tests {
     #[test]
     fn entity_identity_excludes_run_so_an_unlifted_run_only_fact_is_not_gated() {
         // §4 enrichment lifts a resolvable run into project/issue/pr before H;
-        // a run that was not lifted leaves an empty durable composite → the
+        // a run that was not lifted leaves an empty work-item composite → the
         // fact is unkeyed for H and skips the gate (T3-pin / ISI-6131).
         let run_only = keys(None, None, Some("r1"), None);
         assert!(entity_identity(&gated_fact(run_only, Some("s"))).is_none());
     }
 
     #[test]
-    fn entity_identity_includes_thread_as_the_durable_a2a_anchor() {
-        let t1 = EntityKeys {
+    fn entity_identity_excludes_thread_and_service_as_transport_anchors() {
+        // ISI-6131 Q1 correction (a4d3522): thread/service are §4 per-source
+        // transport anchors, excluded alongside run. An anchor-only fact that
+        // enrichment could not lift to a work-item coordinate is unkeyed for H
+        // and gate-skipped (an independent observation, not a competing head).
+        let thread_only = EntityKeys {
             thread: Some("T1".into()),
             ..Default::default()
         };
-        let t2 = EntityKeys {
+        let service_only = EntityKeys {
+            service: Some("svc-a".into()),
+            ..Default::default()
+        };
+        assert!(entity_identity(&gated_fact(thread_only, Some("s"))).is_none());
+        assert!(entity_identity(&gated_fact(service_only, Some("s"))).is_none());
+    }
+
+    #[test]
+    fn entity_identity_collapses_cross_thread_and_cross_service_on_one_work_item() {
+        // The same work-item statement reached over two threads (or two
+        // services) resolves to ONE live head — excluding thread/service is
+        // exactly what prevents the cross-thread / cross-service fork on the
+        // A2A and telemetry paths (ISI-6131 Q1).
+        let via_t1 = EntityKeys {
+            issue: Some("I1".into()),
+            thread: Some("T1".into()),
+            ..Default::default()
+        };
+        let via_t2 = EntityKeys {
+            issue: Some("I1".into()),
             thread: Some("T2".into()),
             ..Default::default()
         };
-        assert_eq!(
-            entity_identity(&gated_fact(t1, Some("s"))).as_deref(),
-            Some("thread=T1")
-        );
-        assert_ne!(
-            entity_identity(&gated_fact(t2, Some("s"))),
-            entity_identity(&gated_fact(
-                EntityKeys {
-                    thread: Some("T1".into()),
-                    ..Default::default()
-                },
-                Some("s")
-            ))
-        );
+        let via_svc = EntityKeys {
+            issue: Some("I1".into()),
+            service: Some("svc-a".into()),
+            ..Default::default()
+        };
+        let h1 = entity_identity(&gated_fact(via_t1, Some("s")));
+        let h2 = entity_identity(&gated_fact(via_t2, Some("s")));
+        let h3 = entity_identity(&gated_fact(via_svc, Some("s")));
+        assert_eq!(h1.as_deref(), Some("issue=I1"));
+        assert_eq!(h1, h2);
+        assert_eq!(h1, h3);
     }
 
     #[test]
     fn entity_identity_is_none_for_subjectless_or_unkeyed() {
         assert!(entity_identity(&gated_fact(keys(None, Some("I1"), None, None), None)).is_none());
-        // Unkeyed for H (no durable key) → None even with a subject.
+        // Unkeyed for H (no work-item coordinate) → None even with a subject.
         assert!(entity_identity(&gated_fact(EntityKeys::default(), Some("s"))).is_none());
     }
 

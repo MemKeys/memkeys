@@ -1,21 +1,24 @@
 -- MemKeys T3 — live-head key (WS-4 Invariant T §7.6 T3; ISI-5914).
 --
--- Adds `entity_identity`: the durable entity component of the live-head key
+-- Adds `entity_identity`: the work-item entity component of the live-head key
 --   H = (tenant_id, entity_identity, subject, fact_type)
--- for subject-bearing keyed facts. It is computed by the write path (pg.rs
+-- for subject-bearing facts. It is computed by the write path (pg.rs
 -- `entity_identity()`) and written once at commit — IMMUTABLE, never rewritten
 -- (append-only SoT is preserved; this is not a supersession flag).
 --
--- Composition (§7.6 T3-pin, ratified ISI-6131): the DURABLE keyed dimensions
--- project/issue/pr/thread/service — the keys that identify a *statement*. It
--- EXCLUDES:
+-- Composition (§7.6 T3-pin, ratified ISI-6131, Q1 corrected a4d3522): the
+-- WORK-ITEM COORDINATE tuple project/issue/pr — the keys that identify *what a
+-- statement is about*. It EXCLUDES:
 --   * entity.agent — the head is per statement, not per producing agent
 --                    (ISI-6053 R1); the agent stays in the fact.id salt only.
---   * entity.run   — episodic. §4 enrichment lifts a resolvable run into
---                    project/issue/pr BEFORE H is computed, so a run keeps
---                    chaining the same durable statement; a run that was not
---                    lifted leaves an empty composite (below). (thread stays —
---                    it is the durable a2a anchor-of-record.)
+--   * entity.run / entity.thread / entity.service — the three §4 per-source
+--                    transport anchors (how a fact arrived, not what it is
+--                    about). §4 enrichment lifts a resolvable anchor into
+--                    project/issue/pr BEFORE H is computed, so the same
+--                    statement keeps chaining across runs/threads/services; an
+--                    anchor that was not lifted leaves an empty composite
+--                    (below). Keeping thread/service would re-fork cross-thread
+--                    / cross-service versioning of one work-item statement.
 -- An EMPTY composite => the fact is unkeyed for H and NULL here: it skips the
 -- live-head gate (also NULL for subject-null facts).
 --

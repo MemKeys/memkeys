@@ -518,6 +518,57 @@ async fn plain_write_to_occupied_head_auto_supersedes() {
 }
 
 #[tokio::test]
+async fn cross_thread_writes_on_one_issue_collapse_to_one_head() {
+    // ISI-6131 Q1 correction (a4d3522): `thread` is a §4 transport anchor,
+    // EXCLUDED from `entity_identity` alongside `run`/`service`. Two plain
+    // writes to the same work-item statement (same issue + subject + type)
+    // reached over two different threads must collapse to ONE live head — if
+    // `thread` were in `H` they would fork into two competing "current"
+    // decisions on one issue, the exact fork the correction removes.
+    let (svc, tenant) = service(Arc::new(NoopResolver)).await;
+    let c = CallerContext {
+        tenant_id: tenant.clone(),
+        principal: "agent-a".into(),
+        trace_id: None,
+    };
+    let stmt = |body: &str, thread: &str| {
+        envelope(serde_json::json!({
+            "source": { "kind": "a2a_exchange", "emitted_at": "2026-10-17T10:00:00Z" },
+            "entity": { "thread": thread, "issue": "I1" },
+            "fact": { "type": "decision", "body": body, "subject": "the chosen database" }
+        }))
+    };
+    let r1 = ingest(&svc, &c, &stmt("database: postgres", "t1")).await;
+    let r2 = ingest(&svc, &c, &stmt("database: sqlite after all", "t2")).await;
+    assert_ne!(r1.fact_id, r2.fact_id);
+
+    let q = |valid: Validity| KeyedQuery {
+        keys: vec![(EntityKey::Issue, "I1".into())],
+        fact_type: None,
+        as_of: None,
+        valid,
+        limit: KeyedQuery::DEFAULT_LIMIT,
+    };
+    let current = svc
+        .fetch_by_keys(&tenant, &q(Validity::Current))
+        .await
+        .expect("current");
+    assert_eq!(
+        current.len(),
+        1,
+        "one live head across two threads (thread excluded from H)"
+    );
+    assert_eq!(current[0].body, "database: sqlite after all");
+    assert_eq!(
+        svc.fetch_by_keys(&tenant, &q(Validity::All))
+            .await
+            .expect("all")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn explicit_supersedes_of_a_stale_head_is_conflict() {
     // v1 is the head; a plain v2 auto-supersedes it (v1 is now stale). An
     // explicit v3 that names v1 (no longer the current head) is a conflict.
