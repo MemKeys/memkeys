@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
-# MemKeys M8 — scripted, reproducible single-writer write-path benchmark run.
+# MemKeys M8 — scripted write-path benchmark + conformance run.
 #
-# Builds the release profile, then runs `write-bench` with the recorded default
-# workload (seed 0x6082_2026_1017, 1000 ops, 100 warmup, 5% supersede ratio,
-# 64 key cardinality, 256-byte bodies) against a Postgres instance, writing a
-# JSON report plus a console summary. Identical seed + op count => identical
-# workload; reruns never collide (unique tenant per run).
+# Reproducible single-command run of the M8 harness against a Postgres
+# instance: builds the release binaries, executes the conformance suite
+# (must be GREEN), then the single-writer write-path benchmark with the
+# pinned baseline configuration (docs/promotion-thresholds.md).
 #
 # Usage:
-#   scripts/run-write-bench.sh [URL] [--ops N] [--warmup N] [--read-ops N] ...
+#   scripts/run-write-bench.sh [DATABASE_URL]
 #
-# Database URL resolution: first positional argument, else MEMKEYS_DATABASE_URL,
-# else TEST_DATABASE_URL (same order as the binary). Extra flags are forwarded
-# to write-bench verbatim, so --ops/--json/... work as on the binary.
-#
-# Report: bencher-reports/write-bench-<UTC timestamp>.json (plus stdout
-# summary). Exit status mirrors write-bench (0 ok, 1 failed phase, 2 usage).
+# The URL may also be supplied via MEMKEYS_DATABASE_URL or TEST_DATABASE_URL.
+# Results (human summary on stdout + JSON report) are written to
+# bench-results/<timestamp>.json (gitignored).
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-URL="${1:-}"
-EXTRA=()
-if [ $# -gt 0 ]; then shift; EXTRA=("$@"); fi
+URL="${1:-${MEMKEYS_DATABASE_URL:-${TEST_DATABASE_URL:-}}}"
 if [ -z "$URL" ]; then
-  URL="${MEMKEYS_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
-fi
-if [ -z "$URL" ]; then
-  echo "no database url: pass it as the first argument or set MEMKEYS_DATABASE_URL/TEST_DATABASE_URL" >&2
-  exit 2
+    echo "error: no database url (pass one, or set MEMKEYS_DATABASE_URL/TEST_DATABASE_URL)" >&2
+    exit 2
 fi
 
-echo "=== memkeys M8: single-writer write-path benchmark (scripted run) ===" >&2
-cargo build --release -p memkeys-bench >&2
+echo "=== memkeys M8 harness: build (release) ==="
+cargo build --release -p memkeys-bench
 
-mkdir -p bencher-reports
+echo
+echo "=== conformance suite ==="
+./target/release/conformance "$URL"
+
+echo
+echo "=== write-path benchmark (single-writer ceiling, pinned baseline config) ==="
+mkdir -p bench-results
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-REPORT="bencher-reports/write-bench-${STAMP}.json"
+./target/release/write-bench \
+    --url "$URL" \
+    --ops 1000 --warmup 100 --read-ops 1000 \
+    --seed 106112001380375 \
+    --supersede-ratio 0.05 --key-cardinality 64 --body-bytes 256 \
+    --json "bench-results/write-bench-${STAMP}.json"
 
-exec ./target/release/write-bench \
-  --url "$URL" \
-  --json "$REPORT" \
-  "${EXTRA[@]}"
+echo
+echo "JSON report: bench-results/write-bench-${STAMP}.json"
+echo "Compare against the baseline and thresholds in docs/promotion-thresholds.md."
