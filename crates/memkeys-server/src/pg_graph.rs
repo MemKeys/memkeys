@@ -558,15 +558,19 @@ impl GraphView for PgGraph {
             expected.extend(derive_edges(f));
         }
 
-        // Scope delete: tenant-wide, or the src fact's project facet (NULL
-        // projects belong to the tenant scope only — MED-12).
-        let deleted =
-            sqlx::query("DELETE FROM edges WHERE tenant = $1 AND project IS NOT DISTINCT FROM $2")
-                .bind(&scope.tenant)
-                .bind(&scope.project)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+        // Scope delete: project Some(p) evicts only that project's facet
+        // (MED-12); project None evicts the WHOLE tenant — including stale
+        // project-carrying edges, so tenant rebuild stays reconciling
+        // (ADR-GRAPH "Rebuild determinism & eviction", BLOCKER-2).
+        let deleted = sqlx::query(
+            "DELETE FROM edges WHERE tenant = $1 \
+             AND ($2::text IS NULL OR project IS NOT DISTINCT FROM $2)",
+        )
+        .bind(&scope.tenant)
+        .bind(&scope.project)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
         let mut inserted = 0u64;
         if !expected.is_empty() {

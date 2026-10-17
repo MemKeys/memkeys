@@ -687,6 +687,21 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
         "deleted real edge healed"
     );
 
+    // Tenant-wide drift: a phantom edge LIVING IN A PROJECT facet. The
+    // whole-tenant rebuild (project: None) must evict it too — BLOCKER-2
+    // keeps the tenant scope reconciling, not additive.
+    let f2 = node_id(&x.tenant, NodeKind::Fact, &e2.fact_id.to_string());
+    sqlx::query(
+        "INSERT INTO edges (tenant, project, src_kind, src_id, dst_kind, dst_id, edge_type, event_time, rule_ver) \
+         VALUES ($1, 'proj-2', 'fact', $2, 'fact', $3, 'supersedes', now(), 'stale-rule')",
+    )
+    .bind(&x.tenant)
+    .bind(node_id(&x.tenant, NodeKind::Fact, &e2.fact_id.to_string()))
+    .bind(node_id(&x.tenant, NodeKind::Fact, &e1.fact_id.to_string()))
+    .execute(x.graph.pool())
+    .await
+    .expect("insert tenant-wide phantom");
+
     // Full tenant rebuild converges the whole projection to the SoT-derived
     // set: exactly the edges of the two facts.
     let stats = x
@@ -705,7 +720,12 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
         10,
         "converged edge set, nothing stale, nothing missing"
     );
-    assert!(edges.iter().all(|(_, _, t)| t != "supersedes"));
+    assert!(
+        !edges
+            .iter()
+            .any(|(s, _d, t)| (s == &f1 || s == &f2) && t == "supersedes"),
+        "phantom edges evicted, including the project-carrying one"
+    );
 }
 
 #[tokio::test]
