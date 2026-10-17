@@ -1,7 +1,8 @@
-//! memkeys-server binary — M2 bootstrap.
+//! memkeys-server binary — M2 bootstrap with M4 OTel wiring.
 //!
 //! M1 shipped the FactStore + pipeline + keyed read as a library with a
-//! minimal entry point. M2 adds the graph projection: connect, apply
+//! minimal entry point. M2 adds the graph projection: wire OTel (OTLP when
+//! OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise no-op), connect, apply
 //! migrations (FactStore + edges), then run the stage-5a projection worker —
 //! an initial SoT catch-up scan (the projection is built FROM the FactStore)
 //! followed by a periodic drain + hole scan. The transport (HTTP/MCP) is M3;
@@ -13,9 +14,15 @@ use std::time::Duration;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
 use memkeys_server::service::MemKeysService;
+use memkeys_server::telemetry_setup::Otel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // M4: providers + exporters + the tracing→OTel logs bridge. The guard is
+    // held for the process lifetime; Drop flushes everything on exit.
+    let otel = Otel::init()?;
+    tracing::info!(target: "memkeys", "memkeys.server.started");
+
     let database_url =
         std::env::var("MEMKEYS_DATABASE_URL").map_err(|_| "MEMKEYS_DATABASE_URL is required")?;
     let store = PgStore::connect(&database_url).await?;
@@ -60,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     maintenance.abort();
     println!("memkeys-server: shut down");
+    // The OTel guard drops here at scope end — M4 Drop flushes providers/exporters.
+    drop(otel);
     Ok(())
 }
 

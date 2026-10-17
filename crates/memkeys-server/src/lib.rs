@@ -16,6 +16,7 @@
 pub mod envelope;
 pub mod error;
 pub mod graph;
+pub mod memstore;
 pub mod model;
 pub mod pg;
 pub mod pg_graph;
@@ -23,6 +24,7 @@ pub mod pipeline;
 pub mod service;
 pub mod store;
 pub mod telemetry;
+pub mod telemetry_setup;
 pub mod worker;
 
 pub use envelope::{EntityHints, Envelope, FactBlock, SourceBlock, SourceKind};

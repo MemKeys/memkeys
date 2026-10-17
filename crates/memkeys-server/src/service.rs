@@ -20,7 +20,7 @@ use crate::pipeline::{
 use crate::store::{CommitOutcome, FactStore};
 use crate::telemetry::{self, Instruments};
 use crate::worker::GraphProjectionWorker;
-use opentelemetry::trace::{Span, SpanKind, Status};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt};
 
 /// Response of `POST /memory/facts` (§7.1 write-with-keys): the fact id, the
 /// keyed flag, and the server-resolved entity keys so the caller can cache
@@ -97,7 +97,7 @@ impl MemKeysService {
         caller: &CallerContext,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<IngestReceipt, IngestError> {
-        let mut ingest_span = telemetry::start_span(
+        let ingest_span = telemetry::start_span(
             "memkeys.fact.ingest",
             SpanKind::Server,
             vec![
@@ -106,16 +106,27 @@ impl MemKeysService {
             ],
         );
 
-        let outcome = self
-            .run_pipeline(envelope, caller, now, &mut ingest_span)
-            .await;
+        // Explicit parent context (not thread-local attach) so the stage
+        // spans parent correctly across `.await` boundaries without making
+        // the pipeline future `!Send`.
+        let cx = opentelemetry::Context::current_with_span(ingest_span);
+
+        let outcome = self.run_pipeline(envelope, caller, now, &cx).await;
+        // Attach the ingest span around the sync outcome handling so the
+        // bridge log record auto-carries this trace id (no awaits follow).
+        let _active = cx.clone().attach();
+        let ingest = cx.span();
         match &outcome {
             Ok(_) => {
-                ingest_span.set_status(Status::Ok);
+                ingest.set_status(Status::Ok);
                 self.instruments
                     .write_operation(anchor_kind(envelope), telemetry::OUTCOME_SUCCESS);
             }
-            Err(IngestError::Rejected { .. }) => {
+            Err(IngestError::Rejected { reason }) => {
+                // Signal-catalog key event: templated body only — the free-form
+                // reject reason is response data, never a log body (deny-list);
+                // the bounded reason CODE is the catalog's "with reason enum".
+                tracing::warn!(target: "memkeys", "memkeys.write.rejected reason={}", rejection_code(reason));
                 self.instruments
                     .write_operation(anchor_kind(envelope), telemetry::OUTCOME_REJECTED);
             }
@@ -124,7 +135,7 @@ impl MemKeysService {
                     .write_operation(anchor_kind(envelope), telemetry::OUTCOME_ERROR);
             }
         }
-        ingest_span.end();
+        ingest.end();
         outcome
     }
 
@@ -133,11 +144,11 @@ impl MemKeysService {
         envelope: &Envelope,
         caller: &CallerContext,
         now: chrono::DateTime<chrono::Utc>,
-        parent: &mut opentelemetry::global::BoxedSpan,
+        parent: &opentelemetry::Context,
     ) -> Result<IngestReceipt, IngestError> {
         // Stage 1 — normalize.
         let t = Instant::now();
-        let mut fact = stage_span(telemetry::PIPELINE_STAGE_NORMALIZE, || {
+        let mut fact = stage_span(telemetry::PIPELINE_STAGE_NORMALIZE, parent, || {
             normalize(envelope, caller, now)
         })?;
         self.instruments.write_stage_duration(
@@ -146,10 +157,13 @@ impl MemKeysService {
             t.elapsed().as_secs_f64(),
         );
 
-        // Stage 2 — key.
+        // Stage 2 — key. The span wraps the async stage body (enrichment
+        // pivots are resolver lookups), so its duration is the real stage time.
         let t = Instant::now();
-        stage_span(telemetry::PIPELINE_STAGE_KEY, || Ok(()))?;
-        let key_result = key_stage(envelope, caller, &mut fact, self.resolver.as_ref()).await;
+        let key_result = key_stage_span(anchor_kind(envelope), parent, async {
+            key_stage(envelope, caller, &mut fact, self.resolver.as_ref()).await
+        })
+        .await;
         let key_outcome = match &key_result {
             Ok(_) => telemetry::OUTCOME_SUCCESS,
             Err(IngestError::Rejected { .. }) => telemetry::OUTCOME_REJECTED,
@@ -165,7 +179,7 @@ impl MemKeysService {
         // Stage 3 — temporalize (+ the supersedes-target store check that
         // validates the target shares (entity, subject, type)).
         let t = Instant::now();
-        stage_span(telemetry::PIPELINE_STAGE_TEMPORALIZE, || {
+        stage_span(telemetry::PIPELINE_STAGE_TEMPORALIZE, parent, || {
             temporalize(&mut fact)
         })?;
         if let Some(target_id) = fact.supersedes {
@@ -183,10 +197,11 @@ impl MemKeysService {
 
         // Stage 4 — commit (the ack point).
         let t = Instant::now();
-        let mut commit_span = telemetry::start_span(
+        let mut commit_span = telemetry::start_child_span(
             "memkeys.commit",
             SpanKind::Client,
             telemetry::db_attrs("insert"),
+            parent,
         );
         let commit_result = self.store.commit_fact(&fact).await;
         let commit_outcome = match &commit_result {
@@ -211,7 +226,9 @@ impl MemKeysService {
             t.elapsed().as_secs_f64(),
         );
         let commit_result = commit_result.map_err(|e| {
-            record_error(parent, format!("{e}"));
+            parent.span().set_status(Status::Error {
+                description: format!("{e}").into(),
+            });
             e
         })?;
 
@@ -260,7 +277,7 @@ impl MemKeysService {
             });
         }
 
-        let mut retrieve_span = telemetry::start_span(
+        let retrieve_span = telemetry::start_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
@@ -269,26 +286,28 @@ impl MemKeysService {
             ],
         );
         let t = Instant::now();
-        let mut store_span = telemetry::start_span(
+        let cx = opentelemetry::Context::current_with_span(retrieve_span);
+        let mut store_span = telemetry::start_child_span(
             "memkeys.store.query",
             SpanKind::Client,
             telemetry::db_attrs("select"),
+            &cx,
         );
+        let retrieve = cx.span();
         let result = self.store.fetch_by_keys(caller_tenant, query).await;
         match &result {
             Ok(rows) => {
                 store_span.set_status(Status::Ok);
-                retrieve_span.set_status(Status::Ok);
+                retrieve.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_KEYED, rows.len() as u64);
             }
             Err(e) => {
                 record_error(&mut store_span, format!("{e}"));
-                record_error(&mut retrieve_span, format!("{e}"));
-                store_span.set_status(Status::Error {
-                    description: "query failed".into(),
+                retrieve.set_status(Status::Error {
+                    description: format!("{e}").into(),
                 });
-                retrieve_span.set_status(Status::Error {
+                store_span.set_status(Status::Error {
                     description: "query failed".into(),
                 });
             }
@@ -302,7 +321,7 @@ impl MemKeysService {
         };
         self.instruments
             .retrieve_duration(telemetry::RETRIEVAL_OP_KEYED, outcome, secs);
-        retrieve_span.end();
+        retrieve.end();
         result
     }
 }
@@ -447,6 +466,22 @@ impl MemKeysService {
     }
 }
 
+/// Bounded reason enum for the `memkeys.write.rejected` key event
+/// (signal-catalog logs.key_events "with reason enum"). The free-text
+/// rejection reason is caller response data — only this bounded code is
+/// ever emitted into telemetry.
+fn rejection_code(reason: &str) -> &'static str {
+    if reason.contains("unkeyed") {
+        "unkeyed"
+    } else if reason.contains("supersedes") {
+        "supersedes"
+    } else if reason.contains("limit must be") || reason.contains("entity.* key") {
+        "query"
+    } else {
+        "envelope"
+    }
+}
+
 /// The entity-kind attribute of the envelope's anchor (the kind only — the
 /// value is on the deny-list, signal-catalog "never fact content").
 fn anchor_kind(envelope: &Envelope) -> &'static str {
@@ -511,17 +546,46 @@ fn record_error(span: &mut opentelemetry::global::BoxedSpan, message: String) {
 }
 
 /// Start a pipeline-stage span around a synchronous stage body, recording the
-/// stage attribute (`memkeys.pipeline.stage`).
+/// stage attribute (`memkeys.pipeline.stage`) as a child of the ingest span.
 fn stage_span<T>(
     stage: &'static str,
+    parent: &opentelemetry::Context,
     body: impl FnOnce() -> Result<T, IngestError>,
 ) -> Result<T, IngestError> {
-    let mut span = telemetry::start_span(
+    let mut span = telemetry::start_child_span(
         stage_span_name(stage),
         SpanKind::Internal,
         vec![telemetry::attr("memkeys.pipeline.stage", stage)],
+        parent,
     );
     let result = body();
+    match &result {
+        Ok(_) => span.set_status(Status::Ok),
+        Err(e) => record_error(&mut span, format!("{e}")),
+    }
+    span.end();
+    result
+}
+
+/// Like [`stage_span`], but wrapping the async key-stage body (enrichment
+/// pivots are resolver lookups). Carries the signal-catalog `memkeys.key`
+/// attribute set: `memkeys.pipeline.stage` AND `memkeys.entity.kind`
+/// (the kind only — never entity-key values).
+async fn key_stage_span<T>(
+    entity_kind: &'static str,
+    parent: &opentelemetry::Context,
+    body: impl std::future::Future<Output = Result<T, IngestError>>,
+) -> Result<T, IngestError> {
+    let mut span = telemetry::start_child_span(
+        stage_span_name(telemetry::PIPELINE_STAGE_KEY),
+        SpanKind::Internal,
+        vec![
+            telemetry::attr("memkeys.pipeline.stage", telemetry::PIPELINE_STAGE_KEY),
+            telemetry::attr("memkeys.entity.kind", entity_kind),
+        ],
+        parent,
+    );
+    let result = body.await;
     match &result {
         Ok(_) => span.set_status(Status::Ok),
         Err(e) => record_error(&mut span, format!("{e}")),

@@ -1,0 +1,325 @@
+# MemKeys Observability Signal Catalog
+# Owner: Observability Agent (WS-7, ISI-5872)
+# Authoritative, machine-readable definition of every span, metric, and log MemKeys emits.
+# WS-1..WS-4 instrument AGAINST this file. Changes go through change management first (see ADR-0001).
+#
+# Conventions:
+#   - semconv pins: see semconv-pins.yaml
+#   - cardinality: every attribute listed here MUST be a bounded enum or an opaque bounded id.
+#   - PII boundary: see `deny_list` below — enforced in the SDK helper AND the collector.
+
+catalog_version: "0.2.0"   # 0.2.0: + graph promotion-gate signals (ADR-GRAPH §10 rev-4 R10; ISI-5911 fold of the ISI-5915/ISI-5907-ratified realization)
+schema_url: "https://opentelemetry.io/schemas/1.30.0"   # pinned; tracked in semconv-pins.yaml
+
+# ---------------------------------------------------------------------------
+# RESOURCE (identity, set once per process — attached to all signals)
+# ---------------------------------------------------------------------------
+resource:
+  required:
+    - key: service.name
+      value: memkeys
+    - key: service.version
+      source: build metadata (semver + git sha)
+    - key: deployment.environment.name     # drives sampling ratio (D-5); deployment.environment is deprecated
+      enum: [dev, staging, prod]
+    - key: service.instance.id
+      source: stable per-process uuid
+  optional:
+    - key: service.namespace
+      source: deployment grouping
+  detected:
+    vm_bare_metal: [process.*, host.*, os.*]     # resourcedetection processor ONLY
+    kubernetes:    [k8s.*, container.*]           # k8sattributes processor ONLY (never both)
+  note: tenant is NOT a resource attribute (one process serves many tenants) — see memkeys.tenant.id on spans/metrics.
+
+# ---------------------------------------------------------------------------
+# ATTRIBUTE REGISTRY (the only custom attributes allowed; all bounded)
+# ---------------------------------------------------------------------------
+attributes:
+  memkeys.tenant.id:
+    type: string
+    desc: Opaque tenant identifier (uuid or hash). NEVER a tenant name. Bounded by tenant count.
+    cardinality: bounded(tenants)
+  memkeys.entity.kind:
+    type: enum
+    values: [project, issue, pr, agent, run]
+    desc: The KIND of entity a fact is keyed to. The entity VALUE is never emitted.
+  memkeys.pipeline.stage:
+    type: enum
+    values: [normalize, key, temporalize, commit]
+  memkeys.retrieval.op:
+    type: enum
+    values: [keyed, graph, semantic]
+  memkeys.projection.kind:
+    type: enum
+    values: [graph, summary, embedding, category]
+  memkeys.worker.kind:
+    type: enum
+    values: [graph_projection, summarization, embedding, categorization]
+  memkeys.fusion.algorithm:
+    type: enum
+    values: [rrf]
+  memkeys.graph.depth:
+    type: int
+    values: [1, 2, 3, 4, 5]   # bounded by the server-side [1, MaxDepth=5] clamp — never emitted unclamped
+    desc: >
+      Requested traversal depth AFTER the server clamp (§7.3 / ADR-GRAPH bounds). Drives the
+      warm-SLO split: depth ≤ 3 is the SLO-covered warm band; 4–5 is deep best-effort
+      (deadline-fail-closed, outside the SLO).
+  memkeys.graph.truncate.reason:
+    type: enum
+    values: [none, depth_clamp, fanout, node_budget, deadline, orphan]
+    desc: >
+      Why a bounded traversal came back incomplete (Truncated=true — fail-closed, never an
+      unbounded walk; ADR-GRAPH bounds). `none` when it finished within all bounds. Emitted
+      only on graph operations.
+
+# ---------------------------------------------------------------------------
+# TRACES / SPANS
+# ---------------------------------------------------------------------------
+spans:
+
+  # --- Write path (WS-1/WS-2/SoT) : one trace, db.* on the commit ---
+  - name: memkeys.fact.ingest
+    kind: SERVER
+    domain: write
+    owner: WS-1
+    desc: Entry span for ingesting one raw fact (gateway flush / run settle / A2A exchange).
+    attributes: [memkeys.tenant.id, memkeys.entity.kind]
+    children: [memkeys.normalize, memkeys.key, memkeys.temporalize, memkeys.commit]
+    status_on_error: ERROR     # always recorded (not sampled away)
+
+  - name: memkeys.normalize
+    kind: INTERNAL
+    domain: write
+    owner: WS-1
+    attributes: [memkeys.pipeline.stage=normalize]
+
+  - name: memkeys.key
+    kind: INTERNAL
+    domain: write
+    owner: WS-1
+    desc: Entity-key extraction/inference. Emits entity.kind only — never key values.
+    attributes: [memkeys.pipeline.stage=key, memkeys.entity.kind]
+
+  - name: memkeys.temporalize
+    kind: INTERNAL
+    domain: write
+    owner: WS-1
+    desc: Applies validity window + supersedes-links.
+    attributes: [memkeys.pipeline.stage=temporalize]
+
+  - name: memkeys.commit
+    kind: CLIENT
+    domain: write
+    owner: WS-2 / SoT
+    semconv: db
+    desc: Durable write to the entity-keyed temporal store (SoT).
+    attributes:
+      - db.system.name          # e.g. the backend (grail reference)
+      - db.operation.name       # e.g. insert/upsert
+      - db.collection.name      # logical collection, NOT the fact content
+    forbidden: [db.query.text]  # disabled — would carry fact content
+
+  # --- Retrieval (WS-4) : keyed first, semantic second; db.* on store calls ---
+  - name: memkeys.retrieve
+    kind: SERVER
+    domain: retrieval
+    owner: WS-4
+    desc: Entry span for a retrieval request. One child CLIENT span per store touched + optional fusion.
+    attributes: [memkeys.tenant.id, memkeys.retrieval.op]
+    children: [memkeys.store.query, memkeys.rrf.fuse]
+
+  - name: memkeys.store.query
+    kind: CLIENT
+    domain: retrieval
+    owner: WS-4
+    semconv: db
+    desc: One keyed / graph / semantic store read. Semantic reads add vector-search attrs (sizes only).
+    attributes:
+      - db.system.name
+      - db.operation.name
+      - memkeys.retrieval.op
+    forbidden: [db.query.text]
+
+  - name: memkeys.rrf.fuse
+    kind: INTERNAL
+    domain: retrieval
+    owner: WS-4
+    desc: Reciprocal-rank fusion of multiple result lists (keyed + graph + semantic).
+    attributes: [memkeys.fusion.algorithm=rrf]
+
+  # --- Async derived-view workers : own trace, LINKED to the triggering write ---
+  - name: memkeys.worker.process
+    kind: CONSUMER
+    domain: derived-view
+    owner: WS-4 / workers
+    desc: >
+      A derived-view worker applying a committed fact to a projection. Runs as a new
+      trace root; carries a SPAN LINK to the originating memkeys.commit span context
+      (temporally decoupled — not a parent edge). On apply, records memkeys.projection.lag.
+    attributes: [memkeys.tenant.id, memkeys.worker.kind, memkeys.projection.kind]
+    links: [originating memkeys.commit span context]
+
+  # --- LLM pipeline (WS-3) : gen_ai.* (experimental) behind one helper ---
+  - name: "{gen_ai.operation.name} {gen_ai.request.model}"   # semconv span-name convention
+    logical_name: memkeys.llm.call
+    kind: CLIENT
+    domain: llm
+    owner: WS-3
+    semconv: gen_ai            # EXPERIMENTAL — pinned, isolated in a single helper
+    desc: An LLM call made by a worker (summarization / embedding / categorization).
+    attributes:
+      - gen_ai.operation.name   # chat | embeddings
+      - gen_ai.system           # provider id (e.g. anthropic, openai)
+      - gen_ai.request.model
+      - gen_ai.response.model
+      - gen_ai.usage.input_tokens
+      - gen_ai.usage.output_tokens
+    forbidden: [gen_ai.prompt, gen_ai.completion, "prompt/response content"]
+
+# ---------------------------------------------------------------------------
+# METRICS  (never sampled; aggregates)
+# ---------------------------------------------------------------------------
+metrics:
+
+  - name: memkeys.write.operations
+    instrument: counter
+    unit: "{operation}"
+    desc: Write throughput (count of ingest operations). Rate derived downstream.
+    attributes: [memkeys.tenant.id, memkeys.entity.kind, outcome]   # outcome: ok|error (enum)
+
+  - name: memkeys.write.duration
+    instrument: histogram
+    unit: s
+    desc: Write latency, broken down per pipeline stage.
+    attributes: [memkeys.pipeline.stage, outcome]
+
+  - name: memkeys.retrieve.duration
+    instrument: histogram
+    unit: s
+    desc: Retrieval latency per op (keyed/graph/semantic).
+    attributes: [memkeys.retrieval.op, outcome]
+
+  - name: memkeys.retrieve.candidate_set.size
+    instrument: histogram
+    unit: "{candidate}"
+    desc: Size of the candidate set returned by a retrieval op (pre-fusion).
+    attributes: [memkeys.retrieval.op]
+
+  - name: memkeys.fusion.rrf.inputs
+    instrument: histogram
+    unit: "{list}"
+    desc: Number of result lists fed into an RRF fusion.
+    attributes: []
+
+  - name: memkeys.projection.lag             # *** THE D3 OBSERVABLE-LAG INVARIANT ***
+    instrument: histogram
+    unit: s
+    desc: >
+      Measured lag (apply_time - commit_time) recorded when a projection applies a
+      committed fact. Makes the D3 bounded-lag invariant real and alertable. SLO target
+      lives in define-slos output; breach → tail-sampling keeps the trace.
+    attributes: [memkeys.projection.kind]
+
+  - name: memkeys.projection.lag.current
+    instrument: observable_gauge
+    unit: s
+    desc: Current max outstanding lag per projection (oldest un-applied committed fact). Async-observed.
+    attributes: [memkeys.projection.kind]
+
+  - name: memkeys.worker.queue.depth
+    instrument: observable_up_down_counter
+    unit: "{item}"
+    desc: Pending work items per derived-view worker.
+    attributes: [memkeys.worker.kind]
+
+  # GRAPH (WS-2 / ADR-GRAPH) — the promotion-gate signals (ADR-GRAPH rev-3 F11 → ISI-5911/ISI-5915;
+  # ISI-5915 realization, ISI-5907-ratified SLO, folded into this lineage by ISI-5911).
+  # ISI-5911's F11 ask named the trigger concept `graph.traverse.latency` (p95, warm); the
+  # ratified instrument realizing it is `memkeys.graph.traverse.duration` — semconv histograms
+  # measure duration. One instrument, never both (D-4).
+  # The graph is the always-on default derived tier (§5.4.1): both signals are live from
+  # day 1 on the single-Postgres default. Dormant-but-specified is only the PROMOTION ACTION
+  # they gate (move edges to a dedicated graph DB behind GraphView) — fired on a measured,
+  # sustained, per-tenant breach, never a guess.
+  - name: memkeys.graph.traverse.duration     # ADR-GRAPH §10 promotion trigger #1: graph.traverse.latency (p95, warm)
+    instrument: histogram
+    unit: s
+    desc: >
+      GraphView.Traverse latency (§7.3 op-3), recorded at the traverse call site for every
+      caller — the standalone op-2 endpoint and graph legs of fused retrieval alike (ISI-5915
+      picked the dedicated instrument over graph-attrs on retrieve.duration so the SLO measures
+      Traverse itself, not retrieve-entry latency conflating fusion and other stores; emit ONE
+      design, never both). SLO: graph.traverse.warm — p95 ≤ 150 ms at memkeys.graph.depth ≤ 3
+      (ratified, ISI-5907); depth 4–5 is best-effort deadline-fail-closed and explicitly
+      OUTSIDE the SLO. SLO target lands in define-slos output (same pattern as
+      memkeys.projection.lag); sustained per-tenant breach is ADR-GRAPH promotion trigger #1.
+    attributes: [memkeys.tenant.id, memkeys.graph.depth, memkeys.graph.truncate.reason, outcome]
+
+  - name: memkeys.graph.edges.cardinality     # ADR-GRAPH §10 promotion trigger #3: graph.edges.cardinality (per tenant)
+    instrument: observable_gauge
+    unit: "{edge}"
+    desc: >
+      Standing per-tenant count of projected graph edges — async-observed/polled, NEVER
+      per-request. Sustained per-tenant growth past what a recursive CTE serves within the
+      node budget is ADR-GRAPH promotion trigger #3 (paired with a traverse-SLO breach).
+      Cardinality bounded by tenant count; if a deployment's tenant count is unbounded,
+      emit top-N tenants by cardinality + an overflow bucket, not one series per tenant.
+    attributes: [memkeys.tenant.id]
+
+  # LLM (WS-3) — standard GenAI metrics + a MemKeys cost counter
+  - name: gen_ai.client.token.usage
+    instrument: histogram
+    unit: "{token}"
+    semconv: gen_ai
+    desc: Token usage per LLM call (standard GenAI metric).
+    attributes: [gen_ai.token.type, gen_ai.operation.name, gen_ai.request.model, gen_ai.system]
+    # gen_ai.token.type enum: input | output
+
+  - name: gen_ai.client.operation.duration
+    instrument: histogram
+    unit: s
+    semconv: gen_ai
+    desc: LLM call duration (standard GenAI metric).
+    attributes: [gen_ai.operation.name, gen_ai.request.model, gen_ai.system]
+
+  - name: memkeys.llm.cost
+    instrument: counter
+    unit: "{usd}"             # UCUM has no currency; documented as USD micro-units downstream
+    desc: Estimated LLM spend, derived from token usage × model price.
+    attributes: [gen_ai.request.model, memkeys.worker.kind]
+
+# ---------------------------------------------------------------------------
+# LOGS
+# ---------------------------------------------------------------------------
+logs:
+  transport: OTel Logs SDK / log bridge (not stdout scraping in prod)
+  correlation:
+    - Every record emitted inside a span auto-carries TraceId + SpanId.
+    - Async workers carry the originating trace context on the work item so their
+      records correlate back to the triggering write.
+  structure:
+    severity: standard OTel severity numbers
+    body: short, bounded, templated event text — NO fact bodies / key values / query text
+    attributes: only registry attributes above (tenant.id opaque, entity.kind, etc.)
+  key_events:   # structured event logs (bounded)
+    - memkeys.write.rejected        # with reason enum
+    - memkeys.projection.lag.breach # SLO breach marker
+    - memkeys.worker.dead_letter    # work item exhausted retries
+
+# ---------------------------------------------------------------------------
+# PII / FACT-BODY DENY-LIST  (hard boundary — enforced SDK + collector)
+# ---------------------------------------------------------------------------
+deny_list:
+  never_emit_in_any_signal:
+    - fact bodies / content / summaries
+    - entity-key VALUES (issue id, pr number, agent name, run id) — only entity.kind is allowed
+    - raw query text (db.query.text)
+    - LLM prompt / completion content (gen_ai.prompt, gen_ai.completion)
+    - embedding input text and embedding vectors
+    - credentials / tokens / secrets
+    - free-form user or agent identifiers
+  enforcement:
+    sdk: content capture disabled; single emission helper validates attribute keys against the registry
+    collector: redaction/transform pass + cardinality-limit processor (defense in depth)

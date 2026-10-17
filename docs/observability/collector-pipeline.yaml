@@ -1,0 +1,104 @@
+# MemKeys reference OpenTelemetry Collector pipeline (gateway)
+# Owner: Observability Agent (WS-7, ISI-5872). See ADR-0001 D-1, D-4, D-5.
+#
+# INVARIANTS (do not reorder):
+#   * memory_limiter is the FIRST processor in every pipeline.
+#   * batch is the LAST processor in every pipeline.
+#   * resourcedetection is used on VM/bare-metal ONLY.
+#   * k8sattributes is used on Kubernetes ONLY (never both — pick per deployment profile).
+#
+# The MemKeys app SDK exports OTLP to this collector and holds NO backend credentials.
+# Backend routing, PII redaction (defense-in-depth), tail sampling, and batching live here.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # --- FIRST (invariant) ---
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # --- environment identity (choose ONE per deployment profile) ---
+  resourcedetection:                 # VM / bare-metal ONLY
+    detectors: [env, system, process]
+    system:
+      resource_attributes:
+        host.name: { enabled: true }
+  # k8sattributes:                   # Kubernetes ONLY — enable instead of resourcedetection
+  #   extract:
+  #     metadata: [k8s.namespace.name, k8s.pod.name, k8s.node.name, k8s.deployment.name]
+
+  # --- PII / fact-body redaction (defense in depth; SDK is first line) ---
+  transform/scrub:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # strip any content-bearing keys that must never leave the process
+          - delete_key(attributes, "db.query.text")
+          - delete_key(attributes, "gen_ai.prompt")
+          - delete_key(attributes, "gen_ai.completion")
+    log_statements:
+      - context: log
+        statements:
+          - delete_key(attributes, "db.query.text")
+
+  # --- cardinality firewall (bound attribute explosion) ---
+  # Keep only the registry attributes; drop unexpected high-cardinality keys.
+  # (filter/transform rules generated from signal-catalog.yaml attribute registry.)
+
+  # --- tail sampling (keep the interesting traces; D-5) ---
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: projection-lag-anomaly
+        type: numeric_attribute
+        numeric_attribute: { key: memkeys.projection.lag.ms, min_value: 5000 }
+      - name: rare-workers-always-on
+        type: string_attribute
+        string_attribute:
+          key: memkeys.worker.kind
+          values: [graph_projection, summarization, embedding, categorization]
+      - name: base-rate
+        type: probabilistic
+        probabilistic: { sampling_percentage: 10 }
+
+  # --- LAST (invariant) ---
+  batch:
+    send_batch_size: 8192
+    timeout: 5s
+
+exporters:
+  # Reference backend (Grail / Dynatrace via OTLP). Dev swaps these for jaeger/prometheus.
+  otlp/backend:
+    endpoint: ${env:MEMKEYS_OTLP_BACKEND_ENDPOINT}
+    headers:
+      Authorization: ${env:MEMKEYS_OTLP_BACKEND_TOKEN}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, transform/scrub, tail_sampling, batch]
+      exporters: [otlp/backend]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]          # metrics not sampled
+      exporters: [otlp/backend]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, transform/scrub, batch]  # logs not sampled
+      exporters: [otlp/backend]
