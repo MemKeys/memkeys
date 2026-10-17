@@ -59,12 +59,17 @@ comparability:
 
 ### Baseline (recorded 2026-10-17)
 
-Environment: local dev box, Postgres 18 (scratch instance), synchronous
-commit (default durability), release build. This storage has a slow
-single-writer commit path — raw single-row autocommit INSERT p50 measured at
-~39 ms on the same box, so the pipeline's own overhead over the store is
-small (~2 ms p50). The numbers below are the honest ceiling *of that
-hardware*, not a hardware-independent constant; thresholds are therefore
+Environment: shared local dev box, synchronous commit (default durability),
+release build. Run 1 and Run 2 below were produced by the scripted run against
+a scratch **PostgreSQL 18** instance on that box. A third scripted run on the
+same box against a scratch **PostgreSQL 16.4** instance recorded 12.27
+ops/sec, ingest p50/p95/p99 = 50.7/162.9/421.1 ms, keyed read 3486 ops/sec —
+consistent with the band below and kept as the machine-readable artifact
+(`write-bench-20261017T152808Z.json`, attached to ISI-6082). This storage has
+a slow single-writer commit path — raw single-row autocommit INSERT p50
+measured at ~39 ms on the same box, so the pipeline's own overhead over the
+store is small (~2 ms p50). The numbers below are the honest ceiling *of
+that hardware*, not a hardware-independent constant; thresholds are therefore
 expressed relative to the baseline.
 
 | Metric | Run 1 | Run 2 |
