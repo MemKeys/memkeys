@@ -118,10 +118,13 @@ impl MemKeysService {
             t.elapsed().as_secs_f64(),
         );
 
-        // Stage 2 — key.
+        // Stage 2 — key. The span wraps the async stage body (enrichment
+        // pivots are resolver lookups), so its duration is the real stage time.
         let t = Instant::now();
-        stage_span(telemetry::PIPELINE_STAGE_KEY, parent, || Ok(()))?;
-        let key_result = key_stage(envelope, caller, &mut fact, self.resolver.as_ref()).await;
+        let key_result = key_stage_span(anchor_kind(envelope), parent, async {
+            key_stage(envelope, caller, &mut fact, self.resolver.as_ref()).await
+        })
+        .await;
         let key_outcome = match &key_result {
             Ok(_) => telemetry::OUTCOME_SUCCESS,
             Err(IngestError::Rejected { .. }) => telemetry::OUTCOME_REJECTED,
@@ -365,6 +368,33 @@ fn stage_span<T>(
         parent,
     );
     let result = body();
+    match &result {
+        Ok(_) => span.set_status(Status::Ok),
+        Err(e) => record_error(&mut span, format!("{e}")),
+    }
+    span.end();
+    result
+}
+
+/// Like [`stage_span`], but wrapping the async key-stage body (enrichment
+/// pivots are resolver lookups). Carries the signal-catalog `memkeys.key`
+/// attribute set: `memkeys.pipeline.stage` AND `memkeys.entity.kind`
+/// (the kind only — never entity-key values).
+async fn key_stage_span<T>(
+    entity_kind: &'static str,
+    parent: &opentelemetry::Context,
+    body: impl std::future::Future<Output = Result<T, IngestError>>,
+) -> Result<T, IngestError> {
+    let mut span = telemetry::start_child_span(
+        stage_span_name(telemetry::PIPELINE_STAGE_KEY),
+        SpanKind::Internal,
+        vec![
+            telemetry::attr("memkeys.pipeline.stage", telemetry::PIPELINE_STAGE_KEY),
+            telemetry::attr("memkeys.entity.kind", entity_kind),
+        ],
+        parent,
+    );
+    let result = body.await;
     match &result {
         Ok(_) => span.set_status(Status::Ok),
         Err(e) => record_error(&mut span, format!("{e}")),

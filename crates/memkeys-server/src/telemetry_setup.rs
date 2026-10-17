@@ -33,6 +33,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::PeriodicReader;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::resource::TelemetryResourceDetector;
 use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
@@ -133,8 +134,15 @@ pub fn build_resource(profile: DeploymentProfile) -> Resource {
     // service.name=unknown_service, and with_schema_url's merge order lets an
     // existing attribute win over the new ones — the catalog's identity set
     // (service.name=memkeys, pinned schema_url) must not be overridable by it.
+    // builder_empty also drops the SDK detectors, including the one carrying
+    // the OTel-spec MUST telemetry.sdk.{name,language,version} triple
+    // (ADR-0001 D-2) — re-attached below, sourced from the SDK itself so
+    // telemetry.sdk.version always tracks the opentelemetry_sdk crate. Its
+    // keys don't overlap the identity set, and the detector merge keeps this
+    // resource's schema_url.
     Resource::builder_empty()
         .with_schema_url(attrs, SCHEMA_URL)
+        .with_detector(Box::new(TelemetryResourceDetector))
         .build()
 }
 
@@ -367,6 +375,25 @@ mod tests {
         );
         assert!(get("service.instance.id").is_some());
         assert!(get("service.version").is_some());
+        // OTel spec MUST (ADR-0001 D-2): builder_empty drops the SDK's
+        // telemetry.sdk.* detector, so the triple is re-attached explicitly.
+        assert_eq!(
+            get("telemetry.sdk.name").map(|v| v.to_string()),
+            Some("opentelemetry".to_string())
+        );
+        assert_eq!(
+            get("telemetry.sdk.language").map(|v| v.to_string()),
+            Some("rust".to_string())
+        );
+        // The detector reports the opentelemetry_sdk crate version.
+        let sdk_version = get("telemetry.sdk.version").map(|v| v.to_string());
+        assert!(
+            sdk_version
+                .as_deref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            "telemetry.sdk.version must be a non-empty SDK version, got {sdk_version:?}"
+        );
         assert_eq!(resource.schema_url(), Some(SCHEMA_URL));
         // D-2/D-4: tenant is NEVER a resource attribute.
         assert!(get("memkeys.tenant.id").is_none());

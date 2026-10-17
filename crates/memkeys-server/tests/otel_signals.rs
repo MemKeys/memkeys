@@ -149,6 +149,14 @@ async fn write_path_emits_the_catalog_trace() {
         assert_eq!(value_str(attr(s, "memkeys.pipeline.stage").unwrap()), stage);
     }
 
+    // signal-catalog `memkeys.key`: entity kind, never entity-key values.
+    let key = span(&spans, "memkeys.key");
+    assert_eq!(
+        value_str(attr(key, "memkeys.entity.kind").unwrap()),
+        "run",
+        "memkeys.key must carry memkeys.entity.kind per the signal catalog"
+    );
+
     // memkeys.commit: CLIENT, pinned stable db.* group, db.query.text denied.
     let commit = span(&spans, "memkeys.commit");
     assert_eq!(commit.span_kind, SpanKind::Client);
