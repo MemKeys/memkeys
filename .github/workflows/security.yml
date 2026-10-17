@@ -19,6 +19,8 @@ jobs:
     name: CodeQL (rust)
     runs-on: ubuntu-latest
     permissions:
+      # actions: read is required by codeql-action's status reporting
+      actions: read
       contents: read
       security-events: write
     steps:
