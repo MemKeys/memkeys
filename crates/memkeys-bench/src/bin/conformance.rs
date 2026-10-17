@@ -699,14 +699,28 @@ async fn main() -> Result<(), String> {
                 .fetch_by_keys(&c.tenant_id, &filtered)
                 .await
                 .map_err(|e| format!("fetch failed: {e:?}"))?;
-            if both.len() >= 2 && only_outcome.len() == 1 && only_outcome[0].fact_type == "outcome"
+            // Negative case: the ANDed project key must actually narrow —
+            // a non-matching project excludes every row it is ANDed with.
+            let mut negative = issue_query_valid("issue-20", Validity::All);
+            negative
+                .keys
+                .push((EntityKey::Project, "proj-other".into()));
+            let excluded = store
+                .fetch_by_keys(&c.tenant_id, &negative)
+                .await
+                .map_err(|e| format!("fetch failed: {e:?}"))?;
+            if both.len() >= 2
+                && only_outcome.len() == 1
+                && only_outcome[0].fact_type == "outcome"
+                && excluded.is_empty()
             {
                 Ok(())
             } else {
                 Err(format!(
-                    "filter wrong: both={} filtered={}",
+                    "filter wrong: both={} filtered={} excluded_negative={}",
                     both.len(),
-                    only_outcome.len()
+                    only_outcome.len(),
+                    excluded.len()
                 ))
             }
         },
