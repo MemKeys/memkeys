@@ -1,10 +1,27 @@
 # WS-3 / ISI-5914 — T3 live-head CAS gate + T4 A2A resolution: implementation notes
 
-Status: **implementation-ready design, blocked on one architecture decision**
-(the composition of `entity_identity` / `H`). Owner: WS-3 pipeline. Reference
-contract: `docs/architecture.md` §7.6 (Invariant T), §6 stage 3–4, §5.1 — as
-pinned on `isi-5906/live-head-uniqueness` @ `583082a` and polished by
-ISI-6053 (`8d6d165`: *H excludes `entity.agent`*).
+Status: **implemented** (realization (b)); `entity_identity`/`H` composition
+pinned to a defensible default (see §3) **pending Architect ratification**
+(ISI-6131). Owner: WS-3 pipeline. Reference contract: `docs/architecture.md`
+§7.6 (Invariant T), §6 stage 3–4, §5.1 — as pinned on
+`isi-5906/live-head-uniqueness` @ `583082a` and polished by ISI-6053
+(`8d6d165`: *H excludes `entity.agent`*).
+
+## 0. What landed (this branch)
+
+- `migrations/0002_live_head.sql` — immutable `entity_identity` column +
+  head-lookup index (no `superseded` flag, no write-back).
+- `pg.rs` — `commit_fact` rewritten to the realization-(b) gate: one
+  transaction, `pg_advisory_xact_lock(hash(H))`, idempotency short-circuit
+  under the lock, current-head CAS over the `supersedes` chain, auto-supersede
+  on plain writes, `conflict` on a stale/foreign explicit `supersedes`. Plus
+  `entity_identity()` / `live_head_lock_key()` helpers and 6 DB-free unit tests.
+- `tests/integration.rs` — fork-prevention, stale-supersede-conflict, and
+  subject-null-coexist tests (TEST_DATABASE_URL-gated; CI runs them on PG 18).
+
+Verified by CI on the PR (fmt + clippy `-D warnings` + `cargo test --workspace`
+against a Postgres service) — this environment has no local Rust toolchain/PG.
+The **only** open item is Architect ratification of the §3 `H` composition.
 
 This note is the handoff artifact for the T3 pipeline change. It records the
 chosen realization and exact write-path logic (ready to code), and the single
