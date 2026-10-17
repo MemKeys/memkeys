@@ -621,17 +621,22 @@ only — an agent's write latency never depends on embedding, summarization, or 
 3. **Temporalize + live-head serialization.** Set the event-time axis (`fact.event_time` or
    `emitted_at`). For a **subject-bearing** fact (`subject` non-null — the supersession grain),
    enter the per-key critical section of the **live-head index** (§5.1) keyed on
-   `H = (tenant_id, <entity-identity-keys of T1>, subject, type)` — the entity component
-   **excludes `entity.agent`** (§7.6 T3): one head per *statement*, not per producing agent.
+   `H = (tenant_id, entity_identity, subject, type)`, where `entity_identity` is the pinned
+   stable composite `{project, issue, pr, thread, service}` (§7.6 **T3-pin**) — formed from the
+   **enriched** keys (this stage follows §4 enrichment) and excluding `entity.agent` and
+   `entity.run`: one head per *statement*, not per producing agent or incidental run. A fact
+   whose stable composite is empty (`unkeyed`, §4) is not subject-versioned — it takes the
+   idempotent-insert path and skips this gate, like a subject-null fact.
    Serializing on `H` is the only race-free point for the uniqueness invariant (§7.6 **T3**);
    a read-time check is a check-then-write TOCTOU race and the SoT is append-only, so neither
    alone can hold it.
    Inside the section, resolve the head via **compare-and-set** on the stored head id:
    - `supersedes` set → apply the **Invariant T (§7.6 T2) tenant-ownership check first**: the
      target MUST be owned by the caller's tenant, else fail closed with `not_found` (never a
-     distinguishable permission error); then it MUST equal the **current live head** for `H`
-     and share `(entity, subject, type)` — superseding a stale (already-superseded) or foreign
-     id is rejected `conflict`. This is what forecloses supersession **cycles** and the
+     distinguishable permission error); then it MUST equal the **current live head** for `H` —
+     i.e. same `entity_identity` (same stable composite), same `subject`, same `type` (§7.6
+     **T3-pin** Q2: grain unified on `H`-equality, retiring "shares ≥1 anchor" as authoritative).
+     Superseding a stale (already-superseded), cross-`H`, or foreign id is rejected `conflict`. This is what forecloses supersession **cycles** and the
      two-writers-supersede-one-head fork.
    - `supersedes` unset, `H` empty → this fact becomes the head.
    - `supersedes` unset, `H` occupied → the server **auto-links** `fact.supersedes = <current
@@ -891,6 +896,53 @@ MUST name the **current** head (not a stale/already-superseded id), which also f
 
 Subject-less facts are out of scope: they are independent observations, never versioned, and
 may legitimately share `(entity, null, type)`.
+
+**T3-pin — `entity_identity` composition (ISI-6131, resolving the ISI-5914 blocker).** The T1
+"entity-identity-keys composite" referenced above is pinned normatively as follows, because the
+shipped M1 pipeline (`crates/memkeys-server/src/pipeline.rs::normalize`) derives `fact.id` as an
+idempotency key (`UUIDv5(NS, "{tenant_id}|{principal}|{idem_input}")`) and encodes neither
+`subject`, `type`, nor an entity composite — so `H` had no operational definition for T3 to
+extend. The pin:
+
+- **Composition (Q1).** `entity_identity` is the **resolved, durable, containment-stable**
+  subset of the §4 entity keys: **`{project, issue, pr, thread, service}`**. Excluded:
+  `agent` (producer, not statement — ISI-6053), `counterpart_agent*` (A2A hint, never a verified
+  key — §3/T4), and **`run`** — `run` is an *execution/session-scoped provenance axis*, not an
+  identity axis. `H` is formed **after §4 enrichment (§6 stage 2)**, which lifts an incidental
+  `run` up to its stable container(s) (`run → project/issue/pr`, "corroborated, never guessed",
+  §4); the resolved stable keys — never the `run` itself — enter `H`. This is the Q1 acceptance
+  constraint made concrete: the shipped `supersession_collapses_at_read_time` test supersedes
+  across `run r1 → r2` sharing only `issue`; with `run` excluded and enrichment run first, both
+  versions resolve to the same `H = (tenant, {issue=X, project=P}, subject, type)` and latest-wins
+  holds. A composite that included `run` — or an `H` built from the single resolved `first_anchor`
+  (`run` for `gateway_flush`) — would split the two versions across different `H` and both break
+  that test and fail to model "latest-wins on the same statement".
+- **Empty composite ⇒ no gate.** A fact whose stable composite is empty after enrichment is
+  `unkeyed` (§4) and is **not subject-versioned**: it takes the unchanged idempotent-insert path
+  and bypasses the live-head gate, exactly as subject-null facts do. This is the clean home for a
+  `run`-only envelope that enrichment cannot lift to any durable anchor — it is an independent
+  observation, not a competing head.
+- **Grain unification (Q2).** The §6 stage-3 supersession grain is unified on `H`-equality,
+  **retiring "shares ≥1 anchor" as the authoritative rule**. An explicit `supersedes` is valid
+  iff its target has the **same `entity_identity`** (same stable composite), same `subject`, same
+  `type`, **and** is the current head (T3). "Shares ≥1 anchor" may remain only as a cheap
+  defense-in-depth pre-filter / error-message path; it is not authoritative. This removes the
+  prior contradiction (a `supersedes` sharing `issue` but differing on `run` was grain-valid yet
+  would have been cross-`H`): with `run` excluded it is now `H`-equal and valid, while one that
+  differs on a *stable* key is correctly cross-`H` → `Conflict`.
+- **Identity model (Q3) — `fact.id` ⊥ `H`.** T3 lands as **realization (b)** (per-key advisory-lock
+  CAS over the `supersedes` chain, no migration) keyed on the pinned `H`, while M1's
+  idempotency-based `fact.id` **stays as-is**. `fact.id` = **retry/transport idempotency** identity;
+  `H` = **statement** identity. They are orthogonal and explicitly decoupled; T1's identity-hash
+  form of `fact.id` is **not** required to be adopted for T3 to ship. T1's two security guarantees
+  survive on the M1 derivation: it salts `tenant_id` **and** `principal(=agent)` (no cross-tenant
+  id collision, no content-only existence oracle) and folds a body hash into `idem_input` on the
+  no-`idempotency_key` path (body-complete, latest-wins on body change). The `idempotency_key` path
+  intentionally keys on the caller's asserted operation rather than the body — a changed body under
+  a reused key returns `Conflict`, the intended idempotency semantics. `entity_identity`'s stability
+  depends on §4 enrichment being **deterministic and complete** over the stable keys (a given anchor
+  must resolve to the same stable keyset every time); non-deterministic enrichment of a stable key
+  is an enrichment-contract defect, not an `H`-definition one.
 
 **T4 — A2A counterpart resolution is persisted, not recomputed (F5).** The `a2a_participant`
 graph edge must rebuild identically on every replay. The resolved counterpart is captured in
