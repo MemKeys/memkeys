@@ -202,12 +202,12 @@ enum Bind {
 }
 
 /// Column list for get_fact (unaliased).
-const FACT_COLUMNS: &str = "id, fact_type, subject, body, confidence, supersedes, \
+pub(crate) const FACT_COLUMNS: &str = "id, fact_type, subject, body, confidence, supersedes, \
     event_time, ingested_at, entity_project, entity_issue, entity_pr, entity_agent, \
     entity_run, entity_thread, entity_service, keyed, provenance_principal";
 
 /// Column list for fetch_by_keys (aliased to f).
-const FACT_COLUMNS_ALIAS: &str = "f.id, f.fact_type, f.subject, f.body, f.confidence, \
+pub(crate) const FACT_COLUMNS_ALIAS: &str = "f.id, f.fact_type, f.subject, f.body, f.confidence, \
     f.supersedes, f.event_time, f.ingested_at, f.entity_project, f.entity_issue, f.entity_pr, \
     f.entity_agent, f.entity_run, f.entity_thread, f.entity_service, f.keyed, \
     f.provenance_principal";

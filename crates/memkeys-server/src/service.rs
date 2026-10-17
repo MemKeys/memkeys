@@ -1,17 +1,25 @@
 //! The MemKeys service: orchestrates pipeline stages 1-4 with OTel
-//! instrumentation, and serves op 1 (fetch-by-keys, §7.2).
+//! instrumentation, serves op 1 (fetch-by-keys, §7.2), and fronts the M2
+//! graph projection (stage-5a worker dispatch + the bounded graph reads
+//! behind `GraphView`).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::envelope::Envelope;
 use crate::error::{IngestError, QueryError};
+use crate::graph::{
+    GraphError, GraphView, LinksReq, LinksResult, SupersedesReq, SupersedesResult, TraverseReq,
+    TraverseResult,
+};
 use crate::model::{KeyedQuery, ProcessedFact};
+use crate::pg_graph::PgGraph;
 use crate::pipeline::{
     key_stage, normalize, temporalize, CallerContext, EntityResolver, NoopResolver,
 };
 use crate::store::{CommitOutcome, FactStore};
 use crate::telemetry::{self, Instruments};
+use crate::worker::GraphProjectionWorker;
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt};
 
 /// Response of `POST /memory/facts` (§7.1 write-with-keys): the fact id, the
@@ -34,6 +42,11 @@ pub struct MemKeysService {
     store: Arc<dyn FactStore>,
     resolver: Arc<dyn EntityResolver>,
     instruments: Instruments,
+    /// The M2 graph projection (None = the minimal keyed-only deployment —
+    /// the graph is always-on per §5.4.1, but the SERVICE degrades cleanly
+    /// when no projection is wired in unit contexts).
+    graph: Option<Arc<dyn GraphView>>,
+    worker: Option<Arc<GraphProjectionWorker>>,
 }
 
 impl MemKeysService {
@@ -46,7 +59,33 @@ impl MemKeysService {
             store,
             resolver,
             instruments: Instruments::new(),
+            graph: None,
+            worker: None,
         }
+    }
+
+    /// M2: wire the graph projection. The stage-5a worker is created against
+    /// the same Postgres pool; every successful stage-4 commit is enqueued to
+    /// it OFF the ack path (§6: the receipt is gated on stage 4 only).
+    pub fn with_graph_projection(
+        store: Arc<dyn FactStore>,
+        resolver: Arc<dyn EntityResolver>,
+        graph: Arc<PgGraph>,
+    ) -> Self {
+        let worker = Arc::new(GraphProjectionWorker::new(graph.clone()));
+        Self {
+            store,
+            resolver,
+            instruments: Instruments::new(),
+            graph: Some(graph),
+            worker: Some(worker),
+        }
+    }
+
+    /// The wired stage-5a worker (drain/catch-up control for the binary and
+    /// tests). `None` when no graph projection is configured.
+    pub fn projection_worker(&self) -> Option<Arc<GraphProjectionWorker>> {
+        self.worker.clone()
     }
 
     /// Write path (§6): stages 1-4 as one trace, `memkeys.fact.ingest`
@@ -193,6 +232,18 @@ impl MemKeysService {
             e
         })?;
 
+        // Stage 5a dispatch (async, OFF the ack path — §6/R2): the receipt is
+        // already decided above; a projection hiccup can never fail the write.
+        if commit_result == CommitOutcome::Inserted {
+            if let Some(worker) = &self.worker {
+                worker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+        }
+
         let keyed = fact.keyed;
         Ok(IngestReceipt {
             fact_id: fact.id,
@@ -271,6 +322,146 @@ impl MemKeysService {
         self.instruments
             .retrieve_duration(telemetry::RETRIEVAL_OP_KEYED, outcome, secs);
         retrieve.end();
+        result
+    }
+}
+
+/// The M2 graph reads: one `memkeys.retrieve` (SERVER, op=graph) trace each,
+/// delegated to `GraphView` (the substrate records the store-query span and
+/// `memkeys.graph.traverse.latency` at its call site, WS-7/ISI-5911). The
+/// tenant is SERVER-SET from the verified caller and overwrites any body
+/// value — WS-4 Invariant T / ADR-GRAPH tenant grain.
+impl MemKeysService {
+    fn require_graph(&self) -> Result<&Arc<dyn GraphView>, GraphError> {
+        self.graph
+            .as_ref()
+            .ok_or(GraphError::Invalid("graph projection is not configured"))
+    }
+
+    pub async fn traverse(
+        &self,
+        caller_tenant: &str,
+        req: &TraverseReq,
+    ) -> Result<TraverseResult, GraphError> {
+        let graph = self.require_graph()?;
+        let mut req = req.clone();
+        req.tenant = caller_tenant.to_string();
+
+        let mut span = telemetry::start_span(
+            "memkeys.retrieve",
+            SpanKind::Server,
+            vec![
+                telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
+                telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
+            ],
+        );
+        let t = std::time::Instant::now();
+        let result = graph.traverse(&req).await;
+        match &result {
+            Ok(r) => {
+                if r.truncated {
+                    span.set_attribute(telemetry::attr(
+                        "memkeys.graph.truncate.reason",
+                        r.reason.as_str(),
+                    ));
+                }
+                span.set_status(Status::Ok);
+                self.instruments
+                    .candidate_set_size(telemetry::RETRIEVAL_OP_GRAPH, r.nodes.len() as u64);
+            }
+            Err(_) => span.set_status(Status::Error {
+                description: "graph traverse failed".into(),
+            }),
+        }
+        let outcome = if result.is_ok() {
+            telemetry::OUTCOME_SUCCESS
+        } else {
+            telemetry::OUTCOME_ERROR
+        };
+        self.instruments.retrieve_duration(
+            telemetry::RETRIEVAL_OP_GRAPH,
+            outcome,
+            t.elapsed().as_secs_f64(),
+        );
+        span.end();
+        result
+    }
+
+    pub async fn supersedes(
+        &self,
+        caller_tenant: &str,
+        req: &SupersedesReq,
+    ) -> Result<SupersedesResult, GraphError> {
+        let graph = self.require_graph()?;
+        let mut req = req.clone();
+        req.tenant = caller_tenant.to_string();
+
+        let mut span = telemetry::start_span(
+            "memkeys.retrieve",
+            SpanKind::Server,
+            vec![
+                telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
+                telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
+            ],
+        );
+        let t = std::time::Instant::now();
+        let result = graph.supersedes(&req).await;
+        match &result {
+            Ok(_) => span.set_status(Status::Ok),
+            Err(_) => span.set_status(Status::Error {
+                description: "graph supersedes failed".into(),
+            }),
+        }
+        let outcome = if result.is_ok() {
+            telemetry::OUTCOME_SUCCESS
+        } else {
+            telemetry::OUTCOME_ERROR
+        };
+        self.instruments.retrieve_duration(
+            telemetry::RETRIEVAL_OP_GRAPH,
+            outcome,
+            t.elapsed().as_secs_f64(),
+        );
+        span.end();
+        result
+    }
+
+    pub async fn links(
+        &self,
+        caller_tenant: &str,
+        req: &LinksReq,
+    ) -> Result<LinksResult, GraphError> {
+        let graph = self.require_graph()?;
+        let mut req = req.clone();
+        req.tenant = caller_tenant.to_string();
+
+        let mut span = telemetry::start_span(
+            "memkeys.retrieve",
+            SpanKind::Server,
+            vec![
+                telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
+                telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
+            ],
+        );
+        let t = std::time::Instant::now();
+        let result = graph.links(&req).await;
+        match &result {
+            Ok(_) => span.set_status(Status::Ok),
+            Err(_) => span.set_status(Status::Error {
+                description: "graph links failed".into(),
+            }),
+        }
+        let outcome = if result.is_ok() {
+            telemetry::OUTCOME_SUCCESS
+        } else {
+            telemetry::OUTCOME_ERROR
+        };
+        self.instruments.retrieve_duration(
+            telemetry::RETRIEVAL_OP_GRAPH,
+            outcome,
+            t.elapsed().as_secs_f64(),
+        );
+        span.end();
         result
     }
 }
