@@ -1,0 +1,29 @@
+[package]
+name = "memkeys-server"
+description = "MemKeys core server: FactStore source of truth, write pipeline (stages 1-4), keyed reads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["grpc-tonic"] }
+
+[[bin]]
+name = "memkeys-server"
+path = "src/main.rs"
+
+[lib]
+name = "memkeys_server"
+path = "src/lib.rs"
