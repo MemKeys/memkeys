@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/memkeys-server"]
+members = ["crates/memkeys-server", "crates/memkeys-bench"]
 
 [workspace.package]
 version = "0.1.0"
