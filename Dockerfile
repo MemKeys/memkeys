@@ -34,4 +34,7 @@ USER memkeys
 # Optional: OTEL_EXPORTER_OTLP_ENDPOINT enables OTLP telemetry.
 ENV RUST_LOG=info
 
+# Health surface (GET /healthz, /readyz) — see crates/memkeys-server/src/health.rs.
+EXPOSE 8080
+
 ENTRYPOINT ["/usr/local/bin/memkeys-server"]
