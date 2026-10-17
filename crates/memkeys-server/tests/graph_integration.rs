@@ -128,7 +128,7 @@ async fn drain(x: &Ctx) {
 }
 
 fn proj_entity(proj: &str) -> serde_json::Value {
-    serde_json::json!({ "project": proj, "issue": "iss-1", "agent": "agent-a" })
+    serde_json::json!({ "project": proj, "issue": "iss-1", "agent": "agent-a", "run": "run-1" })
 }
 
 fn entity_node(tenant: &str, kind: NodeKind, v: &str) -> NodeRef {
@@ -525,7 +525,7 @@ async fn links_is_the_budgeted_one_hop_read() {
 #[tokio::test]
 async fn supersedes_lineage_complete_holes_and_heads() {
     let x = ctx().await;
-    let ent = serde_json::json!({ "project": "proj-1", "issue": "iss-1", "agent": "agent-a" });
+    let ent = serde_json::json!({ "project": "proj-1", "issue": "iss-1", "agent": "agent-a", "run": "run-1" });
     let mut ids = Vec::new();
     let mut prev: Option<Uuid> = None;
     for i in 0..3 {
@@ -597,7 +597,7 @@ async fn supersedes_lineage_complete_holes_and_heads() {
 #[tokio::test]
 async fn supersedes_reports_legacy_forks_as_branch_points() {
     let x = ctx().await;
-    let ent = serde_json::json!({ "project": "proj-1", "issue": "iss-1", "agent": "agent-a" });
+    let ent = serde_json::json!({ "project": "proj-1", "issue": "iss-1", "agent": "agent-a", "run": "run-1" });
     let e1 = ingest(&x, &envelope(gw_flush(Some("status"), "v1", ent.clone()))).await;
     // Two successors of v1 — a legacy fork (pre-rule history; today's stage-3
     // admission does not yet reject forks — flagged for the reconciler/M7).
@@ -699,10 +699,10 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
         .expect("tenant rebuild");
     assert_eq!(stats.facts_scanned, 2);
     let edges = edge_rows(&x).await;
-    // e1: 3 entity dims + produced_by = 4; e2 likewise = 4.
+    // e1: 4 entity dims (incl. the run anchor) + produced_by = 5; e2 likewise.
     assert_eq!(
         edges.len(),
-        8,
+        10,
         "converged edge set, nothing stale, nothing missing"
     );
     assert!(edges.iter().all(|(_, _, t)| t != "supersedes"));
@@ -725,8 +725,8 @@ async fn worker_catch_up_builds_projection_from_factstore() {
     let edges = edge_rows(&x).await;
     assert_eq!(
         edges.len(),
-        3 * 4,
-        "entity_fact x3 dims + produced_by per fact"
+        3 * 5,
+        "entity_fact x4 dims (incl. run anchor) + produced_by per fact"
     );
     // Idempotent: a second catch-up finds no holes.
     let n = x.worker.catch_up(&x.tenant).await.expect("catch up 2");
