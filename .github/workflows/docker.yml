@@ -54,8 +54,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: cargo-deny (advisories, licenses, bans)
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: advisories bans licenses
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny (pinned)
+        run: |
+          curl -sSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin --strip-components=1 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
+          cargo deny --version
+
+      - name: cargo-deny (advisories, bans, licenses)
+        run: cargo deny --manifest-path Cargo.toml check advisories bans licenses

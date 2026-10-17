@@ -130,9 +130,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: actionlint
+      - name: Install actionlint (pinned)
+        run: |
+          curl -sSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin actionlint
+          actionlint --version
 
       - name: Lint GitHub Actions workflow files
         run: actionlint
