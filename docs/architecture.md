@@ -622,9 +622,10 @@ only — an agent's write latency never depends on embedding, summarization, or 
    `emitted_at`). For a **subject-bearing** fact (`subject` non-null — the supersession grain),
    enter the per-key critical section of the **live-head index** (§5.1) keyed on
    `H = (tenant_id, entity_identity, subject, type)`, where `entity_identity` is the pinned
-   stable composite `{project, issue, pr, thread, service}` (§7.6 **T3-pin**) — formed from the
-   **enriched** keys (this stage follows §4 enrichment) and excluding `entity.agent` and
-   `entity.run`: one head per *statement*, not per producing agent or incidental run. A fact
+   work-item coordinate tuple `(project, issue, pr)` (§7.6 **T3-pin**) — formed from the
+   **enriched** keys (this stage follows §4 enrichment) and excluding the producing `entity.agent`
+   and all transport anchors (`entity.run`/`thread`/`service`): one head per *statement*, not per
+   producing agent or per transport anchor. A fact
    whose stable composite is empty (`unkeyed`, §4) is not subject-versioned — it takes the
    idempotent-insert path and skips this gate, like a subject-null fact.
    Serializing on `H` is the only race-free point for the uniqueness invariant (§7.6 **T3**);
@@ -904,24 +905,41 @@ idempotency key (`UUIDv5(NS, "{tenant_id}|{principal}|{idem_input}")`) and encod
 `subject`, `type`, nor an entity composite — so `H` had no operational definition for T3 to
 extend. The pin:
 
-- **Composition (Q1).** `entity_identity` is the **resolved, durable, containment-stable**
-  subset of the §4 entity keys: **`{project, issue, pr, thread, service}`**. Excluded:
-  `agent` (producer, not statement — ISI-6053), `counterpart_agent*` (A2A hint, never a verified
-  key — §3/T4), and **`run`** — `run` is an *execution/session-scoped provenance axis*, not an
-  identity axis. `H` is formed **after §4 enrichment (§6 stage 2)**, which lifts an incidental
-  `run` up to its stable container(s) (`run → project/issue/pr`, "corroborated, never guessed",
-  §4); the resolved stable keys — never the `run` itself — enter `H`. This is the Q1 acceptance
-  constraint made concrete: the shipped `supersession_collapses_at_read_time` test supersedes
-  across `run r1 → r2` sharing only `issue`; with `run` excluded and enrichment run first, both
-  versions resolve to the same `H = (tenant, {issue=X, project=P}, subject, type)` and latest-wins
-  holds. A composite that included `run` — or an `H` built from the single resolved `first_anchor`
-  (`run` for `gateway_flush`) — would split the two versions across different `H` and both break
-  that test and fail to model "latest-wins on the same statement".
+- **Composition (Q1).** `entity_identity` is the **work-item coordinate tuple**
+  **`(project, issue, pr)`** — exactly the §4 keys that identify *what the fact is about* and
+  persist across episodes — taken as the server-resolved values **after §4 enrichment (§6
+  stage 2)**. **Excluded:** the producing `agent` (not statement — ISI-6053), `counterpart_agent*`
+  (A2A hint, never a verified key — §3/T4), and **all three per-source transport anchors `run`,
+  `thread`, `service`**. The anchor is the single key a dumb client natively knows (§4): `run` for
+  `gateway_flush`/`run_settle`, `thread` for `a2a_exchange`, `service` for `telemetry_learning`.
+  Enrichment *lifts* each anchor to its work-item container (`run`/`thread` → `project`/`issue`/`pr`,
+  `service` → `project`; "corroborated, never guessed", §4), and only the lifted work-item keys
+  enter `H`. The anchor is *how the fact arrived*, not *what it is about*: the same decision on
+  issue `I1` is one statement whether reached in run `r1` or `r2`, over thread `t1` or `t2`.
+  Excluding `thread` and `service` alongside `run` is what keeps cross-thread / cross-service
+  versioning of the **same work-item statement** collapsing to one live head; including them would
+  re-introduce, on the A2A and telemetry paths, the exact fork that excluding `run` removes on the
+  flush path (two live "current" decisions for one issue, one per thread). This is the Q1
+  acceptance constraint made concrete against the shipped `supersession_collapses_at_read_time`
+  test: it supersedes across `run r1 → r2` sharing only `issue`, so with all anchors excluded both
+  versions resolve to the same `H = (tenant, (–, I1, –), subject, type)` and latest-wins holds. A
+  composite that included *any* anchor — or an `H` built from the single resolved `first_anchor` —
+  would split the two versions across different `H` and both break that test and fail to model
+  "latest-wins on the same statement".
+  *(Why not the "durable" cut that keeps `thread`/`service` because they outlive a `run`?
+  Durability is the wrong axis; identity is. `thread`/`service` are durable yet still only
+  transport — a conversation or an emitter, not the thing a statement is about. Their exclusion
+  changes behaviour in exactly one case: a subject-bearing fact that resolves **no** work-item
+  coordinate then has an empty composite and is gate-skipped as an independent observation (below),
+  rather than versioned per-thread/per-service. That is the safe default — telemetry learnings are
+  observations, and an A2A exchange bound to no work item is untethered — and extending `H` to the
+  durable anchor for that narrow case is a deliberate future option, not a prerequisite for T3; the
+  graph reconciler surfaces any accidental duplication meanwhile, never a silent merge.)*
 - **Empty composite ⇒ no gate.** A fact whose stable composite is empty after enrichment is
   `unkeyed` (§4) and is **not subject-versioned**: it takes the unchanged idempotent-insert path
-  and bypasses the live-head gate, exactly as subject-null facts do. This is the clean home for a
-  `run`-only envelope that enrichment cannot lift to any durable anchor — it is an independent
-  observation, not a competing head.
+  and bypasses the live-head gate, exactly as subject-null facts do. This is the clean home for an
+  anchor-only envelope (`run`/`thread`/`service` that enrichment cannot lift to a work-item
+  coordinate) — it is an independent observation, not a competing head.
 - **Grain unification (Q2).** The §6 stage-3 supersession grain is unified on `H`-equality,
   **retiring "shares ≥1 anchor" as the authoritative rule**. An explicit `supersedes` is valid
   iff its target has the **same `entity_identity`** (same stable composite), same `subject`, same
