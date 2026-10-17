@@ -16,6 +16,8 @@
 pub mod envelope;
 pub mod error;
 pub mod graph;
+pub mod http;
+pub mod mcp;
 pub mod memstore;
 pub mod model;
 pub mod pg;
