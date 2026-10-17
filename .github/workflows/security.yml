@@ -39,9 +39,23 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Perform CodeQL Analysis
+        # This private repo does not have GitHub Advanced Security enabled,
+        # so the SARIF cannot be uploaded to the code-scanning API (that
+        # upload requires GHAS, a paid org decision). The analysis itself
+        # runs on every PR; results are uploaded as a workflow artifact
+        # instead. Once GHAS is enabled by the org owner, set upload: true
+        # and add security-events: write to surface alerts in the UI.
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:rust"
+          upload: false
+          output: sarif-results
+
+      - name: Upload CodeQL SARIF as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-rust.sarif
+          path: sarif-results/rust.sarif
 
   gitleaks:
     name: gitleaks
