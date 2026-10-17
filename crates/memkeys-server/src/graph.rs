@@ -163,7 +163,7 @@ fn decode_segment(s: &str) -> Option<String> {
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                if i + 2 >= bytes.len() + 1 || i + 3 > bytes.len() {
+                if i + 3 > bytes.len() {
                     return None;
                 }
                 let hex = &s[i + 1..i + 3];

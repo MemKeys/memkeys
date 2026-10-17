@@ -156,7 +156,11 @@ async fn edge_rows(x: &Ctx) -> Vec<(String, String, String)> {
 #[tokio::test]
 async fn projection_after_ingest_builds_the_graph() {
     let x = ctx().await;
-    let e1 = ingest(&x, &envelope(gw_flush(Some("status"), "v1", proj_entity("proj-1")))).await;
+    let e1 = ingest(
+        &x,
+        &envelope(gw_flush(Some("status"), "v1", proj_entity("proj-1"))),
+    )
+    .await;
     let mut v2 = gw_flush(Some("status"), "v2", proj_entity("proj-1"));
     v2["fact"]["supersedes"] = serde_json::json!(e1.fact_id.to_string());
     let e2 = ingest(&x, &envelope(v2)).await;
@@ -173,7 +177,9 @@ async fn projection_after_ingest_builds_the_graph() {
     ] {
         let ent = node_id(&x.tenant, kind, v);
         assert!(
-            edges.iter().any(|(s, d, t)| s == &ent && d == &fact1 && t == "entity_fact"),
+            edges
+                .iter()
+                .any(|(s, d, t)| s == &ent && d == &fact1 && t == "entity_fact"),
             "missing entity_fact edge for {v}"
         );
     }
@@ -193,7 +199,11 @@ async fn projection_after_ingest_builds_the_graph() {
 async fn supersedes_edge_written_and_deferred_until_target_lands() {
     let x = ctx().await;
     // v1 ingested but its projection LOST (simulated: never drained — clear queue).
-    let e1 = ingest(&x, &envelope(gw_flush(Some("status"), "v1", proj_entity("proj-1")))).await;
+    let e1 = ingest(
+        &x,
+        &envelope(gw_flush(Some("status"), "v1", proj_entity("proj-1"))),
+    )
+    .await;
     // v2 supersedes v1 (superseding facts carry the shared subject — stage 3).
     let mut j = gw_flush(Some("status"), "v2", proj_entity("proj-1"));
     j["fact"]["supersedes"] = serde_json::json!(e1.fact_id.to_string());
@@ -205,7 +215,9 @@ async fn supersedes_edge_written_and_deferred_until_target_lands() {
     let f2 = node_id(&x.tenant, NodeKind::Fact, &e2.fact_id.to_string());
     let edges = edge_rows(&x).await;
     assert!(
-        edges.iter().any(|(s, d, t)| s == &f2 && d == &f1 && t == "supersedes"),
+        edges
+            .iter()
+            .any(|(s, d, t)| s == &f2 && d == &f1 && t == "supersedes"),
         "supersedes edge present when both endpoints projected"
     );
 
@@ -214,17 +226,21 @@ async fn supersedes_edge_written_and_deferred_until_target_lands() {
     let mut j3 = gw_flush(Some("status"), "v3", proj_entity("proj-1"));
     j3["fact"]["supersedes"] = serde_json::json!(e2.fact_id.to_string());
     let e3 = ingest(&x, &envelope(j3)).await;
-    sqlx::query("DELETE FROM edges WHERE tenant = $1 AND dst_id = $2 AND edge_type = 'entity_fact'")
-        .bind(&x.tenant)
-        .bind(&f2)
-        .execute(x.graph.pool())
-        .await
-        .expect("punch hole");
+    sqlx::query(
+        "DELETE FROM edges WHERE tenant = $1 AND dst_id = $2 AND edge_type = 'entity_fact'",
+    )
+    .bind(&x.tenant)
+    .bind(&f2)
+    .execute(x.graph.pool())
+    .await
+    .expect("punch hole");
     drain(&x).await;
     let f3 = node_id(&x.tenant, NodeKind::Fact, &e3.fact_id.to_string());
     let edges = edge_rows(&x).await;
     assert!(
-        !edges.iter().any(|(s, d, t)| s == &f3 && d == &f2 && t == "supersedes"),
+        !edges
+            .iter()
+            .any(|(s, d, t)| s == &f3 && d == &f2 && t == "supersedes"),
         "supersedes edge DEFERRED while target sits in a projection hole"
     );
 
@@ -233,7 +249,9 @@ async fn supersedes_edge_written_and_deferred_until_target_lands() {
     assert!(filled > 0);
     let edges = edge_rows(&x).await;
     assert!(
-        edges.iter().any(|(s, d, t)| s == &f3 && d == &f2 && t == "supersedes"),
+        edges
+            .iter()
+            .any(|(s, d, t)| s == &f3 && d == &f2 && t == "supersedes"),
         "deferred supersedes edge lands once the hole closes"
     );
 }
@@ -256,7 +274,9 @@ async fn a2a_hint_nodes_are_convergent_and_deterministic() {
     let edges = edge_rows(&x).await;
     for f in [&f1, &f2] {
         assert!(
-            edges.iter().any(|(s, d, t)| s == f && d == &hint_node && t == "a2a_participant"),
+            edges
+                .iter()
+                .any(|(s, d, t)| s == f && d == &hint_node && t == "a2a_participant"),
             "convergent a2a_hint node for corroborating facts"
         );
     }
@@ -271,7 +291,11 @@ async fn projection_is_idempotent_on_replay() {
     let before = edge_rows(&x).await;
     // Same envelope again (same idempotency inputs -> same fact id) — the
     // store dedups the commit; a replayed Project must not add edges either.
-    let dup = x.service.ingest(&env, &x.caller, Utc::now()).await.expect("replay ok");
+    let dup = x
+        .service
+        .ingest(&env, &x.caller, Utc::now())
+        .await
+        .expect("replay ok");
     assert!(dup.duplicate, "replayed flush resolves to the existing row");
     drain(&x).await;
     let after = edge_rows(&x).await;
@@ -285,7 +309,11 @@ async fn projection_is_idempotent_on_replay() {
 #[tokio::test]
 async fn traverse_walks_from_entity_over_directions_and_filters() {
     let x = ctx().await;
-    let e1 = ingest(&x, &envelope(gw_flush(Some("status"), "f1", proj_entity("proj-1")))).await;
+    let e1 = ingest(
+        &x,
+        &envelope(gw_flush(Some("status"), "f1", proj_entity("proj-1"))),
+    )
+    .await;
     let mut j = gw_flush(Some("status"), "f2", proj_entity("proj-1"));
     j["fact"]["supersedes"] = serde_json::json!(e1.fact_id.to_string());
     let e2 = ingest(&x, &envelope(j)).await;
@@ -305,7 +333,10 @@ async fn traverse_walks_from_entity_over_directions_and_filters() {
     // Edge filter: supersedes-only from the newer fact reaches the older one.
     let mut req = memkeys_server::graph::TraverseReq::new(
         &x.tenant,
-        NodeRef { kind: NodeKind::Fact, id: f2.clone() },
+        NodeRef {
+            kind: NodeKind::Fact,
+            id: f2.clone(),
+        },
     );
     req.edges = vec![EdgeType::Supersedes];
     let r = x.graph.traverse(&req).await.expect("filtered traverse");
@@ -315,7 +346,10 @@ async fn traverse_walks_from_entity_over_directions_and_filters() {
     // Direction=in from the older fact reaches the newer one via supersedes.
     let mut req = memkeys_server::graph::TraverseReq::new(
         &x.tenant,
-        NodeRef { kind: NodeKind::Fact, id: f1.clone() },
+        NodeRef {
+            kind: NodeKind::Fact,
+            id: f1.clone(),
+        },
     );
     req.edges = vec![EdgeType::Supersedes];
     req.dir = Direction::In;
@@ -340,13 +374,19 @@ async fn traverse_is_tenant_fail_closed() {
     );
     req.depth = 1;
     let err = x.graph.traverse(&req).await.unwrap_err();
-    assert!(matches!(err, GraphError::NotFound), "cross-tenant start fails closed");
+    assert!(
+        matches!(err, GraphError::NotFound),
+        "cross-tenant start fails closed"
+    );
 
     // Forged node id (tenant segment lies) -> not_found, never a leak.
     let forged = format!("{}|fact|{}", x.tenant, Uuid::new_v4());
     let mut req = memkeys_server::graph::TraverseReq::new(
         &x.tenant,
-        NodeRef { kind: NodeKind::Fact, id: forged },
+        NodeRef {
+            kind: NodeKind::Fact,
+            id: forged,
+        },
     );
     req.depth = 1;
     assert!(matches!(
@@ -409,7 +449,11 @@ async fn traverse_depth_clamp_and_budgets() {
 #[tokio::test]
 async fn traverse_hydrates_from_the_keyed_store_and_flags_orphans() {
     let x = ctx().await;
-    let e1 = ingest(&x, &envelope(gw_flush(None, "the-body", proj_entity("proj-1")))).await;
+    let e1 = ingest(
+        &x,
+        &envelope(gw_flush(None, "the-body", proj_entity("proj-1"))),
+    )
+    .await;
     drain(&x).await;
 
     let mut req = memkeys_server::graph::TraverseReq::new(
@@ -420,7 +464,11 @@ async fn traverse_hydrates_from_the_keyed_store_and_flags_orphans() {
     req.hydrate = true;
     let r = x.graph.traverse(&req).await.expect("hydrate");
     let f1 = node_id(&x.tenant, NodeKind::Fact, &e1.fact_id.to_string());
-    let fact_node = r.nodes.iter().find(|n| n.id == f1).expect("fact node present");
+    let fact_node = r
+        .nodes
+        .iter()
+        .find(|n| n.id == f1)
+        .expect("fact node present");
     let rec = fact_node.record.as_ref().expect("hydrated record");
     assert_eq!(rec.body, "the-body");
 
@@ -534,7 +582,10 @@ async fn supersedes_lineage_complete_holes_and_heads() {
     // Rebuild converges the projection back to the SoT and the chain heals.
     let stats = x
         .graph
-        .rebuild(&Scope { tenant: x.tenant.clone(), project: None })
+        .rebuild(&Scope {
+            tenant: x.tenant.clone(),
+            project: None,
+        })
         .await
         .expect("rebuild");
     assert_eq!(stats.facts_scanned, 3);
@@ -570,7 +621,10 @@ async fn supersedes_reports_legacy_forks_as_branch_points() {
     let r = x.graph.supersedes(&req).await.expect("fork lineage");
     assert_eq!(r.branches.len(), 1, "the fork is reported, not hidden");
     let b = &r.branches[0];
-    assert_eq!(b.at, node_id(&x.tenant, NodeKind::Fact, &e1.fact_id.to_string()));
+    assert_eq!(
+        b.at,
+        node_id(&x.tenant, NodeKind::Fact, &e1.fact_id.to_string())
+    );
     let mut heads = b.heads.clone();
     heads.sort();
     let mut expected = vec![
@@ -614,7 +668,10 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
     // Project-scoped rebuild heals proj-1 only.
     let stats = x
         .graph
-        .rebuild(&Scope { tenant: x.tenant.clone(), project: Some("proj-1".into()) })
+        .rebuild(&Scope {
+            tenant: x.tenant.clone(),
+            project: Some("proj-1".into()),
+        })
         .await
         .expect("scoped rebuild");
     assert_eq!(stats.facts_scanned, 1);
@@ -624,9 +681,9 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
         "phantom edge evicted"
     );
     assert!(
-        edges
-            .iter()
-            .any(|(s, d, t)| d == &f1 && s == &node_id(&x.tenant, NodeKind::EntityProject, "proj-1") && t == "entity_fact"),
+        edges.iter().any(|(s, d, t)| d == &f1
+            && s == &node_id(&x.tenant, NodeKind::EntityProject, "proj-1")
+            && t == "entity_fact"),
         "deleted real edge healed"
     );
 
@@ -634,13 +691,20 @@ async fn rebuild_converges_after_drift_and_respects_scope() {
     // set: exactly the edges of the two facts.
     let stats = x
         .graph
-        .rebuild(&Scope { tenant: x.tenant.clone(), project: None })
+        .rebuild(&Scope {
+            tenant: x.tenant.clone(),
+            project: None,
+        })
         .await
         .expect("tenant rebuild");
     assert_eq!(stats.facts_scanned, 2);
     let edges = edge_rows(&x).await;
     // e1: 3 entity dims + produced_by = 4; e2 likewise = 4.
-    assert_eq!(edges.len(), 8, "converged edge set, nothing stale, nothing missing");
+    assert_eq!(
+        edges.len(),
+        8,
+        "converged edge set, nothing stale, nothing missing"
+    );
     assert!(edges.iter().all(|(_, _, t)| t != "supersedes"));
 }
 
@@ -650,12 +714,20 @@ async fn worker_catch_up_builds_projection_from_factstore() {
     // Ingest directly through the store (queue never sees these) — the
     // projection is then built purely FROM the FactStore.
     for i in 0..3 {
-        ingest(&x, &envelope(gw_flush(None, &format!("f{i}"), proj_entity("proj-1")))).await;
+        ingest(
+            &x,
+            &envelope(gw_flush(None, &format!("f{i}"), proj_entity("proj-1"))),
+        )
+        .await;
     }
     let n = x.worker.catch_up(&x.tenant).await.expect("catch up");
     assert_eq!(n, 3, "all committed facts projected from the SoT");
     let edges = edge_rows(&x).await;
-    assert_eq!(edges.len(), 3 * 4, "entity_fact x3 dims + produced_by per fact");
+    assert_eq!(
+        edges.len(),
+        3 * 4,
+        "entity_fact x3 dims + produced_by per fact"
+    );
     // Idempotent: a second catch-up finds no holes.
     let n = x.worker.catch_up(&x.tenant).await.expect("catch up 2");
     assert_eq!(n, 0);
