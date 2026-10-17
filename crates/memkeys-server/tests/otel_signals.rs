@@ -53,9 +53,11 @@ fn caller(tenant: &str) -> CallerContext {
 }
 
 fn gw_flush(body: &str) -> Envelope {
+    // §3.1 anchor matrix (as merged from main/M8): the per-source pivot
+    // anchor is mandatory — `run` for gateway_flush.
     serde_json::from_value(serde_json::json!({
         "source": { "kind": "gateway_flush", "emitted_at": "2026-10-17T10:00:00Z" },
-        "entity": { "project": "proj-1" },
+        "entity": { "run": "run-1", "project": "proj-1" },
         "fact": { "body": body }
     }))
     .expect("valid envelope")

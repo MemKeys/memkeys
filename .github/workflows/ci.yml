@@ -45,3 +45,12 @@ jobs:
 
       - name: Unit + integration tests
         run: cargo test --workspace
+
+      - name: Conformance suite (M8 promotion gate)
+        run: cargo run --release -p memkeys-bench --bin conformance
+
+      - name: Write-path benchmark smoke (harness executes end to end)
+        run: |
+          cargo run --release -p memkeys-bench --bin write-bench -- \
+            --ops 200 --warmup 20 --read-ops 200 --json -
+

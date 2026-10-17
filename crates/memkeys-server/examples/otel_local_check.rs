@@ -29,7 +29,7 @@ use memkeys_server::telemetry_setup::Otel;
 fn envelope(body: &str) -> Envelope {
     serde_json::from_value(serde_json::json!({
         "source": { "kind": "gateway_flush", "emitted_at": "2026-10-17T10:00:00Z" },
-        "entity": { "project": "paperclip", "issue": "ISI-6078" },
+        "entity": { "run": "run-1", "project": "paperclip", "issue": "ISI-6078" },
         "fact": { "body": body }
     }))
     .expect("valid envelope")
