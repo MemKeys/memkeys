@@ -1,0 +1,48 @@
+# MemKeys semantic-convention version pinning + tracking
+# Owner: Observability Agent (WS-7, ISI-5872). See ADR-0001 D-3.
+#
+# Policy: pin ONE semconv release; record it as schema_url on the Resource and scopes.
+# Stable groups are safe to depend on. The gen_ai group is EXPERIMENTAL — isolate all
+# emission behind one helper and track upstream; a bump is a change-managed, one-file edit.
+
+pinned_release: "1.30.0"
+schema_url: "https://opentelemetry.io/schemas/1.30.0"
+
+groups:
+  general:
+    stability: stable
+    used_for: resource, service.*, deployment.environment.name, process/host/os detectors
+  db:
+    stability: stable
+    used_for: store calls (WS-1/WS-2/SoT) — db.system.name, db.operation.name, db.collection.name
+    notes: >
+      db.system renamed to db.system.name in recent semconv; use the .name form.
+      db.query.text is DISABLED (carries fact content) — see deny-list.
+  log:
+    stability: stable
+    used_for: structured, trace-correlated log records
+  gen_ai:
+    stability: experimental        # a.k.a. "development" — WILL change
+    used_for: LLM pipeline (WS-3) — gen_ai.* spans + gen_ai.client.* metrics
+    isolation: all emission behind a single instrumentation helper (one place to migrate)
+    tracked_signals:
+      - gen_ai.operation.name
+      - gen_ai.system
+      - gen_ai.request.model / gen_ai.response.model
+      - gen_ai.usage.input_tokens / gen_ai.usage.output_tokens
+      - gen_ai.client.token.usage (metric)
+      - gen_ai.client.operation.duration (metric)
+    tracking:
+      action: review the gen_ai semconv group each release; diff with schema-diff; update this file + catalog + helper together.
+      cadence: per OTel semconv release, or sooner on a breaking rename.
+
+change_management:
+  rule: >
+    Any convention change (new/renamed attribute, new metric, new span) updates
+    ADR-0001 + signal-catalog.yaml FIRST, then WS owners update call sites.
+  bump_checklist:
+    - run schema-diff old->new for the changed group
+    - update pinned_release + schema_url here
+    - update signal-catalog.yaml affected entries
+    - update the gen_ai helper (if gen_ai group)
+    - notify WS-1/WS-2/WS-3/WS-4 owners via handoff
