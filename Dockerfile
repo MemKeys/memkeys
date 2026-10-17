@@ -5,7 +5,7 @@
 # GHCR push to ghcr.io/memkeys/memkeys runs on main/tags only (later phase).
 
 # --- builder -------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
@@ -14,10 +14,15 @@ COPY crates ./crates
 RUN cargo build --release --locked --bin memkeys-server
 
 # --- runtime -------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+# trixie (current Debian stable) rather than bookworm: bookworm's base
+# packages currently carry several critical CVEs that will not be fixed
+# there (grype gate fails on critical).
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
+ # pull in security updates published after the base image snapshot
+ && apt-get upgrade -y \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin memkeys
 
