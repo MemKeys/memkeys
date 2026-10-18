@@ -73,8 +73,10 @@ correlate to the triggering write. Key structured events:
 | `memkeys.entity.kind` | project · issue · pr · agent · run |
 | `memkeys.pipeline.stage` | normalize · key · temporalize · commit |
 | `memkeys.retrieval.op` | keyed · graph · semantic |
-| `memkeys.projection.kind` | graph · summary · embedding · category |
-| `memkeys.worker.kind` | graph_projection · summarization · embedding · categorization |
+| `memkeys.projection.kind` | graph · summary · **vector** · category — `vector` = ANN/semantic index tier (M5; replaces placeholder `embedding`) |
+| `memkeys.worker.kind` | graph_projection · summarization · **vector_projection** · categorization — `vector_projection` = M5 stage-5b worker (replaces `embedding`) |
+| `memkeys.fusion.sources` | keyed · semantic · graph · keyed+semantic · keyed+graph · semantic+graph · keyed+semantic+graph (path mix of a fused read; M5) |
+| `outcome` (retrieval) | success · error · **feature_disabled** (M5 — op-4 arrived while `memory.semantic` off → 501) |
 | `memkeys.graph.depth` | 1 · 2 · 3 · 4 · 5 (post-clamp; MaxDepth=5 ceiling) |
 | `memkeys.graph.truncate.reason` | none · depth_clamp · fanout · node_budget · deadline · orphan |
 
