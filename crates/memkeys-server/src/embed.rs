@@ -21,6 +21,14 @@ use crate::semantic::{EmbedError, Embedder, HashEmbedder, HASH_EMBED_DIM};
 /// Environment variable naming the embedding endpoint. Unset ⇒ [`HashEmbedder`].
 pub const EMBED_URL_ENV: &str = "MEMKEYS_EMBED_URL";
 
+/// Environment variable naming the HTTP embedder's model id (M7: the embedding
+/// half of the derivation version, stamped on `fact_vectors`/`digests`). An
+/// operator MUST bump this when they change the embedding model behind the same
+/// `MEMKEYS_EMBED_URL` so the reconciler re-embeds prior vectors. Unset ⇒ a
+/// stable id derived from the endpoint url (so a bare swap of the URL already
+/// counts as a new model and backfills).
+pub const EMBED_MODEL_ENV: &str = "MEMKEYS_EMBED_MODEL";
+
 /// An HTTP embedding-model adapter.
 ///
 /// Wire contract (deliberately minimal — a thin shim a deployment adapts to its
@@ -29,16 +37,21 @@ pub const EMBED_URL_ENV: &str = "MEMKEYS_EMBED_URL";
 pub struct HttpEmbedder {
     url: String,
     dim: usize,
+    model_id: String,
     client: reqwest::Client,
 }
 
 impl HttpEmbedder {
-    /// Build an HTTP embedder for `url` producing `dim`-wide vectors. `dim` must
-    /// equal the configured index width (migration 0003 = 256).
-    pub fn new(url: impl Into<String>, dim: usize) -> Self {
+    /// Build an HTTP embedder for `url` producing `dim`-wide vectors with the
+    /// embedder build id `model_id` (M7: the embedding half of a fact vector's
+    /// derivation version — a change MUST be reflected here so prior vectors
+    /// backfill). `dim` must equal the configured index width (migration 0003 =
+    /// 256).
+    pub fn new(url: impl Into<String>, dim: usize, model_id: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             dim,
+            model_id: model_id.into(),
             client: reqwest::Client::new(),
         }
     }
@@ -58,6 +71,10 @@ struct EmbedResponse {
 impl Embedder for HttpEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
@@ -98,11 +115,18 @@ impl Embedder for HttpEmbedder {
 pub fn from_env() -> Arc<dyn Embedder> {
     match std::env::var(EMBED_URL_ENV).ok().filter(|s| !s.is_empty()) {
         Some(url) => {
+            // The embedder build id (M7): an explicit MEMKEYS_EMBED_MODEL, else
+            // a stable id derived from the endpoint url so even an un-annotated
+            // URL swap registers as a new model and backfills prior vectors.
+            let model_id = std::env::var(EMBED_MODEL_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("http:{url}"));
             tracing::info!(
                 target: "memkeys",
-                "memkeys.embedder.http: using HTTP embedder at {url} (dim {HASH_EMBED_DIM})"
+                "memkeys.embedder.http: using HTTP embedder at {url} (dim {HASH_EMBED_DIM}, model {model_id})"
             );
-            Arc::new(HttpEmbedder::new(url, HASH_EMBED_DIM))
+            Arc::new(HttpEmbedder::new(url, HASH_EMBED_DIM, model_id))
         }
         None => {
             tracing::info!(
@@ -120,8 +144,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_embedder_reports_configured_dim() {
-        let e = HttpEmbedder::new("http://localhost:9/embed", HASH_EMBED_DIM);
+    fn http_embedder_reports_configured_dim_and_model() {
+        let e = HttpEmbedder::new("http://localhost:9/embed", HASH_EMBED_DIM, "bge-small/v1");
         assert_eq!(e.dim(), HASH_EMBED_DIM);
+        assert_eq!(e.model_id(), "bge-small/v1");
     }
 }

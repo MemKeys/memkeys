@@ -137,6 +137,16 @@ impl GraphProjectionWorker {
         Ok(n)
     }
 
+    /// Ingest time of the OLDEST outstanding graph-projection hole for a tenant
+    /// (the reconciler's `memkeys.projection.lag.current` input; M7). Reuses the
+    /// same hole scan as [`catch_up`](Self::catch_up) — the graph tier is
+    /// deterministic (no model stamp; edges carry a structural `rule_ver`), so a
+    /// hole is strictly a missing/deferred edge. `None` when converged.
+    pub async fn oldest_hole(&self, tenant: &str) -> Result<Option<DateTime<Utc>>, GraphError> {
+        let facts = self.graph.unprojected_facts(tenant).await?;
+        Ok(facts.iter().map(|f| f.ingested_at).min())
+    }
+
     async fn apply(&self, item: &WorkItem, _retryable: bool) -> Result<(), GraphError> {
         let fact = fetch_fact(self.graph.as_ref(), &item.tenant, item.fact_id).await?;
         let Some(fact) = fact else {
@@ -376,15 +386,24 @@ impl VectorProjectionWorker {
     }
 
     /// SoT convergence scan: committed facts with no row in `fact_vectors` yet
-    /// (holes — lost queue items, module just-enabled, drift). The projection is
-    /// built FROM the FactStore, same contract as the graph worker's catch_up.
+    /// (holes — lost queue items, module just-enabled, drift) OR one embedded
+    /// under a STALE embedder build (`v.model_id <> active` — M7: an embedding
+    /// model change is a re-embed/backfill event, mirroring the LLM tiers'
+    /// `(model_id, prompt_version)` staleness; ISI-6081). The projection is
+    /// built FROM the FactStore, same contract as the graph worker's catch_up;
+    /// the upsert overwrites the stale vector + its stamp in place, so a model
+    /// change rebuilds with no downtime (D3 — a stale vector costs freshness,
+    /// never correctness).
     pub async fn catch_up(&self, tenant: &str) -> Result<usize, VectorError> {
+        let model_id = self.embedder.model_id();
         let ids: Vec<(Uuid,)> = sqlx::query_as(
             "SELECT f.id FROM facts f \
              LEFT JOIN fact_vectors v ON v.fact_id = f.id AND v.tenant_id = f.tenant_id \
-             WHERE f.tenant_id = $1 AND v.fact_id IS NULL ORDER BY f.ingested_at, f.id",
+             WHERE f.tenant_id = $1 AND (v.fact_id IS NULL OR v.model_id <> $2) \
+             ORDER BY f.ingested_at, f.id",
         )
         .bind(tenant)
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| VectorError::Backend(e.to_string()))?;
@@ -395,6 +414,24 @@ impl VectorProjectionWorker {
             }
         }
         Ok(n)
+    }
+
+    /// Ingest time of the OLDEST outstanding stage-5b hole/stale vector for a
+    /// tenant (the reconciler's `memkeys.projection.lag.current` input — the
+    /// age of the longest-un-applied committed fact for this tier; M7). `None`
+    /// when the projection is converged (no holes, no stale embeddings).
+    pub async fn oldest_hole(&self, tenant: &str) -> Result<Option<DateTime<Utc>>, VectorError> {
+        let row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+            "SELECT min(f.ingested_at) FROM facts f \
+             LEFT JOIN fact_vectors v ON v.fact_id = f.id AND v.tenant_id = f.tenant_id \
+             WHERE f.tenant_id = $1 AND (v.fact_id IS NULL OR v.model_id <> $2)",
+        )
+        .bind(tenant)
+        .bind(self.embedder.model_id())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| VectorError::Backend(e.to_string()))?;
+        Ok(row.and_then(|(ts,)| ts))
     }
 
     async fn apply(&self, item: &WorkItem) -> Result<(), VectorError> {
@@ -464,6 +501,9 @@ impl VectorProjectionWorker {
                     counterpart_agent: row.counterpart_agent.clone(),
                 },
                 ingested_at: row.ingested_at,
+                // M7: stamp the active embedder build so the reconciler can
+                // detect a stale embedding and re-embed on a model change.
+                model_id: self.embedder.model_id().to_string(),
             })
             .await
     }

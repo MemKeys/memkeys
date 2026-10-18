@@ -30,6 +30,7 @@ pub mod pg;
 pub mod pg_graph;
 pub mod pg_vector;
 pub mod pipeline;
+pub mod reconciler;
 pub mod semantic;
 pub mod service;
 pub mod store;
@@ -59,6 +60,7 @@ pub use pg::PgStore;
 pub use pg_graph::PgGraph;
 pub use pg_vector::PgVectorIndex;
 pub use pipeline::{CallerContext, EntityResolver, NoopResolver, RunBinding, ThreadBinding};
+pub use reconciler::{Reconcilable, ReconcileReport, Reconciler, TierReport};
 pub use semantic::{
     cosine, rrf_fuse, CandidateSet, EmbedError, Embedder, FactVector, FusedHit, FusionSource,
     HashEmbedder, MemVectorIndex, RankedList, ScoredId, VectorError, VectorIndex, K_RRF,

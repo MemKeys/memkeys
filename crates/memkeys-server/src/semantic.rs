@@ -42,6 +42,13 @@ use crate::model::EntityKeys;
 /// enough to separate token bags without being wasteful.
 pub const HASH_EMBED_DIM: usize = 256;
 
+/// The [`HashEmbedder`]'s `model_id` — the embedding half of a fact vector's
+/// derivation version (M7). Stamped onto every `fact_vectors` row it produces
+/// so the reconciler can detect a stale embedding and re-embed when the active
+/// embedder changes (ISI-6081). The algorithm + width are baked into the id: a
+/// change to either MUST bump this string so prior vectors backfill.
+pub const HASH_EMBED_MODEL_ID: &str = "hash-fnv1a-256/v1";
+
 /// The RRF constant `k` (§7.4 step 3): `score = Σ 1/(k_rrf + rank)`. 60 is the
 /// standard value from the original RRF paper and the ratified default.
 pub const K_RRF: f64 = 60.0;
@@ -69,6 +76,14 @@ pub enum VectorError {
 pub trait Embedder: Send + Sync {
     /// The fixed output dimensionality (must match the configured index).
     fn dim(&self) -> usize;
+    /// The embedder build id — the embedding half of a fact vector's derivation
+    /// version (§5.5; M7). Stamped onto every embedded row (`fact_vectors`,
+    /// `digests`) so the reconciler re-embeds when the active embedder changes
+    /// (ISI-6081): a stored `model_id` that differs from the active one marks a
+    /// stale embedding for backfill, exactly as `(model_id, prompt_version)`
+    /// does for the LLM-derived tiers. A deterministic embedder's id captures
+    /// its algorithm + width; a model-backed one, the model name/revision.
+    fn model_id(&self) -> &str;
     /// Embed one text. Called on stage 5b (fact body) and per query (§7.4).
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
 }
@@ -114,6 +129,10 @@ fn tokenize(text: &str) -> Vec<String> {
 impl Embedder for HashEmbedder {
     fn dim(&self) -> usize {
         HASH_EMBED_DIM
+    }
+
+    fn model_id(&self) -> &str {
+        HASH_EMBED_MODEL_ID
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
@@ -177,6 +196,11 @@ pub struct FactVector {
     /// as_of` so a whole-tenant `as_of` search is temporally bounded — not a
     /// silent read over newer-than-as_of facts (§7.4; ISI-6172).
     pub ingested_at: DateTime<Utc>,
+    /// The embedder build that produced `embedding` ([`Embedder::model_id`];
+    /// M7). Persisted on the row so the reconciler re-embeds this fact when the
+    /// active embedder's id differs — the stage-5b stale-embedding backfill
+    /// trigger (ISI-6081), mirroring the LLM tiers' `(model_id, prompt_version)`.
+    pub model_id: String,
 }
 
 /// A similarity hit from the index: an id and its score (cosine, in `[-1, 1]`).
@@ -491,6 +515,7 @@ mod tests {
             fact_type: "decision".into(),
             entity: EntityKeys::default(),
             ingested_at: at,
+            model_id: e.model_id().to_string(),
         }
     }
 

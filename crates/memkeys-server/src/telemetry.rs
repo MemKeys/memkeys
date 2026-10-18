@@ -266,6 +266,7 @@ pub struct Instruments {
     retrieve_duration: opentelemetry::metrics::Histogram<f64>,
     retrieve_candidate_set_size: opentelemetry::metrics::Histogram<u64>,
     projection_lag: opentelemetry::metrics::Histogram<f64>,
+    projection_lag_current: opentelemetry::metrics::Gauge<f64>,
     graph_traverse_latency: opentelemetry::metrics::Histogram<f64>,
     graph_edges_cardinality: opentelemetry::metrics::Gauge<u64>,
     worker_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
@@ -304,6 +305,16 @@ impl Instruments {
                 .with_description(
                     "Measured lag (apply_time - commit_time) when a projection \
                      applies a committed fact (the D3 bounded-lag invariant).",
+                )
+                .build(),
+            projection_lag_current: meter
+                .f64_gauge("memkeys.projection.lag.current")
+                .with_unit("s")
+                .with_description(
+                    "Current max outstanding lag per projection — age of the oldest \
+                     un-applied/stale committed fact for a tier. Observed by the M7 \
+                     reconciler at maintenance time (same async-observed pattern as \
+                     graph.edges.cardinality); 0 when the tier is converged.",
                 )
                 .build(),
             graph_traverse_latency: meter
@@ -389,6 +400,15 @@ impl Instruments {
     /// committed fact (worker call site).
     pub fn projection_lag(&self, projection_kind: &'static str, seconds: f64) {
         self.projection_lag
+            .record(seconds, &[attr("memkeys.projection.kind", projection_kind)]);
+    }
+
+    /// `memkeys.projection.lag.current` — the age (seconds) of the oldest
+    /// outstanding (un-applied or stale) committed fact for a projection tier,
+    /// recorded by the M7 reconciler at maintenance time. Realizes the reserved
+    /// signal-catalog gauge; 0.0 means the tier is converged.
+    pub fn projection_lag_current(&self, projection_kind: &'static str, seconds: f64) {
+        self.projection_lag_current
             .record(seconds, &[attr("memkeys.projection.kind", projection_kind)]);
     }
 

@@ -110,6 +110,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("worker is wired with the graph projection");
     let vector_worker = service.vector_worker();
 
+    // M7 (ISI-6081): the reconciler owns the per-tier `catch_up` SoT scans —
+    // one cohesive component over every wired tier (graph always; vector / LLM
+    // tiers ride their feature gates) instead of a hand-inlined list. It drives
+    // both the boot convergence pass and the steady-state maintenance tick,
+    // closing projection holes AND stale model-stamp rebuilds (incl. the M7
+    // embedding-model re-embed) with collect-and-continue failure handling.
+    let mut tiers: Vec<Arc<dyn memkeys_server::Reconcilable>> =
+        vec![worker.clone() as Arc<dyn memkeys_server::Reconcilable>];
+    if let Some(vw) = &vector_worker {
+        tiers.push(vw.clone() as Arc<dyn memkeys_server::Reconcilable>);
+    }
+    tiers.push(extract_worker.clone() as Arc<dyn memkeys_server::Reconcilable>);
+    if let Some(cw) = &categorize_worker {
+        tiers.push(cw.clone() as Arc<dyn memkeys_server::Reconcilable>);
+    }
+    if let Some(dw) = &digest_worker {
+        tiers.push(dw.clone() as Arc<dyn memkeys_server::Reconcilable>);
+    }
+    let reconciler = memkeys_server::Reconciler::new(tiers);
+
     // ISI-6132: the health listener starts before the (potentially long)
     // catch-up scan so kubelet probes can reach the pod immediately after
     // migrations; readiness is a live DB ping, not the scan state.
@@ -123,38 +143,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("memkeys-server: migrations applied; FactStore + graph projection ready");
 
-    // Initial convergence pass: build the projection(s) from the FactStore.
-    for tenant in distinct_tenants(graph.pool()).await? {
-        let n = worker.catch_up(&tenant).await?;
-        if n > 0 {
-            println!("memkeys-server: projected {n} hole facts for tenant {tenant}");
-        }
-        // Stage-5b vector catch-up (only when the semantic module is on).
-        if let Some(vw) = &vector_worker {
-            let vn = vw.catch_up(&tenant).await?;
-            if vn > 0 {
-                println!("memkeys-server: embedded {vn} hole facts for tenant {tenant}");
+    // Initial convergence pass: the reconciler rebuilds every wired tier's
+    // projection from the FactStore (holes + stale model-stamp rebuilds). It is
+    // collect-and-continue — a tier's transient failure is logged, never
+    // `?`-aborts the boot (ISI-6192 B2 class: one stuck tier must not wedge the
+    // whole server start). The steady-state tick below retries.
+    match reconciler.reconcile_all(graph.pool()).await {
+        Ok(reports) => {
+            for report in reports {
+                let n = report.total_reconciled();
+                if n > 0 {
+                    println!(
+                        "memkeys-server: reconciled {n} hole/stale facts for tenant {}",
+                        report.tenant
+                    );
+                }
+                // Per-tier backfill failures are logged inside reconcile_tenant
+                // (ISI-6223 M2), so both this boot pass and the steady-state
+                // tick surface them uniformly — no second loop needed here.
             }
         }
-        // M6 stages 5c-5e catch-up: re-derive LLM pipeline projections for
-        // facts/scopes with no derivation stamp — or one stale versus the
-        // active (model_id, prompt_version) (ADR Decision 5: a version bump
-        // is a backfill event).
-        let en = extract_worker.catch_up(&tenant).await?;
-        if en > 0 {
-            println!("memkeys-server: extracted {en} hole facts for tenant {tenant}");
-        }
-        if let Some(cw) = &categorize_worker {
-            let cn = cw.catch_up(&tenant).await?;
-            if cn > 0 {
-                println!("memkeys-server: categorized {cn} hole facts for tenant {tenant}");
-            }
-        }
-        if let Some(dw) = &digest_worker {
-            let dn = dw.catch_up(&tenant).await?;
-            if dn > 0 {
-                println!("memkeys-server: rolled up {dn} hole scopes for tenant {tenant}");
-            }
+        Err(e) => {
+            tracing::warn!(target: "memkeys", error = %e, "boot reconcile tenant scan failed")
         }
     }
 
@@ -270,6 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loop_extract_worker = extract_worker.clone();
     let loop_categorize_worker = categorize_worker.clone();
     let loop_digest_worker = digest_worker.clone();
+    let loop_reconciler = reconciler.clone();
     let maintenance = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -289,21 +300,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(dw) = &loop_digest_worker {
                 dw.drain().await;
             }
-            if let Ok(tenants) = distinct_tenants(loop_worker.graph_pool()).await {
-                for tenant in tenants {
-                    let _ = loop_worker.catch_up(&tenant).await;
-                    if let Some(vw) = &loop_vector_worker {
-                        let _ = vw.catch_up(&tenant).await;
-                    }
-                    let _ = loop_extract_worker.catch_up(&tenant).await;
-                    if let Some(cw) = &loop_categorize_worker {
-                        let _ = cw.catch_up(&tenant).await;
-                    }
-                    if let Some(dw) = &loop_digest_worker {
-                        let _ = dw.catch_up(&tenant).await;
-                    }
-                }
-            }
+            // Rescan every tenant for holes + stale model-stamp rebuilds across
+            // all wired tiers, and emit `memkeys.projection.lag.current` (once
+            // per kind, max across tenants). The reconciler collect-and-continues
+            // internally, and reconcile_tenant logs each tier's backfill/lag
+            // errors (ISI-6223 M2), so discarding the report here stays silent
+            // only about success counts, never about failures.
+            let _ = loop_reconciler
+                .reconcile_all(loop_worker.graph_pool())
+                .await;
         }
     });
 
@@ -333,14 +338,4 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn shutdown_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
-}
-
-/// The tenants with committed facts (the catch-up scan grain).
-async fn distinct_tenants(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
-    // DISTINCT keeps the scan bounded by tenant count, not fact count.
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT tenant_id FROM facts ORDER BY tenant_id")
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().map(|(s,)| s).collect())
 }
