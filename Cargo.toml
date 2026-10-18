@@ -38,6 +38,9 @@ axum = "0.7"
 tower = { version = "0.4", features = ["util"] }
 base64 = "0.22"
 hmac = "0.12"
+# M5 — the real HTTP embedder adapter (MEMKEYS_EMBED_URL). rustls to match the
+# sqlx tls stack (no new native-TLS/OpenSSL in the tree); json for the payload.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
 lto = "thin"

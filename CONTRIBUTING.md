@@ -17,7 +17,7 @@ Integration tests and the conformance suite expect a reachable Postgres, e.g.:
 
 ```bash
 docker run -d -p 5432:5432 -e POSTGRES_USER=memkeys -e POSTGRES_PASSWORD=memkeys \
-  -e POSTGRES_DB=memkeys_test postgres:18
+  -e POSTGRES_DB=memkeys_test pgvector/pgvector:pg18
 export TEST_DATABASE_URL=postgres://memkeys:memkeys@localhost:5432/memkeys_test
 ```
 

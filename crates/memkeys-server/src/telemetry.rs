@@ -357,12 +357,11 @@ impl Instruments {
             .record(depth as i64, &[attr("memkeys.worker.kind", worker_kind)]);
     }
 
-    /// `memkeys.poison.queue.depth` — live dead-letter count (absolute).
-    pub fn poison_queue_depth(&self, count: i64) {
-        self.poison_queue_depth_gauge.record(
-            count,
-            &[attr("memkeys.worker.kind", WORKER_KIND_GRAPH_PROJECTION)],
-        );
+    /// `memkeys.poison.queue.depth` — live dead-letter count (absolute), per
+    /// derived-view worker kind (graph_projection / vector_projection).
+    pub fn poison_queue_depth(&self, worker_kind: &'static str, count: i64) {
+        self.poison_queue_depth_gauge
+            .record(count, &[attr("memkeys.worker.kind", worker_kind)]);
     }
 }
 

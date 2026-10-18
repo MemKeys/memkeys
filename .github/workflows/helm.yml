@@ -134,7 +134,7 @@ jobs:
               spec:
                 containers:
                   - name: postgres
-                    image: postgres:18
+                    image: pgvector/pgvector:pg18
                     env:
                       - { name: POSTGRES_USER, value: memkeys }
                       - { name: POSTGRES_PASSWORD, value: memkeys }

@@ -22,7 +22,7 @@ use crate::semantic::{
 };
 use crate::store::{CommitOutcome, FactStore};
 use crate::telemetry::{self, Instruments};
-use crate::worker::GraphProjectionWorker;
+use crate::worker::{GraphProjectionWorker, VectorProjectionWorker};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt};
 
 /// Response of `POST /memory/facts` (§7.1 write-with-keys): the fact id, the
@@ -56,6 +56,10 @@ pub struct MemKeysService {
     /// the embedder produces query/fact vectors, the index stores+ranks them.
     embedder: Option<Arc<dyn Embedder>>,
     vector: Option<Arc<dyn VectorIndex>>,
+    /// M5 stage-5b vector-projection worker (write path). `None` in unit
+    /// contexts (no pg pool) — tests seed the index directly. Enqueued OFF the
+    /// stage-4 ack path, alongside the stage-5a graph worker (§6/R2).
+    vector_worker: Option<Arc<VectorProjectionWorker>>,
 }
 
 impl MemKeysService {
@@ -72,6 +76,7 @@ impl MemKeysService {
             worker: None,
             embedder: None,
             vector: None,
+            vector_worker: None,
         }
     }
 
@@ -92,6 +97,7 @@ impl MemKeysService {
             worker: Some(worker),
             embedder: None,
             vector: None,
+            vector_worker: None,
         }
     }
 
@@ -110,10 +116,25 @@ impl MemKeysService {
         self
     }
 
+    /// M5: wire the stage-5b vector-projection worker (write path). Fluent;
+    /// requires [`with_semantic`](Self::with_semantic) to also be set so the
+    /// read path is coherent with the index the worker populates. The worker is
+    /// enqueued OFF the stage-4 ack path (§6/R2).
+    pub fn with_semantic_worker(mut self, worker: Arc<VectorProjectionWorker>) -> Self {
+        self.vector_worker = Some(worker);
+        self
+    }
+
     /// The wired stage-5a worker (drain/catch-up control for the binary and
     /// tests). `None` when no graph projection is configured.
     pub fn projection_worker(&self) -> Option<Arc<GraphProjectionWorker>> {
         self.worker.clone()
+    }
+
+    /// The wired stage-5b vector-projection worker (drain/catch-up control).
+    /// `None` when the semantic module is off or in a unit context.
+    pub fn vector_worker(&self) -> Option<Arc<VectorProjectionWorker>> {
+        self.vector_worker.clone()
     }
 
     /// Write path (§6): stages 1-4 as one trace, `memkeys.fact.ingest`
@@ -265,6 +286,16 @@ impl MemKeysService {
         if commit_result == CommitOutcome::Inserted {
             if let Some(worker) = &self.worker {
                 worker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+            // Stage 5b dispatch (async, OFF the ack path — §6/R2): embed the
+            // fact body + upsert the vector tier. Gated on `memory.semantic`
+            // (the worker is only wired when the module is on).
+            if let Some(vworker) = &self.vector_worker {
+                vworker.enqueue(
                     &caller.tenant_id,
                     fact.id,
                     Some(commit_span.span_context().clone()),
@@ -524,6 +555,32 @@ pub struct SemanticHit {
     pub via: Vec<FusionSource>,
 }
 
+impl SemanticHit {
+    /// The §7.4 response-shape JSON for one hit — the authoritative record
+    /// (hydrated from the SoT, R1) + score + `via` provenance. Shared verbatim
+    /// by the HTTP and MCP transports (WS-5 §2.3 "byte-for-byte the same").
+    pub fn to_wire_json(&self) -> serde_json::Value {
+        let entity: serde_json::Map<String, serde_json::Value> = self
+            .record
+            .entity_keys()
+            .resolved()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::json!({
+            "fact.id": self.record.id,
+            "score": self.score,
+            "fact.type": self.record.fact_type,
+            "fact.subject": self.record.subject,
+            "fact.body": self.record.body,
+            "entity": entity,
+            "event_time": self.record.event_time,
+            "provenance": self.record.provenance_principal,
+            "via": self.via.first().map(|s| s.as_str()).unwrap_or("fact"),
+        })
+    }
+}
+
 /// M5 retrieval: op-4 semantic search (§7.4) and RRF fusion across the keyed +
 /// semantic paths (§7.4 step 3). The tenant floor is SERVER-SET from the
 /// verified caller on every call (WS-4 Invariant T / §7.4 R6).
@@ -640,17 +697,21 @@ impl MemKeysService {
         Ok(hits)
     }
 
-    /// Fused retrieval (§7.4 step 3): run the keyed path and the semantic path,
-    /// fuse their ranked id lists with RRF, and hydrate the top-`k` in fused
-    /// order. A fact that both paths agree on ranks highest — the keyed +
-    /// semantic (+ traverse, once graph-wired) agreement signal. `keyed` and
-    /// `semantic` are each optional; whichever are present participate. The
-    /// semantic path is skipped (not an error) when the module is off, so a
-    /// keyed-only deployment still gets a coherent single-path result.
+    /// Fused retrieval (§7.4 step 3): run the keyed path, the graph-traverse
+    /// path, and the semantic path, fuse their ranked id lists with RRF, and
+    /// hydrate the top-`k` in fused order. A fact that several paths agree on
+    /// ranks highest — the "keyed + traverse + semantic agree" signal. `keyed`,
+    /// `traverse`, and `semantic` are each optional; whichever are present
+    /// participate. The graph path is skipped when no projection is configured,
+    /// and a start node outside the tenant floor (`not_found`) contributes an
+    /// empty list rather than failing the fused read; the semantic path is
+    /// skipped (not an error) when the module is off — so a keyed-only
+    /// deployment still gets a coherent single-path result.
     pub async fn fused_search(
         &self,
         caller_tenant: &str,
         keyed: Option<&KeyedQuery>,
+        traverse: Option<&TraverseReq>,
         semantic: Option<&SearchRequest>,
         k: usize,
     ) -> Result<Vec<SemanticHit>, QueryError> {
@@ -669,6 +730,41 @@ impl MemKeysService {
             ));
             for r in rows {
                 records.entry(r.id).or_insert(r);
+            }
+        }
+        if let Some(treq) = traverse {
+            if self.graph.is_some() {
+                match self.traverse(caller_tenant, treq).await {
+                    Ok(result) => {
+                        // Fact nodes in BFS order are the graph path's ranked
+                        // list; non-fact nodes (entity/a2a) carry no body to
+                        // hydrate and don't participate as hits.
+                        let ids: Vec<uuid::Uuid> = result
+                            .nodes
+                            .iter()
+                            .filter(|n| n.kind == crate::graph::NodeKind::Fact)
+                            .filter_map(|n| crate::graph::parse_node_id(&n.id))
+                            .filter_map(|(_, _, local)| uuid::Uuid::parse_str(&local).ok())
+                            .collect();
+                        lists.push(RankedList::new(FusionSource::Graph, ids));
+                        // Opportunistically carry any hydrated records.
+                        for n in result.nodes {
+                            if let Some(rec) = n.record {
+                                records.entry(rec.id).or_insert(rec);
+                            }
+                        }
+                    }
+                    // A start node outside the tenant floor is `not_found`
+                    // (§3.3) — the graph path contributes nothing, never an
+                    // error that would sink the whole fused read.
+                    Err(GraphError::NotFound) => {}
+                    Err(GraphError::Invalid(reason)) => {
+                        return Err(QueryError::Invalid {
+                            reason: reason.to_string(),
+                        })
+                    }
+                    Err(e) => return Err(QueryError::Semantic(e.to_string())),
+                }
             }
         }
         if let Some(sreq) = semantic {
@@ -1011,7 +1107,7 @@ mod tests {
             as_of: None,
         };
         let hits = svc
-            .fused_search("t", Some(&keyed), Some(&sem), 10)
+            .fused_search("t", Some(&keyed), None, Some(&sem), 10)
             .await
             .unwrap();
         // Both facts are keyed on run=r; fact 1 is also the top semantic hit, so
