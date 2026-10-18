@@ -87,10 +87,11 @@ impl TokenVerifier for JwtVerifier {
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(s)
             .map_err(|_| unauth("bad signature encoding"))?;
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).map_err(|_| unauth("verifier misconfigured"))?;
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|_| unauth("verifier misconfigured"))?;
         mac.update(signing_input.as_bytes());
-        mac.verify_slice(&sig).map_err(|_| unauth("bad signature"))?;
+        mac.verify_slice(&sig)
+            .map_err(|_| unauth("bad signature"))?;
 
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(p)
@@ -178,7 +179,9 @@ mod tests {
             secret,
             &serde_json::json!({"sub":"agent-a","company_id":"tenant-1","run_id":"run-9","exp":2000}),
         );
-        let p = JwtVerifier::new(secret.to_vec()).verify(&token, 1000).unwrap();
+        let p = JwtVerifier::new(secret.to_vec())
+            .verify(&token, 1000)
+            .unwrap();
         assert_eq!(p.tenant_id, "tenant-1");
         assert_eq!(p.agent_id, "agent-a");
         assert_eq!(p.run_id.as_deref(), Some("run-9"));
@@ -187,7 +190,10 @@ mod tests {
     #[test]
     fn rejects_expired_token() {
         let secret = b"test-secret";
-        let token = mint(secret, &serde_json::json!({"sub":"a","company_id":"t","exp":500}));
+        let token = mint(
+            secret,
+            &serde_json::json!({"sub":"a","company_id":"t","exp":500}),
+        );
         let err = JwtVerifier::new(secret.to_vec())
             .verify(&token, 1000)
             .unwrap_err();
@@ -196,7 +202,10 @@ mod tests {
 
     #[test]
     fn rejects_tampered_signature() {
-        let token = mint(b"real-secret", &serde_json::json!({"sub":"a","company_id":"t","exp":2000}));
+        let token = mint(
+            b"real-secret",
+            &serde_json::json!({"sub":"a","company_id":"t","exp":2000}),
+        );
         // Verifier holds a different secret → signature mismatch.
         let err = JwtVerifier::new(b"other-secret".to_vec())
             .verify(&token, 1000)

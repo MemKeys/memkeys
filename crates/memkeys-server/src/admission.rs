@@ -72,6 +72,7 @@ struct ProbeWindow {
 
 /// Held for the duration of an admitted call; releases the permit on drop so
 /// the in-flight depth always reflects live work (RAII, panic-safe).
+#[derive(Debug)]
 pub struct AdmitGuard {
     _permit: OwnedSemaphorePermit,
     permits: Arc<Semaphore>,
@@ -125,11 +126,7 @@ impl AdmissionControl {
     /// Gate 2 (F14): reject an over-cap write as `invalid_envelope` *before*
     /// it reaches the pipeline. `body_bytes` is the serialized body length;
     /// `attachments` is the ref count.
-    pub fn check_write_size(
-        &self,
-        body_bytes: usize,
-        attachments: usize,
-    ) -> Result<(), WireError> {
+    pub fn check_write_size(&self, body_bytes: usize, attachments: usize) -> Result<(), WireError> {
         if body_bytes > self.cfg.max_body_bytes {
             return Err(WireError::new(
                 ErrorCode::InvalidEnvelope,

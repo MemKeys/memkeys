@@ -1,4 +1,4 @@
-//! HTTP transport for `/memory/*` routes (M3, §7).
+//! HTTP transport for `/memory/*` routes (M3, §7; WS-5 §2.2 per-request auth).
 //!
 //! Routes:
 //!   POST /memory/facts            → service.ingest()
@@ -6,9 +6,23 @@
 //!   POST /memory/graph/traverse   → service.traverse()
 //!   POST /memory/search           → 501 feature_disabled
 //!
-//! Admission: `X-MemKeys-Tenant` is required on every request. When
-//! `MEMKEYS_AUTH_TOKEN` is set, `X-MemKeys-Token` must match it
-//! (constant-time comparison).
+//! Admission (ISI-6148, closes ISI-6134 S1):
+//!   1. Concurrency shedding ([`AdmissionControl::try_admit`]) gates every
+//!      request — a saturated pool sheds `rate_limited` (429), not unbounded
+//!      queueing.
+//!   2. When a [`TokenVerifier`] is configured, every request MUST carry a
+//!      `Authorization: Bearer <jwt>`; the server verifies it per request and
+//!      derives the R6 tenant floor SERVER-SIDE from the principal (§3). The
+//!      client-asserted `X-MemKeys-Tenant` header is no longer trusted as a
+//!      tenant source — it is honored only as an intersect-only *narrower*
+//!      (must equal the principal tenant) and can never widen it. A mismatch
+//!      is `not_found` (§3.3 collapse — never an existence oracle).
+//!   3. With no verifier (loopback dev only — `main` fails closed on a
+//!      non-loopback bind), `X-MemKeys-Tenant` is self-asserted (the documented
+//!      S1 dev path).
+//!
+//! The F14 write-size cap and the F15 boundary-probe throttle are wired into
+//! the write and traverse handlers respectively.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +30,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -24,6 +38,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::admission::AdmissionControl;
+use crate::auth::{Principal, TokenVerifier};
 use crate::envelope::Envelope;
 use crate::error::{IngestError, QueryError};
 use crate::graph::{
@@ -31,9 +47,9 @@ use crate::graph::{
     DEFAULT_NODE_BUDGET,
 };
 use crate::model::{EntityKey, KeyedQuery, Validity};
-use crate::pipeline::CallerContext;
 use crate::service::{IngestReceipt, MemKeysService};
 use crate::telemetry::{self, TRANSPORT_HTTP};
+use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, TraceContextExt};
 use opentelemetry::Context;
 
@@ -41,23 +57,28 @@ use opentelemetry::Context;
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<MemKeysService>,
-    /// Bearer token loaded from `MEMKEYS_AUTH_TOKEN`; `None` = open (dev/test).
-    pub auth_token: Option<String>,
+    /// Per-request bearer verifier (the Paperclip run-token `JwtVerifier`).
+    /// `None` = open loopback dev mode — tenant is self-asserted (S1 dev path);
+    /// `main` refuses a non-loopback bind in this mode.
+    pub verifier: Option<Arc<dyn TokenVerifier>>,
+    /// Self-protection gates (concurrency shedding, F14 size caps, F15 probe
+    /// throttle), shared across both transports.
+    pub admission: Arc<AdmissionControl>,
 }
 
 impl AppState {
-    pub fn new(service: Arc<MemKeysService>) -> Self {
-        let auth_token = std::env::var("MEMKEYS_AUTH_TOKEN").ok();
+    pub fn new(
+        service: Arc<MemKeysService>,
+        verifier: Option<Arc<dyn TokenVerifier>>,
+        admission: Arc<AdmissionControl>,
+    ) -> Self {
         Self {
             service,
-            auth_token,
+            verifier,
+            admission,
         }
     }
 }
-
-/// Tenant id extracted by admission middleware; forwarded via `Extension`.
-#[derive(Clone, Debug)]
-pub struct TenantId(pub String);
 
 /// Build the `/memory/*` axum `Router`.
 pub fn router(state: AppState) -> Router {
@@ -80,41 +101,89 @@ async fn admit(
     mut req: Request,
     next: Next,
 ) -> Response {
-    // 1. Tenant header — required on every request.
-    let tenant = match headers
-        .get("x-memkeys-tenant")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-    {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "X-MemKeys-Tenant header is required"})),
-            )
-                .into_response();
+    // Gate 1 (concurrency shedding): take an in-flight permit before any work.
+    // The guard releases the permit on drop at the end of the request, so the
+    // in-flight depth always reflects live work. A saturated pool sheds
+    // `rate_limited` (429) rather than queueing unboundedly.
+    let _admit = match state.admission.try_admit() {
+        Ok(g) => g,
+        Err(e) => return wire_response(e),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Principal derivation (§2.2 / §3). With a verifier configured, the bearer
+    // JWT is the ONLY tenant source — the floor is derived server-side and is
+    // never client-assertable.
+    let principal = match &state.verifier {
+        Some(verifier) => {
+            let bearer = headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    v.strip_prefix("Bearer ")
+                        .or_else(|| v.strip_prefix("bearer "))
+                })
+                .unwrap_or("");
+            match verifier.verify(bearer, now) {
+                Ok(p) => p,
+                // Never reveal *why* — one opaque `unauthenticated` (§3/§7).
+                Err(e) => return wire_response(e),
+            }
+        }
+        // Open loopback dev mode (S1 dev path): tenant is self-asserted. `main`
+        // refuses a non-loopback bind in this mode.
+        None => {
+            let tenant = match headers
+                .get("x-memkeys-tenant")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+            {
+                Some(t) => t.to_owned(),
+                None => {
+                    return wire_response(WireError::new(
+                        ErrorCode::Unauthenticated,
+                        "X-MemKeys-Tenant header is required in open (no-verifier) mode",
+                    ));
+                }
+            };
+            Principal {
+                tenant_id: tenant,
+                agent_id: "http-dev".to_string(),
+                run_id: None,
+                expires_at: i64::MAX,
+                trace_id: None,
+            }
         }
     };
 
-    // 2. Optional bearer token check (constant-time XOR-fold over same-length
-    //    bytes — short-circuits only on length mismatch, which is acceptable
-    //    for a bearer-token gate where length is not a secret).
-    if let Some(expected) = &state.auth_token {
-        let provided = headers
-            .get("x-memkeys-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !ct_eq(expected, provided) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid or missing X-MemKeys-Token"})),
-            )
-                .into_response();
+    // `X-MemKeys-Tenant` is an intersect-only *narrower*, never a widener
+    // (§3.3): when present it MUST equal the principal's tenant. A different
+    // value is a cross-tenant assertion → `not_found`, never an existence
+    // oracle and never a `forbidden` that would confirm the tenant exists.
+    if let Some(asserted) = headers
+        .get("x-memkeys-tenant")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if state.verifier.is_some() && asserted != principal.tenant_id {
+            return wire_response(WireError::new(
+                ErrorCode::NotFound,
+                "not found within tenant",
+            ));
         }
     }
 
-    req.extensions_mut().insert(TenantId(tenant));
+    req.extensions_mut().insert(principal);
     next.run(req).await
+}
+
+/// Render a [`WireError`] as the WS-5 §7 HTTP response: the taxonomy status +
+/// the structured error body (so clients read a stable `code`/`retriable`).
+fn wire_response(err: WireError) -> Response {
+    let status = StatusCode::from_u16(err.error_code().http_status())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(err)).into_response()
 }
 
 /// The HTTP transport-boundary span context (ISI-6134 B1). Attach the returned
@@ -128,17 +197,6 @@ fn http_transport_cx() -> Context {
         TRANSPORT_HTTP,
         None,
     ))
-}
-
-/// XOR-fold constant-time equality (same length, no short-circuit on content).
-fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -170,14 +228,24 @@ impl From<IngestReceipt> for IngestResponse {
 
 async fn ingest(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Json(envelope): Json<Envelope>,
 ) -> Response {
-    let caller = CallerContext {
-        tenant_id: tenant.0.clone(),
-        principal: "http".to_string(),
-        trace_id: None,
-    };
+    // F14 write-size cap: reject an over-cap body/attachment set as
+    // `invalid_envelope` (422) BEFORE it reaches the pipeline.
+    let body_bytes = serde_json::to_vec(&envelope.fact.body)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if let Err(e) = state
+        .admission
+        .check_write_size(body_bytes, envelope.attachments.len())
+    {
+        return wire_response(e);
+    }
+
+    // The caller context — the trust root for keys (§4 rule 1) — is the VERIFIED
+    // principal's tenant/agent, never a client-asserted value.
+    let caller = principal.caller_context();
     let now = chrono::Utc::now();
     // `with_context` attaches the transport span's context for each poll without
     // holding a `!Send` `ContextGuard` across `.await` (which would make the
@@ -216,7 +284,7 @@ async fn ingest(
 
 async fn fetch(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let query = match build_keyed_query(&params) {
@@ -231,10 +299,11 @@ async fn fetch(
     };
     // Transport span created on the served path (after argument validation),
     // attached via `with_context` to stay `Send` across `.await` (see `ingest`).
+    // The tenant floor is the VERIFIED principal's, never client-asserted.
     let cx = http_transport_cx();
     let result = state
         .service
-        .fetch_by_keys(&tenant.0, &query)
+        .fetch_by_keys(&principal.tenant_id, &query)
         .with_context(cx.clone())
         .await;
     cx.span().end();
@@ -351,11 +420,14 @@ fn default_deadline_ms() -> u64 {
 
 async fn traverse(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<TraverseReqWire>,
 ) -> Response {
+    // The tenant floor is the VERIFIED principal's; `service.traverse` also
+    // overwrites `req.tenant` from it (WS-4 Invariant T), so a body value can
+    // never widen scope.
     let req = TraverseReq {
-        tenant: tenant.0.clone(),
+        tenant: principal.tenant_id.clone(),
         project: None,
         start: body.start,
         edges: body.edges,
@@ -370,27 +442,29 @@ async fn traverse(
     let cx = http_transport_cx();
     let result = state
         .service
-        .traverse(&tenant.0, &req)
+        .traverse(&principal.tenant_id, &req)
         .with_context(cx.clone())
         .await;
     cx.span().end();
     match result {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(GraphError::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not found"})),
-        )
-            .into_response(),
-        Err(GraphError::Invalid(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        // F15: a boundary-crossing lookup is `not_found` (§3.3 — no existence
+        // oracle). Record the miss; once the principal is over its probe budget
+        // the would-be 404 becomes a `rate_limited` (429) throttle.
+        Err(GraphError::NotFound) => {
+            let now = chrono::Utc::now().timestamp();
+            match state
+                .admission
+                .record_boundary_miss(&principal.tenant_id, now)
+            {
+                Ok(()) => wire_response(WireError::new(ErrorCode::NotFound, "not found")),
+                Err(throttle) => wire_response(throttle),
+            }
+        }
+        Err(GraphError::Invalid(msg)) => {
+            wire_response(WireError::new(ErrorCode::InvalidArgument, msg))
+        }
+        Err(e) => wire_response(WireError::new(ErrorCode::BackendUnavailable, e.to_string())),
     }
 }
 
@@ -422,12 +496,14 @@ mod tests {
     }
 
     #[test]
-    fn ct_eq_matches_only_identical_strings() {
-        assert!(ct_eq("secret", "secret"));
-        assert!(!ct_eq("secret", "Secret"));
-        assert!(!ct_eq("secret", "secre")); // length mismatch
-        assert!(!ct_eq("", "x"));
-        assert!(ct_eq("", ""));
+    fn wire_response_carries_taxonomy_status() {
+        // The §7 error body renders at the taxonomy's HTTP status.
+        let r = wire_response(WireError::new(ErrorCode::NotFound, "x"));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = wire_response(WireError::new(ErrorCode::RateLimited, "x"));
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let r = wire_response(WireError::new(ErrorCode::Unauthenticated, "x"));
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -472,5 +548,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(alias.direction, Direction::Both);
+    }
+
+    // -- ISI-6148: per-request principal auth + server-derived tenant floor --
+
+    fn mint_jwt(secret: &[u8], claims: &serde_json::Value) -> String {
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let header = b64(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = b64(serde_json::to_vec(claims).unwrap().as_slice());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret).unwrap();
+        mac.update(signing_input.as_bytes());
+        let sig = b64(&mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    fn verified_router(secret: &[u8]) -> Router {
+        use crate::auth::JwtVerifier;
+        use crate::memstore::MemStore;
+        use crate::service::MemKeysService;
+        let service = Arc::new(MemKeysService::new(Arc::new(MemStore::new())));
+        let state = AppState::new(
+            service,
+            Some(Arc::new(JwtVerifier::new(secret.to_vec()))),
+            Arc::new(AdmissionControl::with_defaults()),
+        );
+        router(state)
+    }
+
+    #[tokio::test]
+    async fn rejects_request_with_no_bearer() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let app = verified_router(b"s3cr3t");
+        // No Authorization header → middleware stops it as `unauthenticated`
+        // before the handler ever runs. An X-MemKeys-Tenant header cannot
+        // substitute for a verified token.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1")
+                    .header("x-memkeys-tenant", "tenant-victim")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn x_memkeys_tenant_cannot_widen_past_principal() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        let app = verified_router(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+        // A valid token for tenant-a, but the client asserts a DIFFERENT tenant
+        // in the header → cross-tenant → `not_found` (§3.3), never served and
+        // never a `forbidden` existence oracle.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-memkeys-tenant", "tenant-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_reaches_handler_with_derived_floor() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        let app = verified_router(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+        // Valid token, matching (or absent) tenant header → passes admission and
+        // the keyed read runs against the derived floor (empty store → 200 with
+        // `{facts:[]}`), proving the principal reached the handler.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
