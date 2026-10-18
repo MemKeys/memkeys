@@ -5,12 +5,17 @@
 //! OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise no-op), connect, apply
 //! migrations (FactStore + edges), then run the stage-5a projection worker —
 //! an initial SoT catch-up scan (the projection is built FROM the FactStore)
-//! followed by a periodic drain + hole scan. The transport (HTTP/MCP) is M3;
-//! the open contract is not part of M2.
+//! followed by a periodic drain + hole scan.
+//!
+//! ISI-6132 additionally serves the pod-readiness health surface
+//! (`/healthz` liveness, `/readyz` readiness with a DB ping) on
+//! MEMKEYS_HTTP_PORT (default 8080), matching the Helm chart's probes. This
+//! is not the M3 open-contract transport; see `health.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use memkeys_server::health;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
 use memkeys_server::service::MemKeysService;
@@ -35,6 +40,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = service
         .projection_worker()
         .expect("worker is wired with the graph projection");
+
+    // ISI-6132: the health listener starts before the (potentially long)
+    // catch-up scan so kubelet probes can reach the pod immediately after
+    // migrations; readiness is a live DB ping, not the scan state.
+    let listener = health::bind(health::http_port()).await?;
+    tracing::info!(
+        target: "memkeys",
+        port = listener.local_addr()?.port(),
+        "memkeys.server.http.listen"
+    );
+    tokio::spawn(health::serve_pool(listener, graph.pool().clone()));
 
     println!("memkeys-server: migrations applied; FactStore + graph projection ready");
 
@@ -64,12 +80,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     maintenance.abort();
     println!("memkeys-server: shut down");
     // The OTel guard drops here at scope end — M4 Drop flushes providers/exporters.
     drop(otel);
     Ok(())
+}
+
+/// Wait for the orchestrator's termination signal. Kubernetes sends SIGTERM
+/// (not SIGINT), and the graceful path matters: it runs the OTel flush above
+/// instead of being SIGKILLed at the end of the termination grace period.
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = term.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// The tenants with committed facts (the catch-up scan grain).
