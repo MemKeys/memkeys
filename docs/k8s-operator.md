@@ -75,6 +75,8 @@ spec:
 
 Server (2 replicas by default, for drain-tolerance) + a separate worker
 Deployment + a drain-safe PodDisruptionBudget. Prefer `existingSecret` in prod.
+Workers run the same image in the **worker role** (`MEMKEYS_ROLE=worker`):
+projection-only — health surface + projection reconciler, no memory transport.
 
 ```yaml
 apiVersion: memkeys.io/v1alpha1
@@ -106,13 +108,16 @@ Ready-to-apply samples: [`operator/config/samples/`](../operator/config/samples/
 | `database.existingSecret` / `existingSecretKey` | — / `MEMKEYS_DATABASE_URL` | reference a pre-provisioned Secret |
 | `otel.endpoint` / `deploymentEnv` / `serviceNamespace` / `tracesSamplerRatio` | — / `dev` / — / — | mirrors the chart's OTel env wiring |
 | `workers.enabled` | follows profile | force worker Deployment on/off |
-| `workers.replicas` / `command` / `args` / `resources` | `1` | worker tuning |
-| `podDisruptionBudget.enabled` | follows profile | only rendered when server replicas > 1 |
-| `servicePort` | `8080` | Service + container port |
+| `workers.replicas` / `command` / `args` / `resources` | `1` | worker tuning; the worker role itself is selected by the `MEMKEYS_ROLE=worker` env (projection-only: no memory transport) |
+| `podDisruptionBudget.enabled` / `minAvailable` | follows profile / `1` | only rendered when server replicas > 1; `minAvailable` is clamped to `replicas-1` (drain-deadlock guard) |
+| `servicePort` | `8080` | Service + container port + `MEMKEYS_HTTP_PORT` (health listener) |
 | `resources` | chart defaults | server container requests/limits |
 
 Exactly one of `database.url` / `database.existingSecret` must be set, else the
-instance is marked `Degraded` and no pods are rolled out (fail-closed).
+instance is marked `Degraded` and no pods are rolled out (fail-closed). Switching
+from an inline `url` to an `existingSecret` prunes the previously rendered
+`<name>-db` Secret (unless `existingSecret` names that same Secret, in which
+case it is user-managed and left alone).
 
 ## Status conditions
 
