@@ -1,0 +1,37 @@
+# chart-testing (ct install) values.
+#
+# Used by the helm.yml `install` job after it builds the memkeys-server image
+# and loads it into the kind cluster. The test Postgres is provisioned by the
+# workflow (a postgres:18 Deployment+Service in the `default` namespace); this
+# file points MEMKEYS_DATABASE_URL at its in-cluster FQDN, since ct install runs
+# each release in its own namespace and a bare service name would not resolve.
+#
+# The image tag is overridden on the ct command line (--helm-extra-set-args)
+# with the SHA the workflow built, so it is intentionally not pinned here.
+image:
+  pullPolicy: Never  # image is side-loaded into kind, never pulled
+
+database:
+  url: "postgres://memkeys:memkeys@memkeys-test-postgres.default.svc.cluster.local:5432/memkeys_test"
+
+otel:
+  deploymentEnv: "dev"
+
+# NOTE: the current M1 image is a migrate-and-exit bootstrap with no HTTP
+# transport, so the HTTP probes cannot pass and a Deployment pod cannot stay
+# Ready. The install job is gated on the P0 Dockerfile (ISI-6097) existing;
+# pod-readiness additionally requires the server's long-running transport +
+# /healthz surface. Probes are disabled here so the wiring is exercised without
+# asserting an endpoint that does not exist yet.
+livenessProbe:
+  enabled: false
+readinessProbe:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

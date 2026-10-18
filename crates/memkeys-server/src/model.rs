@@ -2,7 +2,7 @@
 //! the keyed-read query (§7.2).
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Canonical fact types (§5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -152,7 +152,7 @@ pub struct ProcessedFact {
 
 /// Read shape returned by op 1 (fetch-by-keys) — the authoritative record
 /// hydrated from the keyed store (§7.5 response-shape invariant).
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FactRecord {
     pub id: uuid::Uuid,
     pub fact_type: String,

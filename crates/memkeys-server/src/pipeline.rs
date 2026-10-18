@@ -320,9 +320,16 @@ pub async fn key_stage(
         }
     }
 
-    // Anchor requirement (§3.1). A fact with no resolvable anchor is stored
-    // `unkeyed` — tolerated only for telemetry_learning.
-    if !k.any_anchor_key() && kind != SourceKind::TelemetryLearning {
+    // Anchor requirement (§3.1). The per-source pivot anchor is mandatory:
+    // `run` for gateway_flush/run_settle, `thread` for a2a_exchange, and
+    // service/project for telemetry_learning. Other hints never substitute
+    // for the anchor ("the anchor is the only mandatory entity key").
+    let has_source_anchor = match kind {
+        SourceKind::GatewayFlush | SourceKind::RunSettle => k.run.is_some(),
+        SourceKind::A2aExchange => k.thread.is_some(),
+        SourceKind::TelemetryLearning => true, // unkeyed tolerated below
+    };
+    if !has_source_anchor {
         return Err(reject(match kind {
             SourceKind::GatewayFlush | SourceKind::RunSettle => "entity.run anchor is required",
             SourceKind::A2aExchange => "entity.thread anchor is required",

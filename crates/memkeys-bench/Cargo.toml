@@ -1,0 +1,38 @@
+[package]
+name = "memkeys-bench"
+description = "MemKeys M8 harness: write-path single-writer ceiling benchmark + conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+memkeys-server = { path = "../memkeys-server", version = "0.1.0" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Micro-benchmark harness for the compute hot paths (ISI-6100 P2). Default
+# features only; no plotting/async feature needed (async paths use block_on).
+criterion = "0.5"
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[[bin]]
+name = "write-bench"
+path = "src/bin/write-bench.rs"
+
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+
+[lib]
+name = "memkeys_bench"
+path = "src/lib.rs"

@@ -1,4 +1,5 @@
-//! OTel instrumentation for the M1 write path and keyed read.
+//! OTel instrumentation for the M1 write path + keyed read, and the M2 graph
+//! projection (worker + reads).
 //!
 //! Contract sources (WS-7, owner Observability Agent):
 //! - docs/observability/signal-catalog.yaml — spans, metrics, attribute registry
@@ -32,10 +33,74 @@ pub const PIPELINE_STAGE_KEY: &str = "key";
 pub const PIPELINE_STAGE_TEMPORALIZE: &str = "temporalize";
 pub const PIPELINE_STAGE_COMMIT: &str = "commit";
 pub const RETRIEVAL_OP_KEYED: &str = "keyed";
+/// `memkeys.retrieval.op` value for graph reads (signal catalog enum).
+pub const RETRIEVAL_OP_GRAPH: &str = "graph";
+/// `memkeys.worker.kind` value for the stage-5a graph-projection worker.
+pub const WORKER_KIND_GRAPH_PROJECTION: &str = "graph_projection";
+/// `memkeys.projection.kind` value for the graph projection.
+pub const PROJECTION_KIND_GRAPH: &str = "graph";
 pub const OUTCOME_SUCCESS: &str = "success";
 pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
 pub const OUTCOME_DUPLICATE: &str = "duplicate";
+
+/// M3 protocol-surface attribute values (`memkeys.transport`). stdio = a
+/// launch-bound single-principal subprocess; http = the per-request-auth
+/// Streamable-HTTP shared server (WS-5 §2).
+pub const TRANSPORT_STDIO: &str = "stdio";
+pub const TRANSPORT_HTTP: &str = "http";
+
+/// The protocol surface a service call arrived on — the transport and, for
+/// MCP, the tool name. Stamped onto the `memkeys.fact.ingest` / `memkeys.retrieve`
+/// SERVER spans as `memkeys.transport` + `memkeys.mcp.tool` (WS-5 §7 / ISI-6137
+/// B1+B2). A direct library/test call has no protocol surface ([`INTERNAL`]) and
+/// emits neither attribute — the transport registry keys carry only real
+/// protocol traffic. Tool *names* only; never argument values (the deny-list).
+///
+/// [`INTERNAL`]: CallScope::INTERNAL
+#[derive(Debug, Clone, Copy)]
+pub struct CallScope {
+    pub transport: Option<&'static str>,
+    pub tool: Option<&'static str>,
+}
+
+impl CallScope {
+    /// A direct library/test call: no protocol surface, no transport attrs.
+    pub const INTERNAL: CallScope = CallScope {
+        transport: None,
+        tool: None,
+    };
+
+    /// An HTTP `/memory/*` request (no MCP tool name on this transport).
+    pub const fn http() -> CallScope {
+        CallScope {
+            transport: Some(TRANSPORT_HTTP),
+            tool: None,
+        }
+    }
+
+    /// An MCP `tools/call` over stdio, carrying the ratified tool name.
+    pub const fn stdio(tool: &'static str) -> CallScope {
+        CallScope {
+            transport: Some(TRANSPORT_STDIO),
+            tool: Some(tool),
+        }
+    }
+
+    /// The span attributes this scope contributes (empty for [`INTERNAL`]).
+    ///
+    /// [`INTERNAL`]: CallScope::INTERNAL
+    pub fn span_attrs(&self) -> Vec<KeyValue> {
+        let mut v = Vec::new();
+        if let Some(t) = self.transport {
+            v.push(attr("memkeys.transport", t));
+        }
+        if let Some(tool) = self.tool {
+            v.push(attr("memkeys.mcp.tool", tool));
+        }
+        v
+    }
+}
 
 /// The complete attribute-key registry every signal may carry (signal-catalog
 /// "Custom attribute registry" + the pinned stable db.* group). Anything not
@@ -45,6 +110,15 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memkeys.entity.kind",
     "memkeys.pipeline.stage",
     "memkeys.retrieval.op",
+    "memkeys.worker.kind",
+    "memkeys.projection.kind",
+    "memkeys.graph.depth",
+    "memkeys.graph.truncate.reason",
+    // M3 protocol surface (WS-5 §2/§7): the transport the request arrived on
+    // and the MCP tool name. Kinds/names only — never argument VALUES (the
+    // deny-list still holds: no bodies, no entity-key values, no query text).
+    "memkeys.transport",
+    "memkeys.mcp.tool",
     "outcome",
     // Pinned stable db.* group (semconv-pins.yaml; db.query.text is DISABLED).
     "db.system.name",
@@ -76,6 +150,68 @@ pub fn start_span(name: &'static str, kind: SpanKind, attrs: Vec<KeyValue>) -> g
         .start(&tracer())
 }
 
+/// Start a span LINKED to another span context (WS-7: the derived-view worker
+/// runs as its own trace root with a SPAN_LINK to the originating commit —
+/// temporally decoupled, not a parent edge).
+pub fn start_span_with_links(
+    name: &'static str,
+    kind: SpanKind,
+    attrs: Vec<KeyValue>,
+    link_to: Option<&opentelemetry::trace::SpanContext>,
+) -> global::BoxedSpan {
+    let mut builder = tracer()
+        .span_builder(name)
+        .with_kind(kind)
+        .with_attributes(attrs);
+    if let Some(ctx) = link_to {
+        builder = builder.with_links(vec![opentelemetry::trace::Link::new(
+            ctx.clone(),
+            Vec::new(),
+            0,
+        )]);
+    }
+    builder.start(&tracer())
+}
+
+/// Start a child span under an explicit parent context. The write path uses
+/// this (not thread-local attach) so spans parent correctly across `.await`
+/// boundaries without making the pipeline future `!Send`.
+pub fn start_child_span(
+    name: &'static str,
+    kind: SpanKind,
+    attrs: Vec<KeyValue>,
+    parent: &opentelemetry::Context,
+) -> global::BoxedSpan {
+    tracer()
+        .span_builder(name)
+        .with_kind(kind)
+        .with_attributes(attrs)
+        .start_with_context(&tracer(), parent)
+}
+
+/// Transport-boundary SERVER span (M3, WS-5 §7.6). This is the ingress span for
+/// a single protocol call; it carries the protocol surface (`memkeys.transport`)
+/// and, for an MCP `tools/call`, the tool name (`memkeys.mcp.tool`). Emitting
+/// here is what makes those two registry keys *live* — before M3 they were
+/// registered in [`ALLOWED_ATTR_KEYS`] but never emitted (ISI-6134 B1/B2).
+///
+/// The service's own `memkeys.fact.ingest` / `memkeys.retrieve` spans nest
+/// beneath this one when the returned span's context is attached around the
+/// service call (OTel parents a new span to the current context on its first,
+/// synchronous poll). Attribute VALUES are kinds/names only — never argument
+/// bodies (the deny-list still holds).
+pub fn transport_span(
+    span_name: &'static str,
+    transport: &'static str,
+    mcp_tool: Option<&str>,
+) -> global::BoxedSpan {
+    let mut attrs = vec![attr("memkeys.transport", transport)];
+    if let Some(tool) = mcp_tool {
+        attrs.push(attr("memkeys.mcp.tool", tool.to_string()));
+    }
+    start_span(span_name, SpanKind::Server, attrs)
+}
+
 /// The M1 instrument set, built once per process from the global meter.
 #[derive(Debug, Clone)]
 pub struct Instruments {
@@ -83,6 +219,11 @@ pub struct Instruments {
     write_duration: opentelemetry::metrics::Histogram<f64>,
     retrieve_duration: opentelemetry::metrics::Histogram<f64>,
     retrieve_candidate_set_size: opentelemetry::metrics::Histogram<u64>,
+    projection_lag: opentelemetry::metrics::Histogram<f64>,
+    graph_traverse_latency: opentelemetry::metrics::Histogram<f64>,
+    graph_edges_cardinality: opentelemetry::metrics::Gauge<u64>,
+    worker_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
+    poison_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
 }
 
 impl Instruments {
@@ -108,6 +249,45 @@ impl Instruments {
                 .u64_histogram("memkeys.retrieve.candidate_set.size")
                 .with_unit("{candidate}")
                 .with_description("Candidate-set size per retrieval op.")
+                .build(),
+            projection_lag: meter
+                .f64_histogram("memkeys.projection.lag")
+                .with_unit("s")
+                .with_description(
+                    "Measured lag (apply_time - commit_time) when a projection \
+                     applies a committed fact (the D3 bounded-lag invariant).",
+                )
+                .build(),
+            graph_traverse_latency: meter
+                .f64_histogram("memkeys.graph.traverse.latency")
+                .with_unit("s")
+                .with_description(
+                    "Latency of one graph-projection BFS traversal, bucketed by \
+                     the post-clamp depth (warm-path SLO: p95 <= 150ms at depth <= 3; \
+                     promotion triggers #1/#2, ADR-GRAPH rev-3 F11 / ISI-5911).",
+                )
+                .build(),
+            graph_edges_cardinality: meter
+                .u64_gauge("memkeys.graph.edges.cardinality")
+                .with_unit("{edge}")
+                .with_description(
+                    "Current edge count of the graph projection per tenant \
+                     (async-observed at maintenance time; promotion trigger #3).",
+                )
+                .build(),
+            worker_queue_depth_gauge: meter
+                .i64_gauge("memkeys.worker.queue.depth")
+                .with_unit("{item}")
+                .with_description("Pending work items per derived-view worker.")
+                .build(),
+            poison_queue_depth_gauge: meter
+                .i64_gauge("memkeys.poison.queue.depth")
+                .with_unit("{item}")
+                .with_description(
+                    "Live poison-queue (dead-letter) items per tier — derivations \
+                     that exhausted retries (WS-3/ADR-llm Decision 8; companion to \
+                     poison.oldest_age).",
+                )
                 .build(),
         }
     }
@@ -143,6 +323,41 @@ impl Instruments {
         self.retrieve_candidate_set_size
             .record(size, &[attr("memkeys.retrieval.op", op)]);
     }
+
+    /// `memkeys.projection.lag` — recorded when a projection applies a
+    /// committed fact (worker call site).
+    pub fn projection_lag(&self, projection_kind: &'static str, seconds: f64) {
+        self.projection_lag
+            .record(seconds, &[attr("memkeys.projection.kind", projection_kind)]);
+    }
+
+    /// `memkeys.graph.traverse.latency` — recorded at the GraphView traverse
+    /// call site, bucketed by the post-clamp depth (ISI-5911).
+    pub fn graph_traverse_latency(&self, depth: u8, seconds: f64) {
+        self.graph_traverse_latency
+            .record(seconds, &[attr("memkeys.graph.depth", depth as i64)]);
+    }
+
+    /// `memkeys.graph.edges.cardinality` — per-tenant standing edge count,
+    /// observed at maintenance time, never per-request.
+    pub fn graph_edges_cardinality(&self, tenant: &str, edges: u64) {
+        self.graph_edges_cardinality
+            .record(edges, &[attr("memkeys.tenant.id", tenant.to_string())]);
+    }
+
+    /// `memkeys.worker.queue.depth` — live pending items (absolute depth).
+    pub fn worker_queue_depth(&self, worker_kind: &'static str, depth: usize) {
+        self.worker_queue_depth_gauge
+            .record(depth as i64, &[attr("memkeys.worker.kind", worker_kind)]);
+    }
+
+    /// `memkeys.poison.queue.depth` — live dead-letter count (absolute).
+    pub fn poison_queue_depth(&self, count: i64) {
+        self.poison_queue_depth_gauge.record(
+            count,
+            &[attr("memkeys.worker.kind", WORKER_KIND_GRAPH_PROJECTION)],
+        );
+    }
 }
 
 impl Default for Instruments {
@@ -161,6 +376,15 @@ pub fn db_attrs(operation: &'static str) -> Vec<KeyValue> {
     ]
 }
 
+/// db.* attributes for graph-projection store spans (`edges` collection).
+pub fn db_attrs_edges(operation: &'static str) -> Vec<KeyValue> {
+    vec![
+        attr("db.system.name", "postgresql"),
+        attr("db.operation.name", operation),
+        attr("db.collection.name", "edges"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +395,23 @@ mod tests {
         assert!(!ALLOWED_ATTR_KEYS.contains(&"db.query.text"));
         assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.tenant.id"));
         assert!(ALLOWED_ATTR_KEYS.contains(&"db.system.name"));
+        // M2 graph additions (WS-7 catalog enums; ISI-5911 promotion signals).
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.graph.depth"));
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.worker.kind"));
+        // M3 protocol surface — now emitted via transport_span (ISI-6134 B1/B2).
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.transport"));
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.mcp.tool"));
+    }
+
+    #[test]
+    fn transport_span_attrs_are_registry_valid() {
+        // Would panic in debug (attr()'s debug_assert) if either key were not
+        // registered — the regression guard for "registered but never emitted".
+        let _http = transport_span("memkeys.http.request", TRANSPORT_HTTP, None);
+        let _mcp = transport_span(
+            "memkeys.mcp.tool_call",
+            TRANSPORT_STDIO,
+            Some("memory_store"),
+        );
     }
 }

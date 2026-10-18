@@ -1,0 +1,89 @@
+name: Benchmarks
+
+# Perf-regression tracking (ISI-6100 / ISI-6094 P2). Runs ONLY off the PR hot
+# path so the PR gate stays fast: on pushes to main, on a nightly schedule, and
+# on manual dispatch. Compares each run against the stored baseline and reports
+# regressions as annotations + a job summary; it never gates a PR.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  schedule:
+    # Nightly 03:17 UTC — catches regressions merged without touching crates/**.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Serialize baseline updates; never cancel an in-flight baseline write.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: criterion hot paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run criterion benches (bencher format for tracking)
+        run: |
+          cargo bench -p memkeys-bench --bench hot_paths -- --output-format bencher \
+            | tee bench-output.txt
+
+      # The comparable baseline/report artifact (criterion keeps full HTML +
+      # estimates under target/criterion; bench-output.txt is the machine copy).
+      - name: Upload benchmark report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-${{ github.sha }}
+          path: |
+            bench-output.txt
+            target/criterion/**
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Restore the rolling baseline (no gh-pages / push secret needed — the
+      # baseline lives in the Actions cache keyed by commit, newest restored).
+      - name: Restore benchmark baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: ./cache/benchmark-data.json
+          key: benchmark-data-${{ github.sha }}
+          restore-keys: |
+            benchmark-data-
+
+      - name: Compare against baseline + report regressions
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: memkeys hot paths
+          tool: cargo
+          output-file-path: bench-output.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          # >1.5x slower than the stored baseline is flagged.
+          alert-threshold: "150%"
+          # Report-only: annotate + job summary, but do not fail the build.
+          fail-on-alert: false
+          comment-on-alert: false
+          summary-always: true
+
+      - name: Save updated benchmark baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ./cache/benchmark-data.json
+          key: benchmark-data-${{ github.sha }}

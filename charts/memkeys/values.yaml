@@ -1,0 +1,152 @@
+# Default values for the memkeys chart.
+# This is a YAML-formatted file. Values are documented inline.
+
+replicaCount: 1
+
+image:
+  # Registry/repository for the memkeys-server image (built by the P0 docker.yml
+  # workflow — ISI-6097). Overridden per-environment.
+  repository: ghcr.io/memkeys/memkeys
+  # Pull policy. IfNotPresent is correct for pinned tags / kind-loaded images.
+  pullPolicy: IfNotPresent
+  # Image tag. Defaults to the chart appVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Create a dedicated ServiceAccount for the workload.
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+# Extra pod annotations/labels.
+podAnnotations: {}
+podLabels: {}
+
+# --- Security hardening -----------------------------------------------------
+# Defaults assume a distroless/nonroot runtime image (UID/GID 65532), matching
+# the P0 Dockerfile (ISI-6097). readOnlyRootFilesystem is on; the server needs
+# no writable paths (migrations run against Postgres, not local disk).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+
+# --- Service ----------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Port the Service exposes and the container listens on. The HTTP/MCP
+  # transport is a later milestone; this is the forward-looking default.
+  port: 8080
+  # Named container port.
+  portName: http
+
+# --- Gateway API ingress (HTTPRoute, not legacy Ingress) --------------------
+# Disabled by default; enable and point at a parentRef Gateway to expose the
+# service outside the cluster.
+httpRoute:
+  enabled: false
+  # References to Gateway resources this route attaches to.
+  parentRefs: []
+  #  - name: my-gateway
+  #    namespace: gateway-system
+  #    sectionName: https
+  hostnames: []
+  #  - memkeys.example.com
+  annotations: {}
+  # Match rules. Defaults to all paths on the service port.
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+# --- Database wiring --------------------------------------------------------
+# The server reads MEMKEYS_DATABASE_URL (required). Mirrors the TEST_DATABASE_URL
+# pattern used by CI (postgres://user:pass@host:5432/db).
+database:
+  # When set, the chart renders a Secret holding MEMKEYS_DATABASE_URL.
+  # Leave empty and set existingSecret to reference a pre-provisioned secret.
+  url: ""
+  # Reference an existing Secret instead of creating one.
+  existingSecret: ""
+  # Key within existingSecret (or the generated secret) holding the URL.
+  existingSecretKey: "MEMKEYS_DATABASE_URL"
+
+# --- Observability (OpenTelemetry) ------------------------------------------
+# When otel.endpoint is set, the server exports OTLP/gRPC for all signals.
+# Empty endpoint → no-op exporters (M4 behaviour).
+otel:
+  endpoint: ""
+  # dev | staging | prod — drives sampling + resource attributes (M4).
+  deploymentEnv: "dev"
+  serviceNamespace: ""
+  # Optional head-sampling ratio override (prod).
+  tracesSamplerRatio: ""
+
+# --- Extra environment ------------------------------------------------------
+# Free-form env vars and envFrom sources merged into the container.
+extraEnv: []
+#  - name: RUST_LOG
+#    value: info
+extraEnvFrom: []
+
+# --- Probes -----------------------------------------------------------------
+# Forward-looking defaults target the HTTP health surface the server will
+# expose (/healthz). The current M1 image is a migrate-and-exit bootstrap with
+# no transport; disable probes (or override to an exec/tcp probe) until the
+# server transport milestone lands. See charts/memkeys/README.md.
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+# --- Resources --------------------------------------------------------------
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# --- Scheduling -------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# Optional container command/args override (e.g. to run the migrate-only
+# bootstrap). Empty uses the image entrypoint.
+command: []
+args: []

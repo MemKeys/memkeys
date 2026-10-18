@@ -1,0 +1,28 @@
+apiVersion: v2
+name: memkeys
+description: |
+  MemKeys — the attribute-based memory server for agents. Facts are keyed by
+  agent-supplied attributes with temporal validity; graph and vector are
+  derived, rebuildable projections over a keyed/temporal source of truth.
+type: application
+# Chart version — bump on every chart change (SemVer).
+version: 0.1.0
+# The memkeys-server image version this chart defaults to.
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/MemKeys/memkeys
+sources:
+  - https://github.com/MemKeys/memkeys
+keywords:
+  - memory
+  - agents
+  - postgres
+  - observability
+maintainers:
+  - name: MemKeys DevOps
+    url: https://github.com/MemKeys/memkeys
+annotations:
+  # ct (chart-testing) reads this to render an upgrade/changelog note.
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial chart scaffold — Deployment, Service, config/secret wiring, probes, non-root securityContext.

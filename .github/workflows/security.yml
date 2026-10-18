@@ -1,0 +1,75 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      # actions: read is required by codeql-action's status reporting
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+
+      - name: Build for CodeQL extraction
+        run: cargo build --workspace --locked
+
+      - name: Perform CodeQL Analysis
+        # This private repo does not have GitHub Advanced Security enabled,
+        # so the SARIF cannot be uploaded to the code-scanning API (that
+        # upload requires GHAS, a paid org decision). The analysis itself
+        # runs on every PR; results are uploaded as a workflow artifact
+        # instead. Once GHAS is enabled by the org owner, set upload: true
+        # and add security-events: write to surface alerts in the UI.
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"
+          upload: false
+          output: sarif-results
+
+      - name: Upload CodeQL SARIF as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-rust.sarif
+          path: sarif-results/rust.sarif
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan git history for secrets
+        run: gitleaks git --redact --exit-code 1 --config .gitleaks.toml .
