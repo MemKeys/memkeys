@@ -1,0 +1,164 @@
+name: Helm
+
+# Joins the PR gate only when the chart is touched (the paths filter). ct lint
+# and kubeconform are self-contained and gate PRs now; the kind-based ct install
+# job is gated on the P0 Dockerfile (ISI-6097) existing — until then it reports
+# success without running, so it never reddens the gate before the image exists.
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm.yml"
+      - ".github/ct.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm.yml"
+      - ".github/ct.yaml"
+
+concurrency:
+  group: helm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ct lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: helm/chart-testing-action@v2.6.1
+
+      - name: Run chart-testing (lint)
+        run: ct lint --config .github/ct.yaml --all
+
+  kubeconform:
+    name: kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Install kubeconform
+        run: |
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz" \
+            | tar -xzf - kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+
+      - name: Template + validate (defaults, probes, HTTPRoute)
+        run: |
+          set -euo pipefail
+          CRD='https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          validate() {
+            helm template memkeys charts/memkeys "$@" \
+              | kubeconform -strict -summary -verbose \
+                  -schema-location default \
+                  -schema-location "$CRD"
+          }
+          echo "::group::defaults (+ db url)"
+          validate --set database.url="postgres://u:p@h:5432/db"
+          echo "::endgroup::"
+          echo "::group::HTTPRoute enabled (Gateway API CRD)"
+          validate --set database.url="postgres://u:p@h:5432/db" \
+            --set httpRoute.enabled=true \
+            --set 'httpRoute.parentRefs[0].name=gw' \
+            --set 'httpRoute.hostnames[0]=memkeys.example.com'
+          echo "::endgroup::"
+
+  detect:
+    name: detect image build
+    runs-on: ubuntu-latest
+    outputs:
+      dockerfile: ${{ steps.check.outputs.dockerfile }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        name: Check for P0 Dockerfile
+        run: |
+          if [ -n "$(find . -maxdepth 2 -name Dockerfile -not -path './.git/*' -print -quit)" ]; then
+            echo "dockerfile=true" >> "$GITHUB_OUTPUT"
+            echo "Dockerfile present — ct install will run."
+          else
+            echo "dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile yet (P0/ISI-6097). Skipping ct install."
+          fi
+
+  install:
+    name: ct install (kind)
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.dockerfile == 'true'
+    env:
+      IMAGE: memkeys:ct-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: helm/chart-testing-action@v2.6.1
+
+      - name: Build memkeys-server image (P0 Dockerfile)
+        run: |
+          DOCKERFILE="$(find . -maxdepth 2 -name Dockerfile -not -path './.git/*' -print -quit)"
+          docker build -f "$DOCKERFILE" -t "$IMAGE" .
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name chart-testing
+
+      - name: Deploy test Postgres
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: memkeys-test-postgres
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: { app: memkeys-test-postgres }
+            template:
+              metadata:
+                labels: { app: memkeys-test-postgres }
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:18
+                    env:
+                      - { name: POSTGRES_USER, value: memkeys }
+                      - { name: POSTGRES_PASSWORD, value: memkeys }
+                      - { name: POSTGRES_DB, value: memkeys_test }
+                    ports:
+                      - containerPort: 5432
+                    readinessProbe:
+                      exec:
+                        command: ["pg_isready", "-U", "memkeys"]
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: memkeys-test-postgres
+          spec:
+            selector: { app: memkeys-test-postgres }
+            ports:
+              - port: 5432
+                targetPort: 5432
+          EOF
+          kubectl rollout status deploy/memkeys-test-postgres --timeout=120s
+
+      - name: Run chart-testing (install)
+        run: |
+          ct install --config .github/ct.yaml --all \
+            --helm-extra-set-args "--set=image.repository=memkeys --set=image.tag=ct-${{ github.sha }}"

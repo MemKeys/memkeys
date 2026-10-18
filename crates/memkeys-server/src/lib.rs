@@ -18,6 +18,7 @@ pub mod auth;
 pub mod envelope;
 pub mod error;
 pub mod graph;
+pub mod health;
 pub mod http;
 pub mod mcp;
 pub mod memstore;
