@@ -15,6 +15,11 @@ Image: {{ include "memkeys.image" . }}
 {{- end }}
 {{- end }}
 
+Profile: {{ include "memkeys.profile" . }}
+{{- if eq (include "memkeys.workersEnabled" .) "true" }}
+  → async-projection workers: Deployment {{ include "memkeys.workerFullname" . }} ({{ .Values.workers.replicaCount }} replica(s))
+{{- end }}
+
 Service (ClusterIP) reachable in-cluster at:
   {{ include "memkeys.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
 

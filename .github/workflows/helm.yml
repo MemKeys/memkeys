@@ -73,6 +73,10 @@ jobs:
             --set 'httpRoute.parentRefs[0].name=gw' \
             --set 'httpRoute.hostnames[0]=memkeys.example.com'
           echo "::endgroup::"
+          echo "::group::microservice profile (server + workers + PDB)"
+          validate --set database.url="postgres://u:p@h:5432/db" \
+            --set profile=microservice
+          echo "::endgroup::"
 
   detect:
     name: detect image build
