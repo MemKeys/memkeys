@@ -12,6 +12,7 @@ use crate::graph::{
     GraphError, GraphView, LinksReq, LinksResult, SupersedesReq, SupersedesResult, TraverseReq,
     TraverseResult,
 };
+use crate::llm_worker::{CategorizeWorker, DigestWorker, ExtractWorker};
 use crate::model::{EntityKey, FactRecord, FactType, KeyedQuery, ProcessedFact, Validity};
 use crate::pg_graph::PgGraph;
 use crate::pipeline::{
@@ -60,6 +61,13 @@ pub struct MemKeysService {
     /// contexts (no pg pool) — tests seed the index directly. Enqueued OFF the
     /// stage-4 ack path, alongside the stage-5a graph worker (§6/R2).
     vector_worker: Option<Arc<VectorProjectionWorker>>,
+    /// M6 LLM pipeline workers (ADR-llm-pipeline Decision 2): W-extract (5e,
+    /// always-on key enrichment), W-digest (5c, gated `memory.semantic.digest`),
+    /// W-categorize (5d, gated `memory.semantic`). All enqueued OFF the
+    /// stage-4 ack path (§6/R2 — a projection failure never blocks stages 1-4).
+    extract_worker: Option<Arc<ExtractWorker>>,
+    digest_worker: Option<Arc<DigestWorker>>,
+    categorize_worker: Option<Arc<CategorizeWorker>>,
 }
 
 impl MemKeysService {
@@ -77,6 +85,9 @@ impl MemKeysService {
             embedder: None,
             vector: None,
             vector_worker: None,
+            extract_worker: None,
+            digest_worker: None,
+            categorize_worker: None,
         }
     }
 
@@ -98,6 +109,9 @@ impl MemKeysService {
             embedder: None,
             vector: None,
             vector_worker: None,
+            extract_worker: None,
+            digest_worker: None,
+            categorize_worker: None,
         }
     }
 
@@ -123,6 +137,44 @@ impl MemKeysService {
     pub fn with_semantic_worker(mut self, worker: Arc<VectorProjectionWorker>) -> Self {
         self.vector_worker = Some(worker);
         self
+    }
+
+    /// M6: wire the stage-5e extract worker (LLM-assisted key enrichment,
+    /// always-on per ADR Decision 2a — the async enrichment of §4's
+    /// synchronous deterministic resolution). Fluent.
+    pub fn with_extract_worker(mut self, worker: Arc<ExtractWorker>) -> Self {
+        self.extract_worker = Some(worker);
+        self
+    }
+
+    /// M6: wire the stage-5c digest worker (scope rollups, gated on
+    /// `memory.semantic.digest` at the wiring site — the binary only wires it
+    /// when the sub-flag is on). Fluent.
+    pub fn with_digest_worker(mut self, worker: Arc<DigestWorker>) -> Self {
+        self.digest_worker = Some(worker);
+        self
+    }
+
+    /// M6: wire the stage-5d categorize worker (gated on `memory.semantic` at
+    /// the wiring site). Fluent.
+    pub fn with_categorize_worker(mut self, worker: Arc<CategorizeWorker>) -> Self {
+        self.categorize_worker = Some(worker);
+        self
+    }
+
+    /// The wired stage-5e extract worker (drain/catch-up control).
+    pub fn extract_worker(&self) -> Option<Arc<ExtractWorker>> {
+        self.extract_worker.clone()
+    }
+
+    /// The wired stage-5c digest worker (drain/catch-up control).
+    pub fn digest_worker(&self) -> Option<Arc<DigestWorker>> {
+        self.digest_worker.clone()
+    }
+
+    /// The wired stage-5d categorize worker (drain/catch-up control).
+    pub fn categorize_worker(&self) -> Option<Arc<CategorizeWorker>> {
+        self.categorize_worker.clone()
     }
 
     /// The wired stage-5a worker (drain/catch-up control for the binary and
@@ -296,6 +348,32 @@ impl MemKeysService {
             // (the worker is only wired when the module is on).
             if let Some(vworker) = &self.vector_worker {
                 vworker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+            // M6 stages 5c-5e dispatch (async, OFF the ack path — §6/R2;
+            // ADR-llm-pipeline Decision 2): key enrichment (5e, always-on
+            // when wired), digest scope-dirty marking (5c, `…semantic.digest`),
+            // categorization (5d, `memory.semantic`). Each worker is only
+            // wired when its gate is on, so the dispatch needs no flag check.
+            if let Some(eworker) = &self.extract_worker {
+                eworker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+            if let Some(dworker) = &self.digest_worker {
+                dworker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+            if let Some(cworker) = &self.categorize_worker {
+                cworker.enqueue(
                     &caller.tenant_id,
                     fact.id,
                     Some(commit_span.span_context().clone()),

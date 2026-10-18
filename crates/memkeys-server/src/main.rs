@@ -33,6 +33,7 @@ use memkeys_server::service::MemKeysService;
 use memkeys_server::telemetry_setup::Otel;
 use memkeys_server::worker::VectorProjectionWorker;
 use memkeys_server::VectorIndex;
+use memkeys_server::{CategorizeWorker, DigestWorker, ExtractWorker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,6 +74,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(target: "memkeys", "memkeys.semantic.enabled: fact-vector tier + stage-5b worker on");
     }
 
+    // M6 (ADR-llm-pipeline): the LLM pipeline workers 5c-5e behind the
+    // pluggable generative endpoint. `generative::from_env` picks the adapter
+    // (MEMKEYS_GEN_URL set ⇒ the HTTP endpoint; unset ⇒ the deterministic
+    // TemplateGenerator so a minimal deployment — and CI — runs with no model
+    // server). W-extract (5e) is always-on key enrichment; W-categorize (5d)
+    // rides the `memory.semantic` gate; W-digest (5c) additionally requires
+    // the `memory.semantic.digest` sub-flag (§5.4.2 ruling: a deployment can
+    // buy fact-tier precision without paying for a summarizer).
+    let generator = memkeys_server::generator_from_env();
+    let extract_worker = Arc::new(ExtractWorker::new(pool.clone(), generator.clone()));
+    service = service.with_extract_worker(extract_worker.clone());
+    let mut categorize_worker: Option<Arc<CategorizeWorker>> = None;
+    let mut digest_worker: Option<Arc<DigestWorker>> = None;
+    if semantic_on {
+        let cw = Arc::new(CategorizeWorker::new(pool.clone(), generator.clone()));
+        service = service.with_categorize_worker(cw.clone());
+        categorize_worker = Some(cw);
+        let digest_on = std::env::var("MEMKEYS_SEMANTIC_DIGEST")
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"));
+        if digest_on {
+            // The digest worker embeds summaries with the SAME embedder as the
+            // fact tier (ADR Decision 3: one embedder, both tiers, RRF-fusable).
+            let embedder = memkeys_server::embedder_from_env();
+            let dw = Arc::new(DigestWorker::new(pool.clone(), generator.clone(), embedder));
+            service = service.with_digest_worker(dw.clone());
+            digest_worker = Some(dw);
+            tracing::info!(target: "memkeys", "memkeys.digest.enabled: stage-5c digest rollups on");
+        }
+    }
+
     let service = Arc::new(service);
     let worker = service
         .projection_worker()
@@ -103,6 +134,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vn = vw.catch_up(&tenant).await?;
             if vn > 0 {
                 println!("memkeys-server: embedded {vn} hole facts for tenant {tenant}");
+            }
+        }
+        // M6 stages 5c-5e catch-up: re-derive LLM pipeline projections for
+        // facts/scopes with no derivation stamp — or one stale versus the
+        // active (model_id, prompt_version) (ADR Decision 5: a version bump
+        // is a backfill event).
+        let en = extract_worker.catch_up(&tenant).await?;
+        if en > 0 {
+            println!("memkeys-server: extracted {en} hole facts for tenant {tenant}");
+        }
+        if let Some(cw) = &categorize_worker {
+            let cn = cw.catch_up(&tenant).await?;
+            if cn > 0 {
+                println!("memkeys-server: categorized {cn} hole facts for tenant {tenant}");
+            }
+        }
+        if let Some(dw) = &digest_worker {
+            let dn = dw.catch_up(&tenant).await?;
+            if dn > 0 {
+                println!("memkeys-server: rolled up {dn} hole scopes for tenant {tenant}");
             }
         }
     }
@@ -216,6 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Steady state: drain the post-commit queue(s) + rescan for holes.
     let loop_worker = worker.clone();
     let loop_vector_worker = vector_worker.clone();
+    let loop_extract_worker = extract_worker.clone();
+    let loop_categorize_worker = categorize_worker.clone();
+    let loop_digest_worker = digest_worker.clone();
     let maintenance = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -225,11 +279,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(vw) = &loop_vector_worker {
                 vw.drain().await;
             }
+            // M6: the LLM pipeline workers share the maintenance cadence. The
+            // 30s tick IS the W-digest debounce window — a burst of facts
+            // coalesces into one rollup per scope per tick.
+            loop_extract_worker.drain().await;
+            if let Some(cw) = &loop_categorize_worker {
+                cw.drain().await;
+            }
+            if let Some(dw) = &loop_digest_worker {
+                dw.drain().await;
+            }
             if let Ok(tenants) = distinct_tenants(loop_worker.graph_pool()).await {
                 for tenant in tenants {
                     let _ = loop_worker.catch_up(&tenant).await;
                     if let Some(vw) = &loop_vector_worker {
                         let _ = vw.catch_up(&tenant).await;
+                    }
+                    let _ = loop_extract_worker.catch_up(&tenant).await;
+                    if let Some(cw) = &loop_categorize_worker {
+                        let _ = cw.catch_up(&tenant).await;
+                    }
+                    if let Some(dw) = &loop_digest_worker {
+                        let _ = dw.catch_up(&tenant).await;
                     }
                 }
             }

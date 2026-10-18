@@ -29,11 +29,14 @@ use crate::telemetry::{self, Instruments};
 
 /// One queued projection work item: the committed fact identity + the span
 /// context of the commit that produced it (for the CONSUMER link).
+/// One queued projection work item: the committed fact identity + the span
+/// context of the commit that produced it (for the CONSUMER link). Shared by
+/// the graph / vector (M5) and LLM pipeline (M6) workers.
 #[derive(Debug, Clone)]
-struct WorkItem {
-    tenant: String,
-    fact_id: Uuid,
-    commit_span: Option<SpanContext>,
+pub(crate) struct WorkItem {
+    pub(crate) tenant: String,
+    pub(crate) fact_id: Uuid,
+    pub(crate) commit_span: Option<SpanContext>,
 }
 
 /// The stage-5a worker. Clone-safe handle (the queue is shared).

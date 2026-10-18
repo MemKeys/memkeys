@@ -18,9 +18,11 @@ pub mod auth;
 pub mod embed;
 pub mod envelope;
 pub mod error;
+pub mod generative;
 pub mod graph;
 pub mod health;
 pub mod http;
+pub mod llm_worker;
 pub mod mcp;
 pub mod memstore;
 pub mod model;
@@ -41,11 +43,17 @@ pub use auth::{JwtVerifier, Principal, StaticVerifier, TokenVerifier};
 pub use embed::{from_env as embedder_from_env, HttpEmbedder};
 pub use envelope::{EntityHints, Envelope, FactBlock, SourceBlock, SourceKind};
 pub use error::{IngestError, QueryError};
+pub use generative::{
+    from_env as generator_from_env, CategorizeInput, CategorizeOutput, ExtractInput, ExtractOutput,
+    GenError, GenTask, Generator, HttpGenerator, SummarizeInput, SummarizeOutput,
+    TemplateGenerator,
+};
 pub use graph::{
     BranchPoint, Cursor, Direction, EdgeType, FactRef, GraphError, GraphView, LinksReq,
     LinksResult, Node, NodeKind, NodeRef, ProjectOutcome, RebuildStats, Scope, SupersedesReq,
     SupersedesResult, TraverseReq, TraverseResult, TruncReason,
 };
+pub use llm_worker::{CategorizeWorker, DigestScope, DigestWorker, ExtractWorker, LlmError};
 pub use model::{EntityKey, EntityKeys, FactRecord, KeyedQuery, ProcessedFact, Validity};
 pub use pg::PgStore;
 pub use pg_graph::PgGraph;
