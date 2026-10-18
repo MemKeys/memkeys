@@ -124,6 +124,14 @@ pub fn build_resource(profile: DeploymentProfile) -> Resource {
         // Stable per-process UUID (replica disambiguation).
         KeyValue::new("service.instance.id", uuid::Uuid::new_v4().to_string()),
         KeyValue::new("deployment.environment.name", profile.as_str()),
+        // memory-semconv v0.1.0 substrate identity (ISI-6216): lets Tempo filter
+        // `resource.memory.sut.name == "memkeys"` and the dashboards slice by
+        // architecture. Set on the Resource (every signal), not per-span.
+        KeyValue::new("memory.sut.name", crate::telemetry::MEMORY_SUT_NAME),
+        KeyValue::new(
+            "memory.sut.architecture",
+            crate::telemetry::MEMORY_SUT_ARCHITECTURE,
+        ),
     ];
     if let Ok(ns) = std::env::var(NAMESPACE_VAR) {
         if !ns.trim().is_empty() {

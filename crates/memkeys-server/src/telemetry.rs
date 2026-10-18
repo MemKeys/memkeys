@@ -59,6 +59,127 @@ pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
 pub const OUTCOME_DUPLICATE: &str = "duplicate";
 
+// ---------------------------------------------------------------------------
+// memory-semconv v0.1.0 alignment layer (ISI-6216 / 5581-§2b)
+// ---------------------------------------------------------------------------
+//
+// memkeys emits its rich native `memkeys.*` vocabulary (above). To be
+// apples-to-apples with the other benchmark substrates (mem0 / memU / MemOS
+// forks + the mcp-memory-server shim + MemPalace PR #2142), it ALSO dual-emits
+// the shared **memory-semconv v0.1.0** contract (one Weaver policy across all
+// forks; ISI-6182 §2b line 100):
+//   spans   `memory.<op>` (SpanKind.CLIENT)
+//   metrics `memory_operation_duration_seconds` (hist, +status),
+//           `memory_recall_results_count` (hist),
+//           `memory_recall_top_similarity` (hist),
+//           `memory_items_total` + `memory_bytes_total` (counters)
+//   labels  (bounded 4-budget) memory_operation, memory_store_kind,
+//           memory_sut_name, memory_embedder_model (+ status on the duration
+//           histogram).
+//
+// The `memory.<op>` span is the CLIENT span the agent→memkeys call nests
+// beneath: when memkeys is reached via the mcp-memory-server shim, the shim's
+// own `memory.<op>` span is the parent and memkeys' `memory.<op>` nests under
+// it (the "two-source rule"); the native `memkeys.fact.ingest`/`memkeys.retrieve`
+// SERVER span in turn nests under memkeys' `memory.<op>`.
+//
+// PII gate is unchanged: the deny-list still excludes fact bodies, entity-key
+// VALUES, raw query text, and creds. `memory.query.length` is the safe proxy
+// (a length, never the text); `memory_bytes_total` is a byte COUNT, never body
+// content.
+
+/// `memory.sut.name` — the benchmark substrate identity (resource + metric
+/// label). Also set as a Resource attribute in `telemetry_setup::build_resource`
+/// so Tempo can filter `resource.memory.sut.name == "memkeys"`.
+pub const MEMORY_SUT_NAME: &str = "memkeys";
+
+/// `memory.sut.architecture` — the one-line architecture descriptor (Resource
+/// attribute; ISI-6216 §1). memkeys is a keyed + temporal + graph + two-tier
+/// vector store.
+pub const MEMORY_SUT_ARCHITECTURE: &str = "keyed+temporal+graph+2-tier-vector";
+
+/// `memory.operation` values (bare op; the span name is `memory.<op>`).
+pub const MEMORY_OP_ADD: &str = "add";
+pub const MEMORY_OP_SEARCH: &str = "search";
+pub const MEMORY_OP_RECALL: &str = "recall";
+pub const MEMORY_OP_UPDATE: &str = "update";
+pub const MEMORY_OP_INVALIDATE: &str = "invalidate";
+
+/// `memory.<op>` span names (must be `&'static str` for the span builder).
+pub const MEMORY_SPAN_ADD: &str = "memory.add";
+pub const MEMORY_SPAN_SEARCH: &str = "memory.search";
+pub const MEMORY_SPAN_RECALL: &str = "memory.recall";
+pub const MEMORY_SPAN_UPDATE: &str = "memory.update";
+pub const MEMORY_SPAN_INVALIDATE: &str = "memory.invalidate";
+
+/// `memory.store.kind` values — which internal tier served the op. Bounded enum.
+/// `postgres` = the SoT fact store (the `memory.add` commit target); `keyed` =
+/// exact entity-key recall; `graph` = the graph projection; `vector` = the
+/// semantic (ANN) tier.
+pub const MEMORY_STORE_POSTGRES: &str = "postgres";
+pub const MEMORY_STORE_KEYED: &str = "keyed";
+pub const MEMORY_STORE_GRAPH: &str = "graph";
+pub const MEMORY_STORE_VECTOR: &str = "vector";
+
+/// `status` values on the `memory_operation_duration_seconds` histogram
+/// (contract: hist "+status"). Coarser than the native `outcome` enum.
+pub const MEMORY_STATUS_SUCCESS: &str = "success";
+pub const MEMORY_STATUS_ERROR: &str = "error";
+
+/// Env knob for `memory.embedder.model` (the 4th bounded label). Fixed per
+/// deployment (one value per process), so it is not a cardinality risk. Unset →
+/// `none` (the non-semantic ops carry no embedder).
+pub const MEMORY_EMBEDDER_MODEL_VAR: &str = "MEMKEYS_EMBEDDER_MODEL";
+
+/// Read the configured embedder model id for the `memory.embedder.model` label.
+/// Defaults to `"none"`. The value is deployment configuration — bounded.
+pub fn memory_embedder_model() -> String {
+    std::env::var(MEMORY_EMBEDDER_MODEL_VAR)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// The `memory.<op>` span name for a bare op value (contract SpanKind.CLIENT).
+fn memory_span_name(op: &str) -> &'static str {
+    match op {
+        MEMORY_OP_ADD => MEMORY_SPAN_ADD,
+        MEMORY_OP_SEARCH => MEMORY_SPAN_SEARCH,
+        MEMORY_OP_RECALL => MEMORY_SPAN_RECALL,
+        MEMORY_OP_UPDATE => MEMORY_SPAN_UPDATE,
+        MEMORY_OP_INVALIDATE => MEMORY_SPAN_INVALIDATE,
+        // Unknown ops should never reach here (ops are the constants above);
+        // fall back to the search span rather than panic in release.
+        _ => MEMORY_SPAN_SEARCH,
+    }
+}
+
+/// Start the shared-contract `memory.<op>` CLIENT span (memory-semconv v0.1.0).
+/// This is the span the agent→memkeys call nests beneath; the native
+/// `memkeys.*` span is started as its child at the call site. `embedder_model`
+/// is stamped only for ops that touch the vector tier; `query_length` is the
+/// PII-safe proxy for read ops (a length — NEVER the query text).
+pub fn start_memory_op_span(
+    op: &'static str,
+    store_kind: &'static str,
+    embedder_model: Option<&str>,
+    query_length: Option<usize>,
+) -> global::BoxedSpan {
+    let mut attrs = vec![
+        attr("memory.operation", op),
+        attr("memory.store.kind", store_kind),
+        attr("memory.sut.name", MEMORY_SUT_NAME),
+    ];
+    if let Some(m) = embedder_model {
+        attrs.push(attr("memory.embedder.model", m.to_string()));
+    }
+    if let Some(len) = query_length {
+        attrs.push(attr("memory.query.length", len as i64));
+    }
+    start_span(memory_span_name(op), SpanKind::Client, attrs)
+}
+
 /// M3 protocol-surface attribute values (`memkeys.transport`). stdio = a
 /// launch-bound single-principal subprocess; http = the per-request-auth
 /// Streamable-HTTP shared server (WS-5 §2).
@@ -135,6 +256,16 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memkeys.transport",
     "memkeys.mcp.tool",
     "outcome",
+    // memory-semconv v0.1.0 shared contract (ISI-6216): the `memory.<op>` span
+    // + metric attributes dual-emitted alongside the native `memkeys.*` set.
+    // Values are bounded enums / a length / a model id — never fact bodies,
+    // entity-key values, or query text (the deny-list still holds).
+    "memory.operation",
+    "memory.store.kind",
+    "memory.sut.name",
+    "memory.embedder.model",
+    "memory.query.length",
+    "status",
     // Pinned stable db.* group (semconv-pins.yaml; db.query.text is DISABLED).
     "db.system.name",
     "db.operation.name",
@@ -273,6 +404,23 @@ pub struct Instruments {
     poison_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
     llm_token_usage: opentelemetry::metrics::Histogram<f64>,
     llm_operation_duration: opentelemetry::metrics::Histogram<f64>,
+    // memory-semconv v0.1.0 shared-contract instruments (ISI-6216). Instrument
+    // names/units are chosen so the OTLP→collector→Prometheus render produces
+    // the exact contract metric names the other substrates emit:
+    //   `memory.operation.duration` (s)        → memory_operation_duration_seconds
+    //   `memory.recall.results.count` ({result})→ memory_recall_results_count
+    //   `memory.recall.top.similarity` ({score})→ memory_recall_top_similarity
+    //   `memory.items` ({item}, monotonic)      → memory_items_total
+    //   `memory.bytes` ({byte}, monotonic)      → memory_bytes_total
+    // Curly-brace annotation units are NOT suffixed by the Prometheus exporter;
+    // only the duration histogram keeps a real unit (`s` → `_seconds`), which
+    // is the intended contract name. Exact-match is gated in the benchmark LGTM
+    // conformance step (acceptance criteria).
+    memory_operation_duration: opentelemetry::metrics::Histogram<f64>,
+    memory_recall_results: opentelemetry::metrics::Histogram<u64>,
+    memory_recall_top_similarity: opentelemetry::metrics::Histogram<f64>,
+    memory_items: opentelemetry::metrics::Counter<u64>,
+    memory_bytes: opentelemetry::metrics::Counter<u64>,
 }
 
 impl Instruments {
@@ -360,6 +508,49 @@ impl Instruments {
                 .f64_histogram("gen_ai.client.operation.duration")
                 .with_unit("s")
                 .with_description("LLM call duration (standard GenAI metric, WS-3 signal catalog).")
+                .build(),
+            // --- memory-semconv v0.1.0 shared contract (ISI-6216) ---
+            memory_operation_duration: meter
+                .f64_histogram("memory.operation.duration")
+                .with_unit("s")
+                .with_description(
+                    "memory-semconv v0.1.0: latency of a memory operation \
+                     (add/search/recall), labelled by op + store kind + sut + \
+                     status. Renders to memory_operation_duration_seconds.",
+                )
+                .build(),
+            memory_recall_results: meter
+                .u64_histogram("memory.recall.results.count")
+                .with_unit("{result}")
+                .with_description(
+                    "memory-semconv v0.1.0: result/candidate-set size returned by \
+                     a read op. Renders to memory_recall_results_count.",
+                )
+                .build(),
+            memory_recall_top_similarity: meter
+                .f64_histogram("memory.recall.top.similarity")
+                .with_unit("{score}")
+                .with_description(
+                    "memory-semconv v0.1.0: top similarity/fusion score of a \
+                     semantic read (0..1). Renders to memory_recall_top_similarity.",
+                )
+                .build(),
+            memory_items: meter
+                .u64_counter("memory.items")
+                .with_unit("{item}")
+                .with_description(
+                    "memory-semconv v0.1.0 gap-fill: corpus items written \
+                     (monotonic). Renders to memory_items_total.",
+                )
+                .build(),
+            memory_bytes: meter
+                .u64_counter("memory.bytes")
+                .with_unit("{byte}")
+                .with_description(
+                    "memory-semconv v0.1.0 gap-fill: corpus bytes written \
+                     (monotonic byte COUNT — never body content). Renders to \
+                     memory_bytes_total.",
+                )
                 .build(),
         }
     }
@@ -480,6 +671,73 @@ impl Instruments {
             ],
         );
     }
+
+    // --- memory-semconv v0.1.0 shared-contract recorders (ISI-6216) ---
+
+    /// `memory_operation_duration_seconds` — one record per memory op, carrying
+    /// the bounded 4-label budget (op/store_kind/sut) plus `status`.
+    pub fn memory_operation_duration(
+        &self,
+        op: &'static str,
+        store_kind: &'static str,
+        status: &'static str,
+        seconds: f64,
+    ) {
+        self.memory_operation_duration.record(
+            seconds,
+            &[
+                attr("memory.operation", op),
+                attr("memory.store.kind", store_kind),
+                attr("memory.sut.name", MEMORY_SUT_NAME),
+                attr("status", status),
+            ],
+        );
+    }
+
+    /// `memory_recall_results_count` — candidate/result-set size of a read op.
+    pub fn memory_recall_results(&self, op: &'static str, store_kind: &'static str, count: u64) {
+        self.memory_recall_results.record(
+            count,
+            &[
+                attr("memory.operation", op),
+                attr("memory.store.kind", store_kind),
+                attr("memory.sut.name", MEMORY_SUT_NAME),
+            ],
+        );
+    }
+
+    /// `memory_recall_top_similarity` — top similarity/fusion score of a
+    /// semantic read (only recorded when the read returned ≥1 hit).
+    pub fn memory_recall_top_similarity(&self, store_kind: &'static str, score: f64) {
+        self.memory_recall_top_similarity.record(
+            score,
+            &[
+                attr("memory.operation", MEMORY_OP_SEARCH),
+                attr("memory.store.kind", store_kind),
+                attr("memory.sut.name", MEMORY_SUT_NAME),
+            ],
+        );
+    }
+
+    /// `memory_items_total` + `memory_bytes_total` — corpus-growth counters
+    /// (gap-fill; no native equivalent). Called once per committed write with a
+    /// byte COUNT (never content). `embedder_model` is the 4th bounded label.
+    pub fn memory_items_added(
+        &self,
+        store_kind: &'static str,
+        embedder_model: &str,
+        items: u64,
+        bytes: u64,
+    ) {
+        let labels = [
+            attr("memory.operation", MEMORY_OP_ADD),
+            attr("memory.store.kind", store_kind),
+            attr("memory.sut.name", MEMORY_SUT_NAME),
+            attr("memory.embedder.model", embedder_model.to_string()),
+        ];
+        self.memory_items.add(items, &labels);
+        self.memory_bytes.add(bytes, &labels);
+    }
 }
 
 impl Default for Instruments {
@@ -523,6 +781,36 @@ mod tests {
         // M3 protocol surface — now emitted via transport_span (ISI-6134 B1/B2).
         assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.transport"));
         assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.mcp.tool"));
+    }
+
+    #[test]
+    fn memory_semconv_keys_registered_and_span_valid() {
+        // The memory-semconv v0.1.0 dual-emit keys (ISI-6216) must be in the
+        // registry or attr()'s debug_assert would panic at emission.
+        for k in [
+            "memory.operation",
+            "memory.store.kind",
+            "memory.sut.name",
+            "memory.embedder.model",
+            "memory.query.length",
+            "status",
+        ] {
+            assert!(ALLOWED_ATTR_KEYS.contains(&k), "{k} not registered");
+        }
+        // Content-bearing keys must NEVER be registered (PII gate).
+        assert!(!ALLOWED_ATTR_KEYS.contains(&"memory.query.text"));
+        // Span-name mapping is total over the op constants.
+        assert_eq!(memory_span_name(MEMORY_OP_ADD), MEMORY_SPAN_ADD);
+        assert_eq!(memory_span_name(MEMORY_OP_SEARCH), MEMORY_SPAN_SEARCH);
+        assert_eq!(memory_span_name(MEMORY_OP_RECALL), MEMORY_SPAN_RECALL);
+        // Would panic in debug (attr()'s debug_assert) if any key were missing.
+        let _add = start_memory_op_span(MEMORY_OP_ADD, MEMORY_STORE_POSTGRES, None, None);
+        let _search = start_memory_op_span(
+            MEMORY_OP_SEARCH,
+            MEMORY_STORE_VECTOR,
+            Some("nomic-embed-text"),
+            Some(42),
+        );
     }
 
     #[test]
