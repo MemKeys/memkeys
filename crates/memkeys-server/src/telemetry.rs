@@ -35,10 +35,16 @@ pub const PIPELINE_STAGE_COMMIT: &str = "commit";
 pub const RETRIEVAL_OP_KEYED: &str = "keyed";
 /// `memkeys.retrieval.op` value for graph reads (signal catalog enum).
 pub const RETRIEVAL_OP_GRAPH: &str = "graph";
+/// `memkeys.retrieval.op` value for op-3 semantic search (M5, §7.4).
+pub const RETRIEVAL_OP_SEMANTIC: &str = "semantic";
 /// `memkeys.worker.kind` value for the stage-5a graph-projection worker.
 pub const WORKER_KIND_GRAPH_PROJECTION: &str = "graph_projection";
+/// `memkeys.worker.kind` value for the stage-5b vector-projection worker (M5).
+pub const WORKER_KIND_VECTOR_PROJECTION: &str = "vector_projection";
 /// `memkeys.projection.kind` value for the graph projection.
 pub const PROJECTION_KIND_GRAPH: &str = "graph";
+/// `memkeys.projection.kind` value for the fact-vector projection (M5 stage 5b).
+pub const PROJECTION_KIND_VECTOR: &str = "vector";
 pub const OUTCOME_SUCCESS: &str = "success";
 pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
@@ -351,12 +357,11 @@ impl Instruments {
             .record(depth as i64, &[attr("memkeys.worker.kind", worker_kind)]);
     }
 
-    /// `memkeys.poison.queue.depth` — live dead-letter count (absolute).
-    pub fn poison_queue_depth(&self, count: i64) {
-        self.poison_queue_depth_gauge.record(
-            count,
-            &[attr("memkeys.worker.kind", WORKER_KIND_GRAPH_PROJECTION)],
-        );
+    /// `memkeys.poison.queue.depth` — live dead-letter count (absolute), per
+    /// derived-view worker kind (graph_projection / vector_projection).
+    pub fn poison_queue_depth(&self, worker_kind: &'static str, count: i64) {
+        self.poison_queue_depth_gauge
+            .record(count, &[attr("memkeys.worker.kind", worker_kind)]);
     }
 }
 

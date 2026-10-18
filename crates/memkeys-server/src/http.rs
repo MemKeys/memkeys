@@ -4,7 +4,8 @@
 //!   POST /memory/facts            → service.ingest()
 //!   GET  /memory/facts            → service.fetch_by_keys()
 //!   POST /memory/graph/traverse   → service.traverse()
-//!   POST /memory/search           → 501 feature_disabled
+//!   POST /memory/search           → service.semantic_search() (op-4, §7.4;
+//!                                    501 feature_disabled when the module is off)
 //!
 //! Admission (ISI-6148, closes ISI-6134 S1):
 //!   1. Concurrency shedding ([`AdmissionControl::try_admit`]) gates every
@@ -46,8 +47,8 @@ use crate::graph::{
     Direction, EdgeType, GraphError, NodeRef, TraverseReq, DEFAULT_DEADLINE, DEFAULT_FANOUT_CAP,
     DEFAULT_NODE_BUDGET,
 };
-use crate::model::{EntityKey, KeyedQuery, Validity};
-use crate::service::{IngestReceipt, MemKeysService};
+use crate::model::{EntityKey, FactType, KeyedQuery, Validity};
+use crate::service::{IngestReceipt, MemKeysService, SearchRequest, SemanticHit};
 use crate::telemetry::{self, TRANSPORT_HTTP};
 use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, TraceContextExt};
@@ -86,7 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/memory/facts", post(ingest))
         .route("/memory/facts", get(fetch))
         .route("/memory/graph/traverse", post(traverse))
-        .route("/memory/search", post(search_501))
+        .route("/memory/search", post(search))
         .layer(middleware::from_fn_with_state(state.clone(), admit))
         .with_state(state)
 }
@@ -469,19 +470,134 @@ async fn traverse(
 }
 
 // ---------------------------------------------------------------------------
-// POST /memory/search → 501
+// POST /memory/search — op-4 semantic search (§7.4)
 // ---------------------------------------------------------------------------
 
-async fn search_501() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "feature_disabled",
-            "feature": "semantic_search",
-            "message": "Semantic search is not available in M3; use GET /memory/facts for keyed retrieval."
-        })),
-    )
-        .into_response()
+/// Wire format for op-4 (§7.4). `scope` carries the caller's finer `entity.*`
+/// filters + `fact.type`, ANDed and translated to a candidate id set; the
+/// tenant floor is NOT here — it is SERVER-SET from the verified principal
+/// (§7.4 R6, same as traverse). `tiers` selects fact/digest/auto.
+#[derive(Deserialize)]
+struct SearchReqWire {
+    query: String,
+    #[serde(default)]
+    scope: HashMap<String, String>,
+    #[serde(default)]
+    k: Option<usize>,
+    #[serde(default)]
+    tiers: Option<String>,
+    #[serde(default)]
+    as_of: Option<String>,
+}
+
+/// The parsed §7.4 scope: ANDed `entity.*` keys + an optional `fact.type`.
+type SearchScope = (Vec<(EntityKey, String)>, Option<FactType>);
+
+/// Parse the §7.4 `scope` map → `(entity.* keys, fact.type)`. Unknown scope
+/// keys are rejected rather than silently ignored (a mis-typed filter would
+/// otherwise widen the result set). `category` is reserved for the M6 facet
+/// surface and is accepted-but-unenforced with a note (not yet a candidate
+/// pre-filter).
+fn parse_search_scope(scope: &HashMap<String, String>) -> Result<SearchScope, String> {
+    const KEY_MAP: &[(&str, EntityKey)] = &[
+        ("entity.project", EntityKey::Project),
+        ("entity.issue", EntityKey::Issue),
+        ("entity.pr", EntityKey::Pr),
+        ("entity.agent", EntityKey::Agent),
+        ("entity.run", EntityKey::Run),
+        ("entity.thread", EntityKey::Thread),
+        ("entity.service", EntityKey::Service),
+    ];
+    let mut keys = Vec::new();
+    let mut fact_type = None;
+    for (k, v) in scope {
+        if let Some((_, ek)) = KEY_MAP.iter().find(|(name, _)| name == k) {
+            keys.push((*ek, v.clone()));
+        } else if k == "fact.type" || k == "type" {
+            fact_type = Some(
+                serde_json::from_value(serde_json::Value::String(v.clone()))
+                    .map_err(|_| format!("unknown fact.type: {v}"))?,
+            );
+        } else if k == "category" {
+            // D4 category facet is an M6 surface; accept but don't pre-filter yet.
+            continue;
+        } else {
+            return Err(format!("unknown scope key: {k}"));
+        }
+    }
+    Ok((keys, fact_type))
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<SearchReqWire>,
+) -> Response {
+    let (scope, fact_type) = match parse_search_scope(&body.scope) {
+        Ok(s) => s,
+        Err(reason) => {
+            return wire_response(WireError::new(ErrorCode::InvalidArgument, reason));
+        }
+    };
+    let as_of = match body.as_of.as_deref() {
+        Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+            Ok(t) => Some(t.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                return wire_response(WireError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("as_of must be RFC3339: {ts}"),
+                ));
+            }
+        },
+        None => None,
+    };
+    // `tiers=digest` is an explicit digest-only request; the digest sub-flag is
+    // a later milestone, so it degrades to the fact tier with a warning header
+    // rather than a 501 (§7.4). `auto`/`fact` run the fact tier silently.
+    let digest_requested = matches!(body.tiers.as_deref(), Some("digest"));
+
+    let req = SearchRequest {
+        query: body.query,
+        scope,
+        fact_type,
+        k: body.k.unwrap_or(SearchRequest::DEFAULT_K),
+        as_of,
+    };
+
+    let cx = http_transport_cx();
+    let result = state
+        .service
+        .semantic_search(&principal.tenant_id, &req)
+        .with_context(cx.clone())
+        .await;
+    cx.span().end();
+    match result {
+        Ok(hits) => {
+            let body = serde_json::json!({
+                "hits": hits.iter().map(SemanticHit::to_wire_json).collect::<Vec<_>>(),
+            });
+            let mut resp = (StatusCode::OK, Json(body)).into_response();
+            if digest_requested {
+                resp.headers_mut().insert(
+                    "x-memkeys-warning",
+                    axum::http::HeaderValue::from_static(
+                        "digest tier unavailable (memory.semantic.digest off); served fact tier",
+                    ),
+                );
+            }
+            resp
+        }
+        // §7.4: the semantic module off is a 501 `feature_disabled`, never a
+        // silent empty result — callers degrade gracefully.
+        Err(QueryError::FeatureDisabled { feature }) => wire_response(WireError::new(
+            ErrorCode::FeatureDisabled,
+            format!("semantic module disabled: {feature}"),
+        )),
+        Err(QueryError::Invalid { reason }) => {
+            wire_response(WireError::new(ErrorCode::InvalidArgument, reason))
+        }
+        Err(e) => wire_response(WireError::new(ErrorCode::BackendUnavailable, e.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -654,5 +770,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A verified router whose service has the semantic module wired (in-memory
+    /// index + hash embedder) — the op-4 "on" path.
+    fn verified_router_semantic(secret: &[u8]) -> Router {
+        use crate::auth::JwtVerifier;
+        use crate::memstore::MemStore;
+        use crate::semantic::{HashEmbedder, MemVectorIndex};
+        use crate::service::MemKeysService;
+        let service = Arc::new(
+            MemKeysService::new(Arc::new(MemStore::new())).with_semantic(
+                Arc::new(HashEmbedder::new()),
+                Arc::new(MemVectorIndex::new()),
+            ),
+        );
+        let state = AppState::new(
+            service,
+            Some(Arc::new(JwtVerifier::new(secret.to_vec()))),
+            Arc::new(AdmissionControl::with_defaults()),
+        );
+        router(state)
+    }
+
+    #[tokio::test]
+    async fn search_feature_disabled_is_501_when_module_off() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        // Default verified_router has NO semantic module → op-4 is a 501
+        // feature_disabled, never a silent empty result (§7.4).
+        let app = verified_router(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/memory/search")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"postgres"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn search_reaches_handler_when_module_on() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        // Module on but the in-memory index is empty → 200 with `{hits:[]}`,
+        // proving the op-4 handler is wired (not the 501 stub).
+        let app = verified_router_semantic(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/memory/search")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"postgres","k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_unknown_scope_key() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        let app = verified_router_semantic(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+        // A mis-typed scope key is an invalid_argument (400), never a silently
+        // dropped filter that would widen the result set.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/memory/search")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"x","scope":{"entity.bogus":"y"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

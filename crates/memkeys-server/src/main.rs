@@ -28,8 +28,11 @@ use memkeys_server::health;
 use memkeys_server::http::AppState;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
+use memkeys_server::pg_vector::PgVectorIndex;
 use memkeys_server::service::MemKeysService;
 use memkeys_server::telemetry_setup::Otel;
+use memkeys_server::worker::VectorProjectionWorker;
+use memkeys_server::VectorIndex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,15 +44,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url =
         std::env::var("MEMKEYS_DATABASE_URL").map_err(|_| "MEMKEYS_DATABASE_URL is required")?;
     let store = PgStore::connect(&database_url).await?;
-    let graph = Arc::new(PgGraph::from_pool(store.pool().clone()));
-    let service = Arc::new(MemKeysService::with_graph_projection(
+    let pool = store.pool().clone();
+    let graph = Arc::new(PgGraph::from_pool(pool.clone()));
+    let mut service = MemKeysService::with_graph_projection(
         Arc::new(store),
         Arc::new(memkeys_server::pipeline::NoopResolver),
         graph.clone(),
-    ));
+    );
+
+    // M5: the optional semantic module (§5.4.2 "optional, activates on demand").
+    // `MEMKEYS_SEMANTIC` truthy wires the fact-vector read path (embedder +
+    // pgvector index) AND the stage-5b projection worker; otherwise op-4 keeps
+    // returning `feature_disabled` (501) as in M3. The embedder is chosen by
+    // `embed::from_env` (HTTP when MEMKEYS_EMBED_URL is set, else HashEmbedder).
+    let semantic_on =
+        std::env::var("MEMKEYS_SEMANTIC").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"));
+    if semantic_on {
+        let embedder = memkeys_server::embed::from_env();
+        let vector: Arc<dyn VectorIndex> = Arc::new(PgVectorIndex::from_pool(pool.clone()));
+        let vworker = Arc::new(VectorProjectionWorker::new(
+            pool.clone(),
+            embedder.clone(),
+            vector.clone(),
+        ));
+        service = service
+            .with_semantic(embedder, vector)
+            .with_semantic_worker(vworker);
+        tracing::info!(target: "memkeys", "memkeys.semantic.enabled: fact-vector tier + stage-5b worker on");
+    }
+
+    let service = Arc::new(service);
     let worker = service
         .projection_worker()
         .expect("worker is wired with the graph projection");
+    let vector_worker = service.vector_worker();
 
     // ISI-6132: the health listener starts before the (potentially long)
     // catch-up scan so kubelet probes can reach the pod immediately after
@@ -64,11 +92,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("memkeys-server: migrations applied; FactStore + graph projection ready");
 
-    // Initial convergence pass: build the projection from the FactStore.
+    // Initial convergence pass: build the projection(s) from the FactStore.
     for tenant in distinct_tenants(graph.pool()).await? {
         let n = worker.catch_up(&tenant).await?;
         if n > 0 {
             println!("memkeys-server: projected {n} hole facts for tenant {tenant}");
+        }
+        // Stage-5b vector catch-up (only when the semantic module is on).
+        if let Some(vw) = &vector_worker {
+            let vn = vw.catch_up(&tenant).await?;
+            if vn > 0 {
+                println!("memkeys-server: embedded {vn} hole facts for tenant {tenant}");
+            }
         }
     }
 
@@ -178,17 +213,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         memkeys_server::mcp::run_stdio(mcp_service, stdio_verifier, mcp_admission).await;
     });
 
-    // Steady state: drain the post-commit queue + rescan for holes.
+    // Steady state: drain the post-commit queue(s) + rescan for holes.
     let loop_worker = worker.clone();
+    let loop_vector_worker = vector_worker.clone();
     let maintenance = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             loop_worker.drain().await;
+            if let Some(vw) = &loop_vector_worker {
+                vw.drain().await;
+            }
             if let Ok(tenants) = distinct_tenants(loop_worker.graph_pool()).await {
                 for tenant in tenants {
                     let _ = loop_worker.catch_up(&tenant).await;
+                    if let Some(vw) = &loop_vector_worker {
+                        let _ = vw.catch_up(&tenant).await;
+                    }
                 }
             }
         }

@@ -12,14 +12,17 @@ use crate::graph::{
     GraphError, GraphView, LinksReq, LinksResult, SupersedesReq, SupersedesResult, TraverseReq,
     TraverseResult,
 };
-use crate::model::{KeyedQuery, ProcessedFact};
+use crate::model::{EntityKey, FactRecord, FactType, KeyedQuery, ProcessedFact, Validity};
 use crate::pg_graph::PgGraph;
 use crate::pipeline::{
     key_stage, normalize, temporalize, CallerContext, EntityResolver, NoopResolver,
 };
+use crate::semantic::{
+    rrf_fuse, CandidateSet, Embedder, FusedHit, FusionSource, RankedList, VectorIndex,
+};
 use crate::store::{CommitOutcome, FactStore};
 use crate::telemetry::{self, Instruments};
-use crate::worker::GraphProjectionWorker;
+use crate::worker::{GraphProjectionWorker, VectorProjectionWorker};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt};
 
 /// Response of `POST /memory/facts` (§7.1 write-with-keys): the fact id, the
@@ -47,6 +50,16 @@ pub struct MemKeysService {
     /// when no projection is wired in unit contexts).
     graph: Option<Arc<dyn GraphView>>,
     worker: Option<Arc<GraphProjectionWorker>>,
+    /// M5 semantic module (§5.4.2/§7.4). `None` = `memory.semantic` off → the
+    /// minimal keyed+graph deployment; op-4 then returns `feature_disabled`
+    /// (§7.4) rather than a silent empty result. Both are present together:
+    /// the embedder produces query/fact vectors, the index stores+ranks them.
+    embedder: Option<Arc<dyn Embedder>>,
+    vector: Option<Arc<dyn VectorIndex>>,
+    /// M5 stage-5b vector-projection worker (write path). `None` in unit
+    /// contexts (no pg pool) — tests seed the index directly. Enqueued OFF the
+    /// stage-4 ack path, alongside the stage-5a graph worker (§6/R2).
+    vector_worker: Option<Arc<VectorProjectionWorker>>,
 }
 
 impl MemKeysService {
@@ -61,6 +74,9 @@ impl MemKeysService {
             instruments: Instruments::new(),
             graph: None,
             worker: None,
+            embedder: None,
+            vector: None,
+            vector_worker: None,
         }
     }
 
@@ -79,13 +95,46 @@ impl MemKeysService {
             instruments: Instruments::new(),
             graph: Some(graph),
             worker: Some(worker),
+            embedder: None,
+            vector: None,
+            vector_worker: None,
         }
+    }
+
+    /// M5: enable the semantic module (`memory.semantic` on). Fluent: wire the
+    /// embedder + vector index onto an existing service. The fact tier is
+    /// always present when the module is on (§5.4.2 R1); the digest sub-flag is
+    /// a follow-up. The stage-5b vector-projection worker is wired separately
+    /// against the same index.
+    pub fn with_semantic(
+        mut self,
+        embedder: Arc<dyn Embedder>,
+        vector: Arc<dyn VectorIndex>,
+    ) -> Self {
+        self.embedder = Some(embedder);
+        self.vector = Some(vector);
+        self
+    }
+
+    /// M5: wire the stage-5b vector-projection worker (write path). Fluent;
+    /// requires [`with_semantic`](Self::with_semantic) to also be set so the
+    /// read path is coherent with the index the worker populates. The worker is
+    /// enqueued OFF the stage-4 ack path (§6/R2).
+    pub fn with_semantic_worker(mut self, worker: Arc<VectorProjectionWorker>) -> Self {
+        self.vector_worker = Some(worker);
+        self
     }
 
     /// The wired stage-5a worker (drain/catch-up control for the binary and
     /// tests). `None` when no graph projection is configured.
     pub fn projection_worker(&self) -> Option<Arc<GraphProjectionWorker>> {
         self.worker.clone()
+    }
+
+    /// The wired stage-5b vector-projection worker (drain/catch-up control).
+    /// `None` when the semantic module is off or in a unit context.
+    pub fn vector_worker(&self) -> Option<Arc<VectorProjectionWorker>> {
+        self.vector_worker.clone()
     }
 
     /// Write path (§6): stages 1-4 as one trace, `memkeys.fact.ingest`
@@ -237,6 +286,16 @@ impl MemKeysService {
         if commit_result == CommitOutcome::Inserted {
             if let Some(worker) = &self.worker {
                 worker.enqueue(
+                    &caller.tenant_id,
+                    fact.id,
+                    Some(commit_span.span_context().clone()),
+                );
+            }
+            // Stage 5b dispatch (async, OFF the ack path — §6/R2): embed the
+            // fact body + upsert the vector tier. Gated on `memory.semantic`
+            // (the worker is only wired when the module is on).
+            if let Some(vworker) = &self.vector_worker {
+                vworker.enqueue(
                     &caller.tenant_id,
                     fact.id,
                     Some(commit_span.span_context().clone()),
@@ -466,6 +525,299 @@ impl MemKeysService {
     }
 }
 
+/// Op-4 semantic-search request (§7.4). `scope` is the caller's finer
+/// `entity.*` filters, ANDed and translated to a candidate id set; empty scope
+/// runs against the whole tenant floor (R6 — `unkeyed` facts included). The
+/// tenant floor itself is the authenticated caller's and is never in this
+/// struct (§7.4/R6: "never supplied by, nor omittable by, the client").
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub query: String,
+    pub scope: Vec<(EntityKey, String)>,
+    pub fact_type: Option<FactType>,
+    pub k: usize,
+    pub as_of: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SearchRequest {
+    /// Clamp (§7.4 has no unbounded search): default/ceiling on `k`.
+    pub const DEFAULT_K: usize = 10;
+    pub const MAX_K: usize = 100;
+}
+
+/// One semantic hit (§7.4 response): the authoritative record (hydrated from
+/// the FactStore — R1), its fused/similarity score, and `via` provenance (which
+/// path surfaced it).
+#[derive(Debug, Clone)]
+pub struct SemanticHit {
+    pub record: FactRecord,
+    pub score: f64,
+    pub via: Vec<FusionSource>,
+}
+
+impl SemanticHit {
+    /// The §7.4 response-shape JSON for one hit — the authoritative record
+    /// (hydrated from the SoT, R1) + score + `via` provenance. Shared verbatim
+    /// by the HTTP and MCP transports (WS-5 §2.3 "byte-for-byte the same").
+    pub fn to_wire_json(&self) -> serde_json::Value {
+        let entity: serde_json::Map<String, serde_json::Value> = self
+            .record
+            .entity_keys()
+            .resolved()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::json!({
+            "fact.id": self.record.id,
+            "score": self.score,
+            "fact.type": self.record.fact_type,
+            "fact.subject": self.record.subject,
+            "fact.body": self.record.body,
+            "entity": entity,
+            "event_time": self.record.event_time,
+            "provenance": self.record.provenance_principal,
+            "via": self.via.first().map(|s| s.as_str()).unwrap_or("fact"),
+        })
+    }
+}
+
+/// M5 retrieval: op-4 semantic search (§7.4) and RRF fusion across the keyed +
+/// semantic paths (§7.4 step 3). The tenant floor is SERVER-SET from the
+/// verified caller on every call (WS-4 Invariant T / §7.4 R6).
+impl MemKeysService {
+    /// True when the `memory.semantic` module is wired (embedder + index).
+    pub fn semantic_enabled(&self) -> bool {
+        self.embedder.is_some() && self.vector.is_some()
+    }
+
+    /// Op-4 — semantic search (§7.4). scope → candidate id set → ANN rank (fact
+    /// tier) → hydrate authoritative records (R1). Returns
+    /// [`QueryError::FeatureDisabled`] (→ 501, §7.4) when the module is off, so
+    /// callers degrade gracefully rather than mistaking "disabled" for "empty".
+    pub async fn semantic_search(
+        &self,
+        caller_tenant: &str,
+        req: &SearchRequest,
+    ) -> Result<Vec<SemanticHit>, QueryError> {
+        let (embedder, vector) = match (&self.embedder, &self.vector) {
+            (Some(e), Some(v)) => (e, v),
+            _ => {
+                return Err(QueryError::FeatureDisabled {
+                    feature: "memory.semantic",
+                })
+            }
+        };
+        let k = req.k.clamp(1, SearchRequest::MAX_K);
+
+        let mut span = telemetry::start_span(
+            "memkeys.retrieve",
+            SpanKind::Server,
+            vec![
+                telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
+                telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_SEMANTIC),
+            ],
+        );
+        let t = Instant::now();
+        let result = self
+            .semantic_search_inner(caller_tenant, req, k, embedder.as_ref(), vector.as_ref())
+            .await;
+        match &result {
+            Ok(hits) => {
+                span.set_status(Status::Ok);
+                self.instruments
+                    .candidate_set_size(telemetry::RETRIEVAL_OP_SEMANTIC, hits.len() as u64);
+            }
+            Err(_) => span.set_status(Status::Error {
+                description: "semantic search failed".into(),
+            }),
+        }
+        let outcome = if result.is_ok() {
+            telemetry::OUTCOME_SUCCESS
+        } else {
+            telemetry::OUTCOME_ERROR
+        };
+        self.instruments.retrieve_duration(
+            telemetry::RETRIEVAL_OP_SEMANTIC,
+            outcome,
+            t.elapsed().as_secs_f64(),
+        );
+        span.end();
+        result
+    }
+
+    async fn semantic_search_inner(
+        &self,
+        caller_tenant: &str,
+        req: &SearchRequest,
+        k: usize,
+        embedder: &dyn Embedder,
+        vector: &dyn VectorIndex,
+    ) -> Result<Vec<SemanticHit>, QueryError> {
+        // Step 1 — scope → candidate id set (§7.4). A finer scope runs a keyed
+        // fetch to bound the candidate ids; an empty scope is the whole tenant
+        // floor (CandidateSet::All). Either way the tenant floor is enforced by
+        // `vector.search`, which is the hard boundary.
+        // An empty scope is the whole tenant floor (CandidateSet::All, R6 — so
+        // `unkeyed` facts stay reachable). `as_of` is NOT dropped here: it is
+        // honored on the All path by the vector tier's `ingested_at <= as_of`
+        // filter below, so an unscoped `as_of` search is temporally bounded
+        // (ISI-6172 / CR ISI-6168 B1), not a silent newer-than-as_of read.
+        let candidates = if req.scope.is_empty() {
+            CandidateSet::All
+        } else {
+            let kq = KeyedQuery {
+                keys: req.scope.clone(),
+                fact_type: req.fact_type,
+                as_of: req.as_of,
+                valid: Validity::All, // scope is a candidate filter, not a read
+                limit: KeyedQuery::MAX_LIMIT,
+            };
+            let rows = self.store.fetch_by_keys(caller_tenant, &kq).await?;
+            CandidateSet::Only(rows.into_iter().map(|r| r.id).collect())
+        };
+
+        // Step 2 — embed the query and ANN-rank the fact tier.
+        let qvec = embedder
+            .embed(&req.query)
+            .await
+            .map_err(|e| QueryError::Semantic(e.to_string()))?;
+        let scored = vector
+            .search(caller_tenant, &candidates, &qvec, k, req.as_of)
+            .await
+            .map_err(|e| QueryError::Semantic(e.to_string()))?;
+
+        // A semantic hit must carry actual signal: drop non-positive cosine
+        // similarities (`<= 0` = orthogonal or anti-correlated — no shared
+        // direction, not a match). ANN backends return the k nearest rows
+        // regardless of similarity, so without this filter a zero-signal fact
+        // surfaces as a hit and, worse, earns undeserved RRF credit in
+        // `fused_search` — which let a single-path keyed fact tie out a genuine
+        // cross-path agreement (ISI-6079 / CR ISI-6168 DB suite). Score is
+        // cosine similarity on both backends (MemVectorIndex and PgVectorIndex's
+        // `1 - (embedding <=> q)`), so the predicate is backend-agnostic.
+        let scored: Vec<_> = scored.into_iter().filter(|s| s.score > 0.0).collect();
+
+        // Step 4 — hydrate authoritative records (R1 resolve-to-ground-truth),
+        // preserving ANN rank order. A vanished fact (retention sweep racing
+        // the index) is skipped, not an error.
+        let mut hits = Vec::with_capacity(scored.len());
+        for s in scored {
+            if let Some(record) = self.store.get_fact(caller_tenant, s.fact_id).await? {
+                hits.push(SemanticHit {
+                    record,
+                    score: s.score as f64,
+                    via: vec![FusionSource::SemanticFact],
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Fused retrieval (§7.4 step 3): run the keyed path, the graph-traverse
+    /// path, and the semantic path, fuse their ranked id lists with RRF, and
+    /// hydrate the top-`k` in fused order. A fact that several paths agree on
+    /// ranks highest — the "keyed + traverse + semantic agree" signal. `keyed`,
+    /// `traverse`, and `semantic` are each optional; whichever are present
+    /// participate. The graph path is skipped when no projection is configured,
+    /// and a start node outside the tenant floor (`not_found`) contributes an
+    /// empty list rather than failing the fused read; the semantic path is
+    /// skipped (not an error) when the module is off — so a keyed-only
+    /// deployment still gets a coherent single-path result.
+    pub async fn fused_search(
+        &self,
+        caller_tenant: &str,
+        keyed: Option<&KeyedQuery>,
+        traverse: Option<&TraverseReq>,
+        semantic: Option<&SearchRequest>,
+        k: usize,
+    ) -> Result<Vec<SemanticHit>, QueryError> {
+        let k = k.clamp(1, SearchRequest::MAX_K);
+        let mut lists: Vec<RankedList> = Vec::new();
+        // Carry hydrated records + per-path score so the fused output needs no
+        // second FactStore pass for keyed hits.
+        let mut records: std::collections::HashMap<uuid::Uuid, FactRecord> =
+            std::collections::HashMap::new();
+
+        if let Some(kq) = keyed {
+            let rows = self.fetch_by_keys(caller_tenant, kq).await?;
+            lists.push(RankedList::new(
+                FusionSource::Keyed,
+                rows.iter().map(|r| r.id).collect(),
+            ));
+            for r in rows {
+                records.entry(r.id).or_insert(r);
+            }
+        }
+        if let Some(treq) = traverse {
+            if self.graph.is_some() {
+                match self.traverse(caller_tenant, treq).await {
+                    Ok(result) => {
+                        // Fact nodes in BFS order are the graph path's ranked
+                        // list; non-fact nodes (entity/a2a) carry no body to
+                        // hydrate and don't participate as hits.
+                        let ids: Vec<uuid::Uuid> = result
+                            .nodes
+                            .iter()
+                            .filter(|n| n.kind == crate::graph::NodeKind::Fact)
+                            .filter_map(|n| crate::graph::parse_node_id(&n.id))
+                            .filter_map(|(_, _, local)| uuid::Uuid::parse_str(&local).ok())
+                            .collect();
+                        lists.push(RankedList::new(FusionSource::Graph, ids));
+                        // Opportunistically carry any hydrated records.
+                        for n in result.nodes {
+                            if let Some(rec) = n.record {
+                                records.entry(rec.id).or_insert(rec);
+                            }
+                        }
+                    }
+                    // A start node outside the tenant floor is `not_found`
+                    // (§3.3) — the graph path contributes nothing, never an
+                    // error that would sink the whole fused read.
+                    Err(GraphError::NotFound) => {}
+                    Err(GraphError::Invalid(reason)) => {
+                        return Err(QueryError::Invalid {
+                            reason: reason.to_string(),
+                        })
+                    }
+                    Err(e) => return Err(QueryError::Semantic(e.to_string())),
+                }
+            }
+        }
+        if let Some(sreq) = semantic {
+            if self.semantic_enabled() {
+                let hits = self.semantic_search(caller_tenant, sreq).await?;
+                lists.push(RankedList::new(
+                    FusionSource::SemanticFact,
+                    hits.iter().map(|h| h.record.id).collect(),
+                ));
+                for h in hits {
+                    records.entry(h.record.id).or_insert(h.record);
+                }
+            }
+        }
+
+        let fused: Vec<FusedHit> = rrf_fuse(&lists);
+        let mut out = Vec::with_capacity(fused.len().min(k));
+        for f in fused.into_iter().take(k) {
+            let record = match records.get(&f.fact_id) {
+                Some(r) => r.clone(),
+                // Produced by a path that didn't hydrate it (defensive; both
+                // current paths hydrate). Resolve from the store (R1).
+                None => match self.store.get_fact(caller_tenant, f.fact_id).await? {
+                    Some(r) => r,
+                    None => continue,
+                },
+            };
+            out.push(SemanticHit {
+                record,
+                score: f.score,
+                via: f.sources,
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// Bounded reason enum for the `memkeys.write.rejected` key event
 /// (signal-catalog logs.key_events "with reason enum"). The free-text
 /// rejection reason is caller response data — only this bounded code is
@@ -619,5 +971,204 @@ mod tests {
         };
         assert_eq!(q.valid, Validity::Current);
         assert_eq!(q.limit, 100);
+    }
+
+    // --- M5 semantic / fusion ---------------------------------------------
+
+    use crate::memstore::MemStore;
+    use crate::model::EntityKeys;
+    use crate::semantic::{Embedder, FactVector, HashEmbedder, MemVectorIndex};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn pf(n: u128, tenant: &str, run: &str, body: &str) -> ProcessedFact {
+        ProcessedFact {
+            id: Uuid::from_u128(n),
+            tenant_id: tenant.into(),
+            fact_type: FactType::Decision,
+            subject: Some("db".into()),
+            body: body.into(),
+            body_hash: format!("h{n}"),
+            confidence: None,
+            supersedes: None,
+            event_time: Utc::now(),
+            ingested_at: Utc::now(),
+            entity: EntityKeys {
+                run: Some(run.into()),
+                ..Default::default()
+            },
+            keyed: true,
+            provenance_principal: "agent-a".into(),
+            provenance_source_kind: "gateway_flush".into(),
+            provenance_trace_id: None,
+            rejected_hints: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+        }
+    }
+
+    /// Commit a fact to the store AND project its vector (simulates the
+    /// stage-5b worker having run; the worker itself is wired in M5 part 2).
+    async fn seed(
+        store: &MemStore,
+        index: &MemVectorIndex,
+        embedder: &HashEmbedder,
+        f: &ProcessedFact,
+    ) {
+        store.commit_fact(f).await.unwrap();
+        index
+            .upsert(&FactVector {
+                fact_id: f.id,
+                tenant_id: f.tenant_id.clone(),
+                embedding: embedder.embed(&f.body).await.unwrap(),
+                fact_type: f.fact_type.as_str().into(),
+                entity: f.entity.clone(),
+                ingested_at: f.ingested_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_search_disabled_returns_feature_disabled() {
+        let svc = MemKeysService::new(Arc::new(MemStore::new()));
+        let req = SearchRequest {
+            query: "postgres".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let err = svc.semantic_search("t", &req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            QueryError::FeatureDisabled {
+                feature: "memory.semantic"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn semantic_search_ranks_relevant_fact_first_and_hydrates() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(1, "t", "r", "chose postgres for the durable fact store"),
+        )
+        .await;
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(
+                2,
+                "t",
+                "r",
+                "the react frontend component library was updated",
+            ),
+        )
+        .await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let req = SearchRequest {
+            query: "postgres database durability".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc.semantic_search("t", &req).await.unwrap();
+        assert!(!hits.is_empty());
+        // R1: the hit carries the authoritative body hydrated from the store.
+        assert_eq!(hits[0].record.id, Uuid::from_u128(1));
+        assert!(hits[0].record.body.contains("postgres"));
+        assert_eq!(hits[0].via, vec![FusionSource::SemanticFact]);
+    }
+
+    #[tokio::test]
+    async fn fused_search_combines_keyed_and_semantic() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(1, "t", "r", "chose postgres for the durable fact store"),
+        )
+        .await;
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(2, "t", "r", "a different decision about caching"),
+        )
+        .await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let keyed = KeyedQuery {
+            keys: vec![(EntityKey::Run, "r".into())],
+            fact_type: None,
+            as_of: None,
+            valid: Validity::All,
+            limit: KeyedQuery::DEFAULT_LIMIT,
+        };
+        let sem = SearchRequest {
+            query: "postgres database durability".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc
+            .fused_search("t", Some(&keyed), None, Some(&sem), 10)
+            .await
+            .unwrap();
+        // Both facts are keyed on run=r; fact 1 is also the top semantic hit, so
+        // cross-path agreement puts it first, surfaced via both paths.
+        assert_eq!(hits[0].record.id, Uuid::from_u128(1));
+        assert!(hits[0].via.contains(&FusionSource::Keyed));
+        assert!(hits[0].via.contains(&FusionSource::SemanticFact));
+        assert_eq!(hits.len(), 2, "deduped across the two paths");
+    }
+
+    #[tokio::test]
+    async fn semantic_search_drops_zero_similarity_hits() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+        // f1 shares tokens with the query; f2 is orthogonal (cosine 0.0 under
+        // HashEmbedder — verified: no shared tokens, no hash collision).
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(1, "t", "r", "chose postgres for the durable fact store"),
+        )
+        .await;
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(2, "t", "r", "the standup meeting was moved to Tuesday"),
+        )
+        .await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let req = SearchRequest {
+            query: "postgres database durability".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc.semantic_search("t", &req).await.unwrap();
+        // The orthogonal fact must NOT surface — a zero-signal hit would earn
+        // undeserved RRF credit in fused_search (ISI-6079 regression guard).
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, Uuid::from_u128(1));
     }
 }

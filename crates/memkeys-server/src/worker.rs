@@ -191,7 +191,8 @@ impl GraphProjectionWorker {
         *n += 1;
         let v = *n;
         drop(p);
-        self.instruments.poison_queue_depth(v);
+        self.instruments
+            .poison_queue_depth(telemetry::WORKER_KIND_GRAPH_PROJECTION, v);
     }
 }
 
@@ -272,4 +273,242 @@ impl From<FactRow> for ProcessedFact {
             attachments: serde_json::Value::Array(Vec::new()),
         }
     }
+}
+
+// ===========================================================================
+// Stage 5b — the vector-projection worker (§6 stage 5b; M5, ISI-6079/ISI-6167).
+// ===========================================================================
+//
+// Mirrors [`GraphProjectionWorker`]: a bounded in-process queue, enqueued by
+// the service AFTER the stage-4 ack (OFF the ack path — §6/R2: a projection
+// failure never blocks stages 1-4), gated on `memory.semantic`. Unlike the
+// graph worker it reads the fact BODY (to embed it) — but only the embedding +
+// keys are ever written to the index (§5.4.2 R1: the body stays in the SoT).
+// Idempotent (upsert on fact_id) with a [`VectorProjectionWorker::catch_up`]
+// SoT scan that closes holes (lost queue items, disabled→re-enabled, drift).
+//
+// OTel (WS-7): each apply is its own trace root `memkeys.worker.process`
+// (CONSUMER) LINKED to the commit span, recording `memkeys.projection.lag` and
+// the `memkeys.worker.queue.depth` / `memkeys.poison.queue.depth` gauges under
+// `WORKER_KIND_VECTOR_PROJECTION` / `PROJECTION_KIND_VECTOR`.
+
+use crate::semantic::{Embedder, FactVector, VectorError, VectorIndex};
+use opentelemetry::trace::Status;
+use sqlx::PgPool;
+
+/// The stage-5b worker. Clone-safe handle (the queue/index are shared).
+#[derive(Clone)]
+pub struct VectorProjectionWorker {
+    pool: PgPool,
+    embedder: Arc<dyn Embedder>,
+    index: Arc<dyn VectorIndex>,
+    queue: Arc<Mutex<VecDeque<WorkItem>>>,
+    notify: Arc<tokio::sync::Notify>,
+    instruments: Arc<Instruments>,
+    poison: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+}
+
+impl std::fmt::Debug for VectorProjectionWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorProjectionWorker").finish()
+    }
+}
+
+impl VectorProjectionWorker {
+    pub fn new(pool: PgPool, embedder: Arc<dyn Embedder>, index: Arc<dyn VectorIndex>) -> Self {
+        Self {
+            pool,
+            embedder,
+            index,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            instruments: Arc::new(Instruments::new()),
+            poison: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Enqueue one committed fact (called by the service AFTER the stage-4 ack
+    /// decision — never on the ack path itself).
+    pub fn enqueue(&self, tenant: &str, fact_id: Uuid, commit_span: Option<SpanContext>) {
+        let mut q = self.queue.lock().expect("vector queue lock");
+        q.push_back(WorkItem {
+            tenant: tenant.to_string(),
+            fact_id,
+            commit_span,
+        });
+        let depth = q.len();
+        drop(q);
+        self.instruments
+            .worker_queue_depth(telemetry::WORKER_KIND_VECTOR_PROJECTION, depth);
+        self.notify.notify_one();
+    }
+
+    /// Apply every queued item now (tests + the binary's periodic pass). One
+    /// retry round for transient failures; a second failure dead-letters.
+    pub async fn drain(&self) -> usize {
+        let mut applied = 0usize;
+        let mut retries: Vec<WorkItem> = Vec::new();
+        loop {
+            let item = { self.queue.lock().expect("vector queue lock").pop_front() };
+            let Some(item) = item else { break };
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(_) => retries.push(item),
+            }
+        }
+        let mut poison_now: Vec<WorkItem> = Vec::new();
+        for item in retries {
+            if self.apply(&item).await.is_err() {
+                poison_now.push(item);
+            } else {
+                applied += 1;
+            }
+        }
+        for item in poison_now {
+            self.dead_letter(&item);
+        }
+        self.instruments
+            .worker_queue_depth(telemetry::WORKER_KIND_VECTOR_PROJECTION, 0);
+        applied
+    }
+
+    /// SoT convergence scan: committed facts with no row in `fact_vectors` yet
+    /// (holes — lost queue items, module just-enabled, drift). The projection is
+    /// built FROM the FactStore, same contract as the graph worker's catch_up.
+    pub async fn catch_up(&self, tenant: &str) -> Result<usize, VectorError> {
+        let ids: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT f.id FROM facts f \
+             LEFT JOIN fact_vectors v ON v.fact_id = f.id AND v.tenant_id = f.tenant_id \
+             WHERE f.tenant_id = $1 AND v.fact_id IS NULL ORDER BY f.ingested_at, f.id",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| VectorError::Backend(e.to_string()))?;
+        let n = ids.len();
+        for (id,) in ids {
+            if let Some(row) = self.fetch_fact_body(tenant, id).await? {
+                self.apply_fact(&row, None).await?;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn apply(&self, item: &WorkItem) -> Result<(), VectorError> {
+        let Some(row) = self.fetch_fact_body(&item.tenant, item.fact_id).await? else {
+            // The fact vanished (retention sweep racing the queue): nothing to
+            // project — not an error, not a poison item.
+            return Ok(());
+        };
+        self.apply_fact(&row, item.commit_span.as_ref()).await
+    }
+
+    async fn apply_fact(
+        &self,
+        row: &FactBodyRow,
+        commit_span: Option<&SpanContext>,
+    ) -> Result<(), VectorError> {
+        let mut span = telemetry::start_span_with_links(
+            "memkeys.worker.process",
+            SpanKind::Consumer,
+            vec![
+                telemetry::attr("memkeys.tenant.id", row.tenant_id.clone()),
+                telemetry::attr(
+                    "memkeys.worker.kind",
+                    telemetry::WORKER_KIND_VECTOR_PROJECTION,
+                ),
+                telemetry::attr("memkeys.projection.kind", telemetry::PROJECTION_KIND_VECTOR),
+            ],
+            commit_span,
+        );
+        let outcome = self.embed_and_upsert(row).await;
+        match &outcome {
+            Ok(()) => {
+                span.set_status(Status::Ok);
+                self.instruments.projection_lag(
+                    telemetry::PROJECTION_KIND_VECTOR,
+                    lag_seconds(row.ingested_at),
+                );
+            }
+            Err(e) => span.set_status(Status::Error {
+                description: e.to_string().into(),
+            }),
+        }
+        span.end();
+        outcome
+    }
+
+    async fn embed_and_upsert(&self, row: &FactBodyRow) -> Result<(), VectorError> {
+        let embedding = self
+            .embedder
+            .embed(&row.body)
+            .await
+            .map_err(|e| VectorError::Backend(e.to_string()))?;
+        self.index
+            .upsert(&FactVector {
+                fact_id: row.id,
+                tenant_id: row.tenant_id.clone(),
+                embedding,
+                fact_type: row.fact_type.clone(),
+                entity: crate::model::EntityKeys {
+                    project: row.entity_project.clone(),
+                    issue: row.entity_issue.clone(),
+                    pr: row.entity_pr.clone(),
+                    agent: row.entity_agent.clone(),
+                    run: row.entity_run.clone(),
+                    thread: row.entity_thread.clone(),
+                    service: row.entity_service.clone(),
+                    counterpart_agent: row.counterpart_agent.clone(),
+                },
+                ingested_at: row.ingested_at,
+            })
+            .await
+    }
+
+    async fn fetch_fact_body(
+        &self,
+        tenant: &str,
+        fact_id: Uuid,
+    ) -> Result<Option<FactBodyRow>, VectorError> {
+        sqlx::query_as::<_, FactBodyRow>(
+            "SELECT id, tenant_id, body, fact_type, ingested_at, entity_project, entity_issue, \
+             entity_pr, entity_agent, entity_run, entity_thread, entity_service, counterpart_agent \
+             FROM facts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| VectorError::Backend(e.to_string()))
+    }
+
+    fn dead_letter(&self, item: &WorkItem) {
+        let mut p = self.poison.lock().expect("poison lock");
+        let n = p.entry(item.tenant.clone()).or_insert(0);
+        *n += 1;
+        let v = *n;
+        drop(p);
+        self.instruments
+            .poison_queue_depth(telemetry::WORKER_KIND_VECTOR_PROJECTION, v);
+    }
+}
+
+/// The body-bearing fact row the stage-5b worker embeds (the ONE place body
+/// text is read for the vector tier; it never leaves this worker — only the
+/// embedding + keys reach the index, §5.4.2 R1).
+#[derive(Debug, sqlx::FromRow)]
+struct FactBodyRow {
+    id: Uuid,
+    tenant_id: String,
+    body: String,
+    fact_type: String,
+    ingested_at: DateTime<Utc>,
+    entity_project: Option<String>,
+    entity_issue: Option<String>,
+    entity_pr: Option<String>,
+    entity_agent: Option<String>,
+    entity_run: Option<String>,
+    entity_thread: Option<String>,
+    entity_service: Option<String>,
+    counterpart_agent: Option<String>,
 }

@@ -4,7 +4,8 @@
 //!   memory_store    → service.ingest()
 //!   memory_fetch    → service.fetch_by_keys()
 //!   memory_traverse → service.traverse()
-//!   memory_search   → 501 graceful (semantic search not in M3)
+//!   memory_search   → service.semantic_search() (op-4, §7.4; feature_disabled
+//!                     → isError when memory.semantic is off)
 //!
 //! The tenant is NOT supplied by the caller (ISI-6148, closes ISI-6134 S1).
 //! A single [`Principal`] is bound once at launch from the run token (WS-5
@@ -33,8 +34,8 @@ use crate::graph::{
     Direction, EdgeType, GraphError, NodeRef, TraverseReq, DEFAULT_DEADLINE, DEFAULT_FANOUT_CAP,
     DEFAULT_NODE_BUDGET,
 };
-use crate::model::{EntityKey, KeyedQuery, Validity};
-use crate::service::MemKeysService;
+use crate::model::{EntityKey, FactType, KeyedQuery, Validity};
+use crate::service::{MemKeysService, SearchRequest, SemanticHit};
 use crate::telemetry::{self, TRANSPORT_STDIO};
 use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, Status, TraceContextExt};
@@ -157,12 +158,30 @@ fn tool_list() -> Value {
             },
             {
                 "name": "memory_search",
-                "description": "Semantic search (not available in M3 — returns feature_disabled).",
+                "description": "Semantic search over the fact-vector tier (op-4, §7.4). The tenant floor is the launch-bound principal's (§2.1) — never a tool argument. Returns feature_disabled when memory.semantic is off.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["query"],
                     "properties": {
-                        "query": {"type": "string"}
+                        "query": {"type": "string"},
+                        "scope": {
+                            "type": "object",
+                            "description": "Finer entity.*/fact.type filters ANDed within the tenant floor (§7.4).",
+                            "properties": {
+                                "entity.project": {"type": "string"},
+                                "entity.issue": {"type": "string"},
+                                "entity.pr": {"type": "string"},
+                                "entity.agent": {"type": "string"},
+                                "entity.run": {"type": "string"},
+                                "entity.thread": {"type": "string"},
+                                "entity.service": {"type": "string"},
+                                "fact.type": {"type": "string", "enum": ["decision","outcome","observation","learning","context"]},
+                                "category": {"type": "string"}
+                            }
+                        },
+                        "k": {"type": "integer", "default": 10},
+                        "tiers": {"type": "string", "enum": ["auto","fact","digest"], "default": "auto"},
+                        "as_of": {"type": "string", "description": "RFC3339 point-in-time scoping (§7.4)"}
                     }
                 }
             }
@@ -185,14 +204,10 @@ async fn dispatch_tool(
         "memory_store" => tool_store(service, principal, admission, args).await,
         "memory_fetch" => tool_fetch(service, principal, args).await,
         "memory_traverse" => tool_traverse(service, principal, admission, args).await,
-        // M3 scope: semantic search is not available. Return `Err` so the
-        // `tools/call` reply carries `isError: true`, matching the HTTP 501
-        // (ISI-6134 M2) — an Ok body with an inline `error` field reads as a
-        // successful call to an MCP client.
-        "memory_search" => Err(WireError::new(
-            ErrorCode::FeatureDisabled,
-            "semantic_search is not available in M3 (parity with HTTP 501 on POST /memory/search)",
-        )),
+        // Op-4 semantic search (§7.4). When `memory.semantic` is off the service
+        // returns `feature_disabled`, which maps to an `Err` so the `tools/call`
+        // reply carries `isError: true` (parity with HTTP 501, ISI-6134 M2).
+        "memory_search" => tool_search(service, principal, args).await,
         other => Err(WireError::new(
             ErrorCode::InvalidArgument,
             format!("unknown tool: {other}"),
@@ -392,6 +407,124 @@ async fn tool_traverse(
         Err(e) => Err(WireError::new(
             ErrorCode::BackendUnavailable,
             format!("store error: {e}"),
+        )),
+    }
+}
+
+async fn tool_search(
+    service: &MemKeysService,
+    principal: &Principal,
+    args: Value,
+) -> Result<Value, WireError> {
+    let tenant_id = principal.tenant_id.clone();
+
+    let query = args["query"]
+        .as_str()
+        .ok_or_else(|| WireError::new(ErrorCode::InvalidArgument, "query is required"))?
+        .to_string();
+
+    // §7.4 `scope` is a nested object of `entity.*` + `fact.type` (+ `category`,
+    // an M6 facet reserved for later). Unknown scope keys are rejected.
+    const KEY_MAP: &[(&str, EntityKey)] = &[
+        ("entity.project", EntityKey::Project),
+        ("entity.issue", EntityKey::Issue),
+        ("entity.pr", EntityKey::Pr),
+        ("entity.agent", EntityKey::Agent),
+        ("entity.run", EntityKey::Run),
+        ("entity.thread", EntityKey::Thread),
+        ("entity.service", EntityKey::Service),
+    ];
+    let mut scope: Vec<(EntityKey, String)> = Vec::new();
+    let mut fact_type: Option<FactType> = None;
+    if let Some(obj) = args["scope"].as_object() {
+        for (k, v) in obj {
+            // A non-string scope value is rejected, never silently skipped: HTTP
+            // types `scope` as a string→string map and rejects these, so a
+            // dropped value here would silently WIDEN the within-tenant result
+            // set (the narrowing filter vanishes) with no caller signal. Reject
+            // for transport parity (ISI-6172 NB2 / CR ISI-6168).
+            let Some(val) = v.as_str() else {
+                return Err(WireError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("scope value for '{k}' must be a string"),
+                ));
+            };
+            if let Some((_, ek)) = KEY_MAP.iter().find(|(name, _)| name == k) {
+                scope.push((*ek, val.to_string()));
+            } else if k == "fact.type" || k == "type" {
+                fact_type = Some(
+                    serde_json::from_value(Value::String(val.to_string())).map_err(|_| {
+                        WireError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unknown fact.type: {val}"),
+                        )
+                    })?,
+                );
+            } else if k == "category" {
+                continue; // D4 facet — M6 surface, accept-but-unenforced.
+            } else {
+                return Err(WireError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown scope key: {k}"),
+                ));
+            }
+        }
+    }
+
+    let as_of = match args["as_of"].as_str() {
+        Some(ts) => Some(
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .map_err(|_| {
+                    WireError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("as_of must be RFC3339: {ts}"),
+                    )
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let k = args["k"]
+        .as_u64()
+        .map(|k| k as usize)
+        .unwrap_or(SearchRequest::DEFAULT_K);
+    // `tiers=digest` degrades to the fact tier with a warning (parity with the
+    // HTTP warning header, §7.4) — never a 501.
+    let digest_requested = args["tiers"].as_str() == Some("digest");
+
+    let req = SearchRequest {
+        query,
+        scope,
+        fact_type,
+        k,
+        as_of,
+    };
+
+    match service.semantic_search(&tenant_id, &req).await {
+        Ok(hits) => {
+            let mut body = serde_json::json!({
+                "hits": hits.iter().map(SemanticHit::to_wire_json).collect::<Vec<_>>(),
+            });
+            if digest_requested {
+                body["warnings"] = serde_json::json!([
+                    "digest tier unavailable (memory.semantic.digest off); served fact tier"
+                ]);
+            }
+            Ok(body)
+        }
+        // §7.4: semantic module off → `feature_disabled` (→ isError:true,
+        // parity with HTTP 501), never a silent empty result.
+        Err(QueryError::FeatureDisabled { feature }) => Err(WireError::new(
+            ErrorCode::FeatureDisabled,
+            format!("semantic module disabled: {feature}"),
+        )),
+        Err(QueryError::Invalid { reason }) => Err(WireError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid query: {reason}"),
+        )),
+        Err(e) => Err(WireError::new(
+            ErrorCode::BackendUnavailable,
+            format!("semantic search error: {e}"),
         )),
     }
 }
@@ -671,5 +804,45 @@ mod tests {
         assert!(result.get("isError").is_none(), "should succeed: {result}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("facts"), "got: {text}");
+    }
+
+    fn service_semantic() -> Arc<MemKeysService> {
+        use crate::semantic::{HashEmbedder, MemVectorIndex};
+        Arc::new(
+            MemKeysService::new(Arc::new(MemStore::new())).with_semantic(
+                Arc::new(HashEmbedder::new()),
+                Arc::new(MemVectorIndex::new()),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn search_feature_disabled_is_iserror_when_module_off() {
+        let svc = service();
+        // No semantic module → op-4 is `feature_disabled`, surfaced as an
+        // errored tool call (isError:true), parity with the HTTP 501 (§7.4).
+        let req = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"postgres"}}}"#;
+        let resp = handle_line(&svc, &*verifier("t", i64::MAX), &admission(), req)
+            .await
+            .expect("a request gets a reply");
+        let result = resp.result.expect("errored tool call is an Ok reply");
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("feature_disabled"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn search_runs_when_module_on() {
+        let svc = service_semantic();
+        // Module on, empty index → a successful `{hits:[]}` reply (proof op-4 is
+        // wired, not the old 501 stub). Tenant floor comes from the principal.
+        let req = r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"postgres","k":5}}}"#;
+        let resp = handle_line(&svc, &*verifier("tenant-a", i64::MAX), &admission(), req)
+            .await
+            .expect("a request gets a reply");
+        let result = resp.result.expect("ok reply");
+        assert!(result.get("isError").is_none(), "should succeed: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hits"), "got: {text}");
     }
 }

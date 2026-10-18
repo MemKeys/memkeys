@@ -8,7 +8,7 @@
 #   - cardinality: every attribute listed here MUST be a bounded enum or an opaque bounded id.
 #   - PII boundary: see `deny_list` below — enforced in the SDK helper AND the collector.
 
-catalog_version: "0.2.0"   # 0.2.0: + graph promotion-gate signals (ADR-GRAPH §10 rev-4 R10; ISI-5911 fold of the ISI-5915/ISI-5907-ratified realization)
+catalog_version: "0.3.0"   # 0.3.0: + M5 vector/semantic (ISI-6079/ISI-6169): projection.kind=vector, worker.kind=vector_projection, feature_disabled retrieval outcome, memkeys.fusion.sources. 0.2.0: + graph promotion-gate signals (ADR-GRAPH §10 rev-4 R10; ISI-5911 fold of the ISI-5915/ISI-5907-ratified realization)
 schema_url: "https://opentelemetry.io/schemas/1.30.0"   # pinned; tracked in semconv-pins.yaml
 
 # ---------------------------------------------------------------------------
@@ -52,13 +52,42 @@ attributes:
     values: [keyed, graph, semantic]
   memkeys.projection.kind:
     type: enum
-    values: [graph, summary, embedding, category]
+    values: [graph, summary, vector, category]
+    desc: >
+      The derived-view tier a worker/lag signal belongs to. `vector` is the ANN/semantic
+      index tier (M5, ISI-6079 — telemetry.rs PROJECTION_KIND_VECTOR); it replaces the
+      pre-M5 placeholder name `embedding` for this tier (one name per tier — no dual emit).
+      `summary`/`category` remain future WS-3 LLM-derived views.
   memkeys.worker.kind:
     type: enum
-    values: [graph_projection, summarization, embedding, categorization]
+    values: [graph_projection, summarization, vector_projection, categorization]
+    desc: >
+      Which derived-view worker a signal came from. `vector_projection` is the M5 stage-5b
+      vector-projection worker (ISI-6079/ISI-6167 — telemetry.rs WORKER_KIND_VECTOR_PROJECTION)
+      that embeds committed facts and maintains the ANN index; it replaces the pre-M5
+      placeholder `embedding`. Any gen_ai embedding CALLS it makes carry worker.kind=vector_projection.
   memkeys.fusion.algorithm:
     type: enum
     values: [rrf]
+  memkeys.fusion.sources:
+    type: enum
+    # Bounded: non-empty subset of {keyed, semantic, graph}, rendered as a sorted
+    # "+"-joined label (e.g. keyed, semantic, "keyed+semantic", "keyed+semantic+graph").
+    # Max 7 series — the path MIX of a fused read, so dashboards can split single-path
+    # from true multi-path (agreement) retrieval. NEVER carries result content.
+    values: [keyed, semantic, graph, keyed+semantic, keyed+graph, semantic+graph, keyed+semantic+graph]
+    desc: >
+      Which retrieval paths participated in a fused read (M5, ISI-6169). Emitted on the
+      memkeys.rrf.fuse span and mirrored onto the memkeys.retrieve entry span for fused ops.
+  memkeys.retrieval.outcome:   # DOC alias — emitted via the shared `outcome` key; see note
+    type: enum
+    values: [success, error, feature_disabled]
+    desc: >
+      Retrieval-specific `outcome` values (carried on the shared `outcome` attribute key).
+      `feature_disabled` (M5, ISI-6169) marks an op-4 semantic request that arrived while
+      `memory.semantic` was off (→ HTTP 501 / MCP isError) — makes misconfiguration and
+      shadow-demand for the semantic tier visible instead of silently 501-ing before any
+      span/metric is recorded.
   memkeys.graph.depth:
     type: int
     values: [1, 2, 3, 4, 5]   # bounded by the server-side [1, MaxDepth=5] clamp — never emitted unclamped
@@ -126,8 +155,12 @@ spans:
     kind: SERVER
     domain: retrieval
     owner: WS-4
-    desc: Entry span for a retrieval request. One child CLIENT span per store touched + optional fusion.
-    attributes: [memkeys.tenant.id, memkeys.retrieval.op]
+    desc: >
+      Entry span for a retrieval request. One child CLIENT span per store touched + optional
+      fusion. For a fused read it also carries memkeys.fusion.sources (the path mix). Emitted
+      with outcome=feature_disabled (op=semantic) when the module is off (M5, ISI-6169) — the
+      service MUST record this span/metric BEFORE returning 501, not short-circuit silently.
+    attributes: [memkeys.tenant.id, memkeys.retrieval.op, memkeys.fusion.sources]   # fusion.sources on fused reads only
     children: [memkeys.store.query, memkeys.rrf.fuse]
 
   - name: memkeys.store.query
@@ -146,8 +179,13 @@ spans:
     kind: INTERNAL
     domain: retrieval
     owner: WS-4
-    desc: Reciprocal-rank fusion of multiple result lists (keyed + graph + semantic).
-    attributes: [memkeys.fusion.algorithm=rrf]
+    desc: >
+      Reciprocal-rank fusion of multiple result lists (keyed + graph + semantic). Carries the
+      path MIX (memkeys.fusion.sources) so single-path vs multi-path (agreement) fused reads
+      are separable. NOTE: `memkeys.fusion.algorithm` + `memkeys.fusion.sources` MUST be added
+      to the code attribute registry (telemetry.rs ALLOWED_ATTR_KEYS) when this span is wired —
+      today the span is spec-only and fused_search emits no fusion telemetry (ISI-6169 gap G2).
+    attributes: [memkeys.fusion.algorithm=rrf, memkeys.fusion.sources]
 
   # --- Async derived-view workers : own trace, LINKED to the triggering write ---
   - name: memkeys.worker.process
@@ -158,6 +196,11 @@ spans:
       A derived-view worker applying a committed fact to a projection. Runs as a new
       trace root; carries a SPAN LINK to the originating memkeys.commit span context
       (temporally decoupled — not a parent edge). On apply, records memkeys.projection.lag.
+      M5 (ISI-6167): the stage-5b vector-projection worker emits this with
+      worker.kind=vector_projection + projection.kind=vector. GAP (ISI-6169 G3):
+      Instruments::poison_queue_depth() currently hardcodes worker.kind=graph_projection and
+      takes no worker_kind arg — it MUST be parameterized so vector-worker poison depth is
+      attributable (see worker.queue.depth / poison coverage in the dashboard-alert plan).
     attributes: [memkeys.tenant.id, memkeys.worker.kind, memkeys.projection.kind]
     links: [originating memkeys.commit span context]
 
@@ -198,7 +241,13 @@ metrics:
   - name: memkeys.retrieve.duration
     instrument: histogram
     unit: s
-    desc: Retrieval latency per op (keyed/graph/semantic).
+    desc: >
+      Retrieval latency per op (keyed/graph/semantic). outcome ∈ {success, error,
+      feature_disabled}. M5 (ISI-6169): a disabled op-4 request records this with
+      op=semantic, outcome=feature_disabled BEFORE returning 501 — the per-outcome COUNT
+      is the feature_disabled rate (no separate metric; near-zero duration is expected and
+      ignored by the latency SLO, which filters outcome=success). Gap G1: today
+      semantic_search returns FeatureDisabled before any span/metric is emitted.
     attributes: [memkeys.retrieval.op, outcome]
 
   - name: memkeys.retrieve.candidate_set.size

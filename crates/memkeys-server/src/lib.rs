@@ -15,6 +15,7 @@
 
 pub mod admission;
 pub mod auth;
+pub mod embed;
 pub mod envelope;
 pub mod error;
 pub mod graph;
@@ -25,7 +26,9 @@ pub mod memstore;
 pub mod model;
 pub mod pg;
 pub mod pg_graph;
+pub mod pg_vector;
 pub mod pipeline;
+pub mod semantic;
 pub mod service;
 pub mod store;
 pub mod telemetry;
@@ -35,6 +38,7 @@ pub mod worker;
 
 pub use admission::{AdmissionConfig, AdmissionControl};
 pub use auth::{JwtVerifier, Principal, StaticVerifier, TokenVerifier};
+pub use embed::{from_env as embedder_from_env, HttpEmbedder};
 pub use envelope::{EntityHints, Envelope, FactBlock, SourceBlock, SourceKind};
 pub use error::{IngestError, QueryError};
 pub use graph::{
@@ -45,8 +49,13 @@ pub use graph::{
 pub use model::{EntityKey, EntityKeys, FactRecord, KeyedQuery, ProcessedFact, Validity};
 pub use pg::PgStore;
 pub use pg_graph::PgGraph;
+pub use pg_vector::PgVectorIndex;
 pub use pipeline::{CallerContext, EntityResolver, NoopResolver, RunBinding, ThreadBinding};
-pub use service::{IngestReceipt, MemKeysService};
+pub use semantic::{
+    cosine, rrf_fuse, CandidateSet, EmbedError, Embedder, FactVector, FusedHit, FusionSource,
+    HashEmbedder, MemVectorIndex, RankedList, ScoredId, VectorError, VectorIndex, K_RRF,
+};
+pub use service::{IngestReceipt, MemKeysService, SearchRequest, SemanticHit};
 pub use store::{CommitOutcome, FactStore};
 pub use wire::{ErrorCode, WireError};
-pub use worker::GraphProjectionWorker;
+pub use worker::{GraphProjectionWorker, VectorProjectionWorker};
