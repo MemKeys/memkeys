@@ -79,6 +79,7 @@ fn next_tenant() -> String {
 struct ScriptedGenerator {
     extract: Mutex<Option<serde_json::Value>>,
     categorize: Mutex<Option<serde_json::Value>>,
+    summarize: Mutex<Option<serde_json::Value>>,
     summarize_calls: AtomicUsize,
 }
 
@@ -93,6 +94,15 @@ impl ScriptedGenerator {
     fn with_categorize(v: serde_json::Value) -> Self {
         Self {
             categorize: Mutex::new(Some(v)),
+            ..Self::default()
+        }
+    }
+
+    /// Override the summarize output (e.g. an empty summary → POISON) to drive
+    /// the digest poison path (ISI-6192 B2).
+    fn with_summarize(v: serde_json::Value) -> Self {
+        Self {
+            summarize: Mutex::new(Some(v)),
             ..Self::default()
         }
     }
@@ -128,6 +138,9 @@ impl Generator for ScriptedGenerator {
                 .unwrap_or(serde_json::json!({ "labels": [] }))),
             GenTask::Summarize => {
                 self.summarize_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(v) = self.summarize.lock().expect("scripted lock").clone() {
+                    return Ok(v);
+                }
                 let members = input["member_facts"]
                     .as_array()
                     .map(|a| a.len())
@@ -473,7 +486,10 @@ async fn stage_5c_coalesces_a_burst_into_one_rollup_with_members_and_story() {
     let (version, members, summary, story) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("thread digest exists");
-    assert_eq!(version, 3, "scope_version = member count");
+    assert!(
+        version > 0,
+        "scope_version is the member-read wall-clock epoch"
+    );
     assert_eq!(members.len(), 3, "member_fact_ids carries every member");
     assert!(
         summary.contains("3 facts"),
@@ -502,7 +518,7 @@ async fn stage_5c_coalesces_a_burst_into_one_rollup_with_members_and_story() {
     let (run_v, run_members, _, _) = digest_row(&ctx, &tenant, "run", "run-1")
         .await
         .expect("run digest exists");
-    assert_eq!((run_v as usize, run_members.len()), (3, 3));
+    assert!(run_v > 0 && run_members.len() == 3);
 }
 
 #[tokio::test]
@@ -523,10 +539,11 @@ async fn stage_5c_rerolls_on_new_members_and_a_late_old_rollup_is_a_noop() {
     let (v1, m1, _, _) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("first rollup");
-    assert_eq!(v1, 1);
+    assert_eq!(m1.len(), 1);
+    assert!(v1 > 0, "scope_version is the member-read wall-clock epoch");
 
-    // A new member arrives → the next drain re-rolls the scope at the new
-    // version (monotonic; members = append-only count).
+    // A new member arrives → the next drain re-rolls the scope at a STRICTLY
+    // LATER version (monotonic read-time epoch; ISI-6192 B1) with more members.
     ingest(
         &ctx,
         &tenant,
@@ -539,15 +556,19 @@ async fn stage_5c_rerolls_on_new_members_and_a_late_old_rollup_is_a_noop() {
     let (v2, m2, _, _) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("second rollup");
-    assert_eq!((v2, m2.len()), (2, 2));
+    assert_eq!(m2.len(), 2);
+    assert!(v2 > v1, "a later rollup read a later snapshot: {v2} > {v1}");
     assert!(m2.len() > m1.len());
 
     // Late-rollup guard (ADR Decision 6): a stored rollup at a HIGHER
-    // scope_version makes an incoming older rollup a no-op. Simulate the
-    // future version, enqueue one more fact, drain: the incoming rollup
-    // (version 3) is <= the stored 999 → no overwrite.
-    sqlx::query("UPDATE digests SET scope_version = 999 WHERE tenant_id = $1 AND scope = 'thread' AND scope_id = 't-1'")
+    // scope_version makes an incoming older rollup a no-op. Simulate a
+    // far-future stored version (beyond any wall-clock epoch), enqueue one more
+    // fact, drain: the incoming rollup's now()-epoch is <= the stored future
+    // value → no overwrite.
+    let future = 9_000_000_000_000_000_000i64; // ~year 287396 in micros, < i64::MAX
+    sqlx::query("UPDATE digests SET scope_version = $2 WHERE tenant_id = $1 AND scope = 'thread' AND scope_id = 't-1'")
         .bind(&tenant)
+        .bind(future)
         .execute(&ctx.pool)
         .await
         .expect("bump stored version");
@@ -563,7 +584,7 @@ async fn stage_5c_rerolls_on_new_members_and_a_late_old_rollup_is_a_noop() {
     let (v3, m3, _, _) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("guarded rollup");
-    assert_eq!(v3, 999, "the older incoming rollup was a no-op");
+    assert_eq!(v3, future, "the older incoming rollup was a no-op");
     assert_eq!(
         m3.len(),
         2,
@@ -591,7 +612,8 @@ async fn stage_5c_catch_up_fills_missing_scope_rollups() {
     let (v, m, _, _) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("catch-up rollup exists");
-    assert_eq!((v as usize, m.len()), (1, 1));
+    assert!(v > 0, "scope_version is the member-read wall-clock epoch");
+    assert_eq!(m.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +761,7 @@ async fn derived_views_are_tenant_partitioned() {
     let (v, members, _, _) = digest_row(&ctx, &tenant_a, "thread", "t-a")
         .await
         .expect("digest");
-    assert_eq!(v, 1);
+    assert!(v > 0, "scope_version is the member-read wall-clock epoch");
     assert_eq!(
         members,
         vec![fact_a],
@@ -850,4 +872,156 @@ async fn workers_emit_catalog_spans_and_gen_ai_client_spans() {
     }
 
     provider.shutdown().expect("provider shutdown");
+}
+
+// ===========================================================================
+// ISI-6192 follow-up regressions (CR ISI-6190)
+// ===========================================================================
+
+/// B1: a NET member-count DECREASE (a retention sweep here; equivalently a
+/// supersession whose superseder leaves the scope) must still roll up. The old
+/// `scope_version = member count` wedged the `scope_version <= EXCLUDED` guard:
+/// a smaller count was rejected as "stale" and the digest froze on an outdated
+/// summary + superseded member_fact_ids. The monotonic read-time epoch fixes it.
+#[tokio::test]
+async fn stage_5c_member_count_decrease_still_rolls_up() {
+    let Some(ctx) = ctx(Arc::new(ScriptedGenerator::default())).await else {
+        return;
+    };
+    let tenant = next_tenant();
+    let a = ingest(&ctx, &tenant, "decrease fact A", "run-dec", Some("t-dec")).await;
+    let b = ingest(&ctx, &tenant, "decrease fact B", "run-dec", Some("t-dec")).await;
+    let c = ingest(&ctx, &tenant, "decrease fact C", "run-dec", Some("t-dec")).await;
+    ctx.digest.drain().await;
+
+    let (v1, m1, summary1, _) = digest_row(&ctx, &tenant, "thread", "t-dec")
+        .await
+        .expect("first rollup");
+    assert_eq!(m1.len(), 3);
+    assert!(summary1.contains("3 facts"), "summary at peak: {summary1}");
+
+    // Retention sweep removes A and B (no FKs reference facts); the live scope
+    // shrinks 3 → 1. Re-mark the scope dirty via the surviving member C (does
+    // NOT add a member) and drain.
+    sqlx::query("DELETE FROM facts WHERE tenant_id = $1 AND id = ANY($2)")
+        .bind(&tenant)
+        .bind(vec![a, b])
+        .execute(&ctx.pool)
+        .await
+        .expect("retention sweep");
+    ctx.digest.enqueue(&tenant, c, None);
+    ctx.digest.drain().await;
+
+    let (v2, m2, summary2, _) = digest_row(&ctx, &tenant, "thread", "t-dec")
+        .await
+        .expect("post-decrease rollup");
+    assert_eq!(
+        m2,
+        vec![c],
+        "the digest regenerated from the 1 surviving member"
+    );
+    assert!(
+        summary2.contains("1 facts"),
+        "summary reflects the smaller current scope: {summary2}"
+    );
+    assert!(
+        v2 > v1,
+        "the smaller rollup still won (monotonic read-time version): {v2} > {v1}"
+    );
+}
+
+/// B2: a deterministic poison (schema-invalid extract output) is durably
+/// quarantined — a `derivation_runs` stamp is written so `catch_up` SKIPS it
+/// instead of re-driving the generator every tick (real cost on HttpGenerator).
+#[tokio::test]
+async fn stage_5e_poison_is_quarantined_and_catch_up_skips_it() {
+    let garbage = serde_json::json!({ "proposed_keys": "not-an-array" });
+    let Some(ctx) = ctx(Arc::new(ScriptedGenerator::with_extract(garbage))).await else {
+        return;
+    };
+    let tenant = next_tenant();
+    let fact = ingest(
+        &ctx,
+        &tenant,
+        "a fact whose extraction poisons",
+        "run-1",
+        None,
+    )
+    .await;
+
+    ctx.extract.drain().await; // first sight of the deterministic poison → quarantine
+
+    assert!(derived_keys(&ctx, fact).await.is_empty());
+    let stamps: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_runs WHERE kind = 'llm_extract' AND ref_id = $1",
+    )
+    .bind(fact)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("stamp count");
+    assert_eq!(stamps.0, 1, "the poison fact carries a quarantine stamp");
+
+    // catch_up now treats the fact as processed-at-this-version → no re-drive.
+    let reaped = ctx.extract.catch_up(&tenant).await.expect("catch_up ok");
+    assert_eq!(reaped, 0, "the quarantined fact is not re-extracted");
+    assert!(derived_keys(&ctx, fact).await.is_empty());
+}
+
+/// B2: a poison SCOPE must not `?`-abort the digest `catch_up` backfill — at
+/// boot that propagates to `main()` and the server never starts. Every scope
+/// here poisons; `catch_up` must return Ok (collect-and-continue), quarantine
+/// each scope, and a second pass must SKIP them (no re-drive).
+#[tokio::test]
+async fn stage_5c_catch_up_survives_and_quarantines_poison_scopes() {
+    let gen = Arc::new(ScriptedGenerator::with_summarize(
+        serde_json::json!({ "summary": "" }), // empty summary → InvalidOutput poison
+    ));
+    let Some(ctx) = ctx(gen.clone()).await else {
+        return;
+    };
+    let tenant = next_tenant();
+    // Two threads sharing one run → scopes {t-1, t-2, run-1}: 3 poison scopes.
+    ingest(&ctx, &tenant, "poison scope fact one", "run-1", Some("t-1")).await;
+    ingest(&ctx, &tenant, "poison scope fact two", "run-1", Some("t-2")).await;
+
+    // catch_up reads scopes straight from the SoT (not the drained queue); every
+    // rollup poisons. It must NOT abort — Ok with 0 successful rollups.
+    let applied = ctx
+        .digest
+        .catch_up(&tenant)
+        .await
+        .expect("catch_up must not abort");
+    assert_eq!(applied, 0, "no scope rolled up (all poison)");
+    let after_first = gen.summarize_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        after_first, 3,
+        "all 3 scopes were attempted (collect-and-continue)"
+    );
+
+    let quarantined: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_runs WHERE kind = 'digest_rollup' AND tenant_id = $1",
+    )
+    .bind(&tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("stamp count");
+    assert_eq!(quarantined.0, 3, "each poison scope is durably quarantined");
+    assert!(
+        digest_row(&ctx, &tenant, "thread", "t-1").await.is_none(),
+        "no digest row for a poison scope"
+    );
+
+    // Second pass: all scopes quarantined at the current version → skipped, no
+    // further generator calls.
+    let applied2 = ctx
+        .digest
+        .catch_up(&tenant)
+        .await
+        .expect("second catch_up ok");
+    assert_eq!(applied2, 0);
+    assert_eq!(
+        gen.summarize_calls.load(Ordering::SeqCst),
+        after_first,
+        "quarantined scopes are not re-driven"
+    );
 }

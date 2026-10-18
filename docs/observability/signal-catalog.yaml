@@ -8,7 +8,7 @@
 #   - cardinality: every attribute listed here MUST be a bounded enum or an opaque bounded id.
 #   - PII boundary: see `deny_list` below — enforced in the SDK helper AND the collector.
 
-catalog_version: "0.3.0"   # 0.3.0: + M5 vector/semantic (ISI-6079/ISI-6169): projection.kind=vector, worker.kind=vector_projection, feature_disabled retrieval outcome, memkeys.fusion.sources. 0.2.0: + graph promotion-gate signals (ADR-GRAPH §10 rev-4 R10; ISI-5911 fold of the ISI-5915/ISI-5907-ratified realization)
+catalog_version: "0.4.0"   # 0.4.0: reconcile M6 LLM-pipeline enums with telemetry.rs (ISI-6080/ISI-6192 B3, same class as ISI-6169 for M5): projection.kind += derived_keys/digest/category_facets (digest/category_facets realize the reserved summary/category), worker.kind += llm_extract/digest_rollup/categorize (digest_rollup/categorize realize the reserved summarization/categorization). Code and catalog now agree — dashboards/alerts keyed on these bounded enums see all three M6 workers. 0.3.0: + M5 vector/semantic (ISI-6079/ISI-6169): projection.kind=vector, worker.kind=vector_projection, feature_disabled retrieval outcome, memkeys.fusion.sources. 0.2.0: + graph promotion-gate signals (ADR-GRAPH §10 rev-4 R10; ISI-5911 fold of the ISI-5915/ISI-5907-ratified realization)
 schema_url: "https://opentelemetry.io/schemas/1.30.0"   # pinned; tracked in semconv-pins.yaml
 
 # ---------------------------------------------------------------------------
@@ -52,20 +52,31 @@ attributes:
     values: [keyed, graph, semantic]
   memkeys.projection.kind:
     type: enum
-    values: [graph, summary, vector, category]
+    values: [graph, vector, derived_keys, digest, category_facets]
     desc: >
       The derived-view tier a worker/lag signal belongs to. `vector` is the ANN/semantic
       index tier (M5, ISI-6079 — telemetry.rs PROJECTION_KIND_VECTOR); it replaces the
       pre-M5 placeholder name `embedding` for this tier (one name per tier — no dual emit).
-      `summary`/`category` remain future WS-3 LLM-derived views.
+      The three M6 LLM-derived tiers (ISI-6080/ISI-6192 — telemetry.rs
+      PROJECTION_KIND_DERIVED_KEYS/_DIGEST/_CATEGORY_FACETS) are now LIVE and replace the
+      pre-M6 placeholders: `derived_keys` = stage-5e W-extract low-trust candidate keys (no
+      reserved slot existed before M6), `digest` = stage-5c W-digest summary/story tier (was
+      the reserved `summary`), `category_facets` = stage-5d W-categorize emergent labels (was
+      the reserved `category`). One name per tier — code and catalog agree (no dual emit).
   memkeys.worker.kind:
     type: enum
-    values: [graph_projection, summarization, vector_projection, categorization]
+    values: [graph_projection, vector_projection, llm_extract, digest_rollup, categorize]
     desc: >
       Which derived-view worker a signal came from. `vector_projection` is the M5 stage-5b
       vector-projection worker (ISI-6079/ISI-6167 — telemetry.rs WORKER_KIND_VECTOR_PROJECTION)
       that embeds committed facts and maintains the ANN index; it replaces the pre-M5
       placeholder `embedding`. Any gen_ai embedding CALLS it makes carry worker.kind=vector_projection.
+      The three M6 LLM-pipeline workers (ISI-6080/ISI-6192 — telemetry.rs
+      WORKER_KIND_LLM_EXTRACT/_DIGEST_ROLLUP/_CATEGORIZE) are now LIVE and replace the pre-M6
+      placeholders: `llm_extract` = stage-5e W-extract (no reserved slot existed before M6),
+      `digest_rollup` = stage-5c W-digest (was the reserved `summarization`), `categorize` =
+      stage-5d W-categorize (was the reserved `categorization`). Each worker's queue/poison/lag
+      gauges carry these values — dashboards keyed on this enum MUST use them.
   memkeys.fusion.algorithm:
     type: enum
     values: [rrf]
