@@ -158,15 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         report.tenant
                     );
                 }
-                for tier in &report.tiers {
-                    if let Err(e) = &tier.reconciled {
-                        tracing::warn!(
-                            target: "memkeys", tenant = %report.tenant,
-                            projection = tier.projection_kind, error = %e,
-                            "reconcile tier failed at boot; next maintenance pass retries"
-                        );
-                    }
-                }
+                // Per-tier backfill failures are logged inside reconcile_tenant
+                // (ISI-6223 M2), so both this boot pass and the steady-state
+                // tick surface them uniformly — no second loop needed here.
             }
         }
         Err(e) => {
@@ -307,9 +301,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dw.drain().await;
             }
             // Rescan every tenant for holes + stale model-stamp rebuilds across
-            // all wired tiers, and emit `memkeys.projection.lag.current`. The
-            // reconciler collect-and-continues internally, so one tier's failure
-            // never skips the rest; errors are already logged per tier.
+            // all wired tiers, and emit `memkeys.projection.lag.current` (once
+            // per kind, max across tenants). The reconciler collect-and-continues
+            // internally, and reconcile_tenant logs each tier's backfill/lag
+            // errors (ISI-6223 M2), so discarding the report here stays silent
+            // only about success counts, never about failures.
             let _ = loop_reconciler
                 .reconcile_all(loop_worker.graph_pool())
                 .await;

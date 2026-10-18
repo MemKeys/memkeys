@@ -39,6 +39,15 @@
 //! the async-observed companion to the per-apply `memkeys.projection.lag`
 //! histogram, same maintenance-time pattern as `graph.edges.cardinality`.
 //!
+//! The gauge carries only `memkeys.projection.kind` (signal-catalog.yaml:
+//! "Current max outstanding lag per projection"), so it is ONE stream per tier
+//! across all tenants. A full `reconcile_all` pass therefore records it once per
+//! kind as the MAX outstanding lag over every tenant scanned — NOT once per
+//! `(tenant, kind)`, which would make each tenant's `record()` overwrite the
+//! previous within a collection cycle and export only the last tenant by
+//! `tenant_id` (ISI-6223 B1). A stuck tenant must surface as the tier's lag even
+//! when a converged tenant sorts after it.
+//!
 //! **Failure policy.** Collect-and-continue: a tier that errors is recorded in
 //! the report, never `?`-aborts the others — at boot that would wedge the whole
 //! maintenance pass on one tier's transient failure. Durably-poisoned items are
@@ -94,10 +103,14 @@ pub struct TierReport {
     pub projection_kind: &'static str,
     /// Count applied this pass, or the tier's error (collect-and-continue).
     pub reconciled: Result<usize, String>,
-    /// Oldest-outstanding lag in seconds AFTER the pass (0.0 = converged or not
-    /// lag-measured). Residual lag after a backfill is the alertable signal: a
-    /// transient-stuck or still-missing fact the next pass retries.
-    pub lag_current_s: f64,
+    /// Oldest-outstanding lag in seconds AFTER the pass. `Some(0.0)` = converged;
+    /// `Some(>0)` = a transient-stuck or still-missing fact the next pass
+    /// retries (the alertable signal). `None` = NOT measured this pass — either
+    /// the tier does not measure lag, or its measurement errored. A measurement
+    /// error stays `None` (never a fabricated `Some(0.0)`) so the gauge goes
+    /// stale rather than falsely-healthy (ISI-6223 M3), and `None` is excluded
+    /// from the cross-tenant max so it neither injects a 0 nor masks a real lag.
+    pub lag_current_s: Option<f64>,
 }
 
 /// One full reconcile pass over a tenant across every wired tier.
@@ -150,29 +163,53 @@ impl Reconciler {
     }
 
     /// Reconcile ONE tenant across every tier. Collect-and-continue: a tier
-    /// failure is recorded in the report, never aborts the remaining tiers.
-    /// Records `memkeys.projection.lag.current` per lag-measuring tier.
+    /// failure is recorded in the report AND logged (ISI-6223 M2 — so the
+    /// steady-state maintenance tick, which discards the report, still surfaces
+    /// a persistently failing tier; previously only the boot path logged).
+    ///
+    /// Computes each lag-measuring tier's outstanding lag into the report but
+    /// does NOT emit `memkeys.projection.lag.current` here: that gauge is a
+    /// single per-kind stream whose value is the MAX across tenants, so it is
+    /// emitted once per full pass by [`reconcile_all`] (ISI-6223 B1). A tenant
+    /// in isolation cannot know the cross-tenant max.
     pub async fn reconcile_tenant(&self, tenant: &str) -> ReconcileReport {
         let mut tiers = Vec::with_capacity(self.tiers.len());
         for tier in &self.tiers {
             let reconciled = tier.backfill(tenant).await;
+            // M2: log the backfill failure here, in the one place both the boot
+            // pass and the steady-state tick flow through, so a persistently
+            // failing tier is never silent in steady state.
+            if let Err(e) = &reconciled {
+                tracing::warn!(
+                    target: "memkeys", tenant = %tenant,
+                    projection = tier.projection_kind(), error = %e,
+                    "reconcile tier backfill failed; next maintenance pass retries"
+                );
+            }
             // Measure AFTER the backfill: a non-zero residual is a genuine
             // stuck/missing fact (transient-failing or not-yet-applied), which
             // is exactly what the lag.current gauge should surface. A durable
             // poison item is stamped at the active version by its worker, so it
             // does not count here (poison stops reprocessing).
             let lag_current_s = if tier.measures_lag() {
-                let secs = match tier.oldest_hole(tenant).await {
-                    Ok(Some(ts)) => lag_seconds(ts),
-                    // Converged — or a measurement error we refuse to turn into
-                    // a fabricated lag reading.
-                    Ok(None) | Err(_) => 0.0,
-                };
-                self.instruments
-                    .projection_lag_current(tier.projection_kind(), secs);
-                secs
+                match tier.oldest_hole(tenant).await {
+                    Ok(Some(ts)) => Some(lag_seconds(ts)),
+                    Ok(None) => Some(0.0), // converged
+                    // M3: a measurement error must NOT become a fabricated
+                    // Some(0.0) (healthiest) — leave it unmeasured so the gauge
+                    // goes stale this pass, not falsely-healthy. Logged so M2's
+                    // blind spot doesn't hide it either.
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "memkeys", tenant = %tenant,
+                            projection = tier.projection_kind(), error = %e,
+                            "reconcile tier lag measurement failed; lag.current left stale this pass"
+                        );
+                        None
+                    }
+                }
             } else {
-                0.0
+                None
             };
             tiers.push(TierReport {
                 projection_kind: tier.projection_kind(),
@@ -189,6 +226,9 @@ impl Reconciler {
     /// Reconcile every tenant that has committed facts (the boot pass and the
     /// steady-state maintenance tick share this). Returns one report per
     /// tenant. Tenant discovery is bounded by tenant count, not fact count.
+    ///
+    /// Emits `memkeys.projection.lag.current` ONCE per projection kind after the
+    /// full pass, as the max outstanding lag across every tenant (B1).
     pub async fn reconcile_all(&self, pool: &sqlx::PgPool) -> Result<Vec<ReconcileReport>, String> {
         let tenants: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT tenant_id FROM facts ORDER BY tenant_id")
@@ -199,8 +239,35 @@ impl Reconciler {
         for (tenant,) in tenants {
             reports.push(self.reconcile_tenant(&tenant).await);
         }
+        for (kind, secs) in max_lag_by_kind(&reports) {
+            self.instruments.projection_lag_current(kind, secs);
+        }
         Ok(reports)
     }
+}
+
+/// The `memkeys.projection.lag.current` value to export per projection kind for
+/// a full reconcile pass: the MAX outstanding lag over every tenant scanned
+/// (B1 — the gauge is per-kind, not per-(tenant, kind)). Order-independent, so
+/// a lagging tenant surfaces whether it sorts before or after a converged one.
+///
+/// A tier whose lag was NOT measured this pass (`None` — unmeasurable tier, or a
+/// measurement error) contributes nothing: it is excluded from the max, so it
+/// neither injects a false 0.0 nor masks a real lag from another tenant (M3). A
+/// kind with no measured observation at all is absent from the result and so is
+/// not recorded — the gauge goes stale rather than reporting a fabricated 0.0.
+fn max_lag_by_kind(reports: &[ReconcileReport]) -> Vec<(&'static str, f64)> {
+    let mut max: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();
+    for report in reports {
+        for tier in &report.tiers {
+            if let Some(secs) = tier.lag_current_s {
+                max.entry(tier.projection_kind)
+                    .and_modify(|m| *m = m.max(secs))
+                    .or_insert(secs);
+            }
+        }
+    }
+    max.into_iter().collect()
 }
 
 /// Seconds between a committed fact's ingest and now (never negative — a clock
@@ -302,6 +369,7 @@ mod tests {
         kind: &'static str,
         result: Result<usize, String>,
         oldest: Option<DateTime<Utc>>,
+        oldest_err: bool,
         calls: AtomicUsize,
     }
 
@@ -311,6 +379,7 @@ mod tests {
                 kind,
                 result: Ok(n),
                 oldest: None,
+                oldest_err: false,
                 calls: AtomicUsize::new(0),
             }
         }
@@ -319,11 +388,16 @@ mod tests {
                 kind,
                 result: Err("boom".into()),
                 oldest: None,
+                oldest_err: false,
                 calls: AtomicUsize::new(0),
             }
         }
         fn with_oldest(mut self, ts: DateTime<Utc>) -> Self {
             self.oldest = Some(ts);
+            self
+        }
+        fn with_oldest_err(mut self) -> Self {
+            self.oldest_err = true;
             self
         }
     }
@@ -338,7 +412,22 @@ mod tests {
             self.result.clone()
         }
         async fn oldest_hole(&self, _tenant: &str) -> Result<Option<DateTime<Utc>>, String> {
+            if self.oldest_err {
+                return Err("oldest_hole boom".into());
+            }
             Ok(self.oldest)
+        }
+    }
+
+    /// Build a one-tier report directly, for the pure `max_lag_by_kind` tests.
+    fn report(tenant: &str, kind: &'static str, lag: Option<f64>) -> ReconcileReport {
+        ReconcileReport {
+            tenant: tenant.to_string(),
+            tiers: vec![TierReport {
+                projection_kind: kind,
+                reconciled: Ok(0),
+                lag_current_s: lag,
+            }],
         }
     }
 
@@ -370,11 +459,61 @@ mod tests {
 
         let report = r.reconcile_tenant("t1").await;
 
-        assert_eq!(report.tiers[0].lag_current_s, 0.0, "converged → 0 lag");
+        assert_eq!(
+            report.tiers[0].lag_current_s,
+            Some(0.0),
+            "converged → 0 lag"
+        );
         assert!(
-            report.tiers[1].lag_current_s >= 42.0,
-            "outstanding hole surfaces as positive lag.current, got {}",
+            report.tiers[1].lag_current_s.unwrap() >= 42.0,
+            "outstanding hole surfaces as positive lag.current, got {:?}",
             report.tiers[1].lag_current_s
         );
+    }
+
+    #[tokio::test]
+    async fn lag_measurement_error_is_unmeasured_not_fabricated_zero() {
+        // M3: oldest_hole erroring must leave lag unmeasured (None), NOT a
+        // falsely-healthy Some(0.0).
+        let tier = Arc::new(SpyTier::ok("vector", 0).with_oldest_err());
+        let r = Reconciler::new(vec![tier]);
+
+        let report = r.reconcile_tenant("t1").await;
+
+        assert_eq!(report.tiers[0].lag_current_s, None);
+    }
+
+    #[test]
+    fn lag_gauge_is_max_across_tenants_not_last_scanned() {
+        // B1 regression: the LAGGING tenant sorts FIRST (by tenant_id), the
+        // CONVERGED tenant sorts LAST. Under the old last-tenant-wins record()
+        // the converged tenant's 0.0 would overwrite the real 42s and export 0,
+        // silencing the D3 alert. max-across-tenants surfaces the 42s.
+        let reports = vec![
+            report("a-lagging", "vector", Some(42.0)),
+            report("z-converged", "vector", Some(0.0)),
+        ];
+        assert_eq!(max_lag_by_kind(&reports), vec![("vector", 42.0)]);
+    }
+
+    #[test]
+    fn lag_error_neither_fabricates_zero_nor_masks_a_real_lag() {
+        // M3 + B1: tenant t1's measurement errored (None), tenant t2 is 10s
+        // behind on the same kind. The None contributes nothing, so the real
+        // 10s still surfaces as the exported max.
+        let reports = vec![
+            report("t1", "vector", None),
+            report("t2", "vector", Some(10.0)),
+        ];
+        assert_eq!(max_lag_by_kind(&reports), vec![("vector", 10.0)]);
+    }
+
+    #[test]
+    fn kind_with_only_unmeasured_observations_is_absent_so_gauge_goes_stale() {
+        // M3: every observation for the kind is None (unmeasured / errored) ⇒
+        // the kind is absent from the result ⇒ no record() ⇒ the gauge holds
+        // its prior value (stale) instead of reporting a fabricated 0.0.
+        let reports = vec![report("t1", "vector", None), report("t2", "vector", None)];
+        assert!(max_lag_by_kind(&reports).is_empty());
     }
 }
