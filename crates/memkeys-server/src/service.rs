@@ -1102,6 +1102,7 @@ mod tests {
                 fact_type: f.fact_type.as_str().into(),
                 entity: f.entity.clone(),
                 ingested_at: f.ingested_at,
+                model_id: embedder.model_id().to_string(),
             })
             .await
             .unwrap();

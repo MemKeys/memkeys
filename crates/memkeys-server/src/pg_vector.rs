@@ -66,15 +66,17 @@ impl VectorIndex for PgVectorIndex {
         sqlx::query(
             "INSERT INTO fact_vectors \
                (fact_id, tenant_id, embedding, fact_type, ingested_at, entity_project, \
-                entity_issue, entity_pr, entity_agent, entity_run, entity_thread, entity_service) \
-             VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                entity_issue, entity_pr, entity_agent, entity_run, entity_thread, entity_service, \
+                model_id) \
+             VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT (fact_id) DO UPDATE SET \
                tenant_id = EXCLUDED.tenant_id, embedding = EXCLUDED.embedding, \
                fact_type = EXCLUDED.fact_type, ingested_at = EXCLUDED.ingested_at, \
                entity_project = EXCLUDED.entity_project, \
                entity_issue = EXCLUDED.entity_issue, entity_pr = EXCLUDED.entity_pr, \
                entity_agent = EXCLUDED.entity_agent, entity_run = EXCLUDED.entity_run, \
-               entity_thread = EXCLUDED.entity_thread, entity_service = EXCLUDED.entity_service",
+               entity_thread = EXCLUDED.entity_thread, entity_service = EXCLUDED.entity_service, \
+               model_id = EXCLUDED.model_id",
         )
         .bind(v.fact_id)
         .bind(&v.tenant_id)
@@ -88,6 +90,7 @@ impl VectorIndex for PgVectorIndex {
         .bind(&v.entity.run)
         .bind(&v.entity.thread)
         .bind(&v.entity.service)
+        .bind(&v.model_id)
         .execute(&self.pool)
         .await
         .map_err(|e| VectorError::Backend(e.to_string()))?;

@@ -252,6 +252,35 @@ fn lag_seconds(ingested_at: DateTime<Utc>) -> f64 {
     (Utc::now() - ingested_at).num_milliseconds() as f64 / 1000.0
 }
 
+/// The ingest time of the oldest committed fact with no — or a STALE —
+/// `derivation_runs` stamp for `kind` at `(model_id, prompt_version)` (M7, the
+/// reconciler's `memkeys.projection.lag.current` input). Shared by the per-fact
+/// 5e/5d tiers; `None` when every fact is stamped at the active version. A fact
+/// stamped at the active version (success OR durable poison quarantine) is NOT
+/// counted — its derived view is intentionally current, not outstanding lag.
+async fn oldest_derivation_hole(
+    pool: &PgPool,
+    tenant: &str,
+    kind: &str,
+    model_id: &str,
+    prompt_version: &str,
+) -> Result<Option<DateTime<Utc>>, LlmError> {
+    let row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+        "SELECT min(f.ingested_at) FROM facts f \
+         LEFT JOIN derivation_runs r ON r.kind = $2 AND r.ref_id = f.id \
+         WHERE f.tenant_id = $1 \
+           AND (r.ref_id IS NULL OR r.model_id <> $3 OR r.prompt_version <> $4)",
+    )
+    .bind(tenant)
+    .bind(kind)
+    .bind(model_id)
+    .bind(prompt_version)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| LlmError::Backend(e.to_string()))?;
+    Ok(row.and_then(|(ts,)| ts))
+}
+
 // ===========================================================================
 // W-extract (stage 5e)
 // ===========================================================================
@@ -403,6 +432,22 @@ impl ExtractWorker {
             }
         }
         Ok(applied)
+    }
+
+    /// Ingest time of the OLDEST outstanding stage-5e hole/stale stamp for a
+    /// tenant (the reconciler's `memkeys.projection.lag.current` input; M7).
+    /// `None` when converged. A fact durably quarantined at the active version
+    /// has a current stamp, so it is NOT counted (poison stops reprocessing —
+    /// its missing derived view is intentional, not outstanding lag).
+    pub async fn oldest_hole(&self, tenant: &str) -> Result<Option<DateTime<Utc>>, LlmError> {
+        oldest_derivation_hole(
+            &self.pool,
+            tenant,
+            RUN_KIND_EXTRACT,
+            self.generator.model_id(),
+            GenTask::Extract.prompt_version(),
+        )
+        .await
     }
 
     async fn apply(&self, item: &WorkItem) -> Result<(), LlmError> {
@@ -750,13 +795,17 @@ impl DigestWorker {
                  LEFT JOIN digests d ON d.tenant_id = f.tenant_id \
                      AND d.scope = $2 AND d.scope_id = f.{col} \
                  WHERE f.tenant_id = $1 AND f.{col} IS NOT NULL \
-                   AND (d.digest_id IS NULL OR d.model_id <> $3 OR d.prompt_version <> $4)",
+                   AND (d.digest_id IS NULL OR d.model_id <> $3 OR d.prompt_version <> $4 \
+                        OR d.embed_model_id <> $5)",
                 col = scope.column()
             ))
             .bind(tenant)
             .bind(scope.as_str())
             .bind(self.generator.model_id())
             .bind(GenTask::Summarize.prompt_version())
+            // M7: an embedder-only change (generator unchanged) still re-rolls
+            // the scope so its summary embedding tracks the active model.
+            .bind(self.embedder.model_id())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| LlmError::Backend(e.to_string()))?;
@@ -910,14 +959,15 @@ impl DigestWorker {
         // >= the stored one (a stale coalesced rollup landing late is a no-op).
         sqlx::query(
             "INSERT INTO digests (digest_id, tenant_id, scope, scope_id, scope_version, \
-                 summary, story, member_fact_ids, embedding, model_id, prompt_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11) \
+                 summary, story, member_fact_ids, embedding, model_id, prompt_version, \
+                 embed_model_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12) \
              ON CONFLICT (tenant_id, scope, scope_id) DO UPDATE SET \
                  digest_id = EXCLUDED.digest_id, scope_version = EXCLUDED.scope_version, \
                  summary = EXCLUDED.summary, story = EXCLUDED.story, \
                  member_fact_ids = EXCLUDED.member_fact_ids, embedding = EXCLUDED.embedding, \
                  model_id = EXCLUDED.model_id, prompt_version = EXCLUDED.prompt_version, \
-                 ingested_at = now() \
+                 embed_model_id = EXCLUDED.embed_model_id, ingested_at = now() \
              WHERE digests.scope_version <= EXCLUDED.scope_version",
         )
         .bind(digest_id)
@@ -931,6 +981,11 @@ impl DigestWorker {
         .bind(&encoded)
         .bind(self.generator.model_id())
         .bind(GenTask::Summarize.prompt_version())
+        // M7: stamp the EMBEDDER build too (the summary is embedded; ADR
+        // Decision 3 one-embedder-both-tiers). An embedder-only swap then
+        // re-rolls + re-embeds, keeping the digest vector space aligned with
+        // the fact vector space the two are RRF-fused against.
+        .bind(self.embedder.model_id())
         .execute(&self.pool)
         .await
         .map_err(|e| LlmError::Backend(e.to_string()))?;
@@ -1082,6 +1137,19 @@ impl CategorizeWorker {
             }
         }
         Ok(applied)
+    }
+
+    /// Ingest time of the OLDEST outstanding stage-5d hole/stale stamp for a
+    /// tenant (the reconciler's `memkeys.projection.lag.current` input; M7).
+    pub async fn oldest_hole(&self, tenant: &str) -> Result<Option<DateTime<Utc>>, LlmError> {
+        oldest_derivation_hole(
+            &self.pool,
+            tenant,
+            RUN_KIND_CATEGORIZE,
+            self.generator.model_id(),
+            GenTask::Categorize.prompt_version(),
+        )
+        .await
     }
 
     async fn apply(&self, item: &WorkItem) -> Result<(), LlmError> {
