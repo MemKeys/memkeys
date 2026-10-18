@@ -5,12 +5,16 @@
 //!   - axum HTTP server on `MEMKEYS_HTTP_PORT` (default 3000) serving
 //!     `/memory/*` routes.
 //!   - MCP stdio server: JSON-RPC 2.0 over stdin/stdout, WS-5 tools.
-//!   - Admission control: `X-MemKeys-Tenant` (required) + `X-MemKeys-Token`
-//!     bearer check when `MEMKEYS_AUTH_TOKEN` is set.
+//!   - Admission control (ISI-6148): per-request `JwtVerifier` on HTTP + a
+//!     launch-bound `StaticVerifier` principal on stdio (§2.1), plus the
+//!     `AdmissionControl` self-protection gates. The run-token issuer secret
+//!     is provisioned via `MEMKEYS_RUN_TOKEN_SECRET`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use memkeys_server::admission::AdmissionControl;
+use memkeys_server::auth::{JwtVerifier, Principal, StaticVerifier, TokenVerifier};
 use memkeys_server::http::AppState;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
@@ -47,41 +51,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ISI-6148: the run-token issuer secret (the deployment prerequisite). When
+    // present the HTTP transport verifies every bearer per request and derives
+    // the tenant floor server-side — closing the ISI-6137 S1 cross-tenant gap.
+    // Absent = open loopback dev mode (tenant self-asserted); the bind gate
+    // below refuses to expose that surface off loopback.
+    let run_token_secret = std::env::var("MEMKEYS_RUN_TOKEN_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let admission = Arc::new(AdmissionControl::with_defaults());
+    let http_verifier: Option<Arc<dyn TokenVerifier>> = run_token_secret
+        .as_ref()
+        .map(|s| Arc::new(JwtVerifier::new(s.clone())) as Arc<dyn TokenVerifier>);
+
     // M3 (ISI-6137 B3): bind loopback by DEFAULT so an unauthenticated server is
     // never network-reachable by accident. A non-loopback bind is permitted only
-    // when a bearer token gates admission (MEMKEYS_AUTH_TOKEN) or the operator
-    // explicitly accepts the risk (MEMKEYS_ALLOW_INSECURE=1); otherwise we refuse
-    // to start rather than expose the open admission surface the CR flagged.
+    // when the per-request verifier gates admission (MEMKEYS_RUN_TOKEN_SECRET) or
+    // the operator explicitly accepts the risk (MEMKEYS_ALLOW_INSECURE=1);
+    // otherwise we refuse to start rather than expose the open admission surface.
     let http_port: u16 = std::env::var("MEMKEYS_HTTP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let http_host = std::env::var("MEMKEYS_HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let has_token = std::env::var("MEMKEYS_AUTH_TOKEN").is_ok_and(|t| !t.is_empty());
+    let has_verifier = http_verifier.is_some();
     let is_loopback = matches!(http_host.as_str(), "127.0.0.1" | "::1" | "localhost");
     let allow_insecure = std::env::var("MEMKEYS_ALLOW_INSECURE").is_ok_and(|v| v == "1");
-    if !is_loopback && !has_token && !allow_insecure {
+    if !is_loopback && !has_verifier && !allow_insecure {
         return Err(format!(
             "refusing to bind {http_host}:{http_port}: a non-loopback bind with no \
-             MEMKEYS_AUTH_TOKEN would expose an unauthenticated admission surface. Set \
-             MEMKEYS_AUTH_TOKEN, keep the loopback default (127.0.0.1), or set \
+             MEMKEYS_RUN_TOKEN_SECRET would expose an unauthenticated admission surface. Set \
+             MEMKEYS_RUN_TOKEN_SECRET, keep the loopback default (127.0.0.1), or set \
              MEMKEYS_ALLOW_INSECURE=1 to override (NOT recommended)."
         )
         .into());
     }
-    if !is_loopback && !has_token {
+    if !is_loopback && !has_verifier {
         tracing::warn!(
             target: "memkeys",
-            "memkeys.admission.open: bound {http_host}:{http_port} with NO auth token \
+            "memkeys.admission.open: bound {http_host}:{http_port} with NO run-token verifier \
              (MEMKEYS_ALLOW_INSECURE); tenant is self-asserted — cross-tenant \
              impersonation is possible (ISI-6137 S1)."
         );
         eprintln!(
-            "WARNING: memkeys-server bound {http_host}:{http_port} with no auth token — \
+            "WARNING: memkeys-server bound {http_host}:{http_port} with no run-token verifier — \
              open admission surface, self-asserted tenant (ISI-6137 S1)."
         );
     }
-    let app_state = AppState::new(service.clone());
+    let app_state = AppState::new(service.clone(), http_verifier, admission.clone());
     let router = memkeys_server::http::router(app_state);
     let listener = tokio::net::TcpListener::bind((http_host.as_str(), http_port)).await?;
     println!("memkeys-server: HTTP listening on {http_host}:{http_port}");
@@ -91,10 +108,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // M3 (ISI-6148 §2.1): bind a SINGLE stdio principal at launch from the run
+    // token — the stdio pipe is the trust boundary, so the principal is fixed
+    // for the process and every tool call inherits it (the window is re-checked
+    // per call for F12). With the issuer secret + a presented `MEMKEYS_RUN_TOKEN`
+    // we verify it once; otherwise we bind a loopback dev principal (same open
+    // posture the HTTP bind gate governs).
+    let now = chrono::Utc::now().timestamp();
+    let stdio_verifier: Arc<dyn TokenVerifier> = match (
+        run_token_secret.as_ref(),
+        std::env::var("MEMKEYS_RUN_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
+    ) {
+        (Some(secret), Some(token)) => {
+            let principal = JwtVerifier::new(secret.clone())
+                .verify(&token, now)
+                .map_err(|e| format!("stdio launch run-token rejected: {}", e.detail))?;
+            Arc::new(StaticVerifier::new(principal))
+        }
+        _ => {
+            let tenant =
+                std::env::var("MEMKEYS_STDIO_TENANT").unwrap_or_else(|_| "default".to_string());
+            tracing::warn!(
+                target: "memkeys",
+                "memkeys.stdio.dev_principal: no MEMKEYS_RUN_TOKEN(+_SECRET); binding an \
+                 UNVERIFIED stdio principal for tenant {tenant} (dev/loopback; ISI-6137 S1)."
+            );
+            Arc::new(StaticVerifier::new(Principal {
+                tenant_id: tenant,
+                agent_id: "stdio-dev".to_string(),
+                run_id: None,
+                expires_at: i64::MAX,
+                trace_id: None,
+            }))
+        }
+    };
+
     // M3: MCP stdio server (spawned as a concurrent task).
     let mcp_service = service.clone();
+    let mcp_admission = admission.clone();
     let mcp_task = tokio::spawn(async move {
-        memkeys_server::mcp::run_stdio(mcp_service).await;
+        memkeys_server::mcp::run_stdio(mcp_service, stdio_verifier, mcp_admission).await;
     });
 
     // Steady state: drain the post-commit queue + rescan for holes.

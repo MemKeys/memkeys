@@ -6,8 +6,13 @@
 //!   memory_traverse → service.traverse()
 //!   memory_search   → 501 graceful (semantic search not in M3)
 //!
-//! The tenant is supplied by the MCP caller as a `tenant_id` argument on every
-//! tool call (WS-4 Invariant T — never process state).
+//! The tenant is NOT supplied by the caller (ISI-6148, closes ISI-6134 S1).
+//! A single [`Principal`] is bound once at launch from the run token (WS-5
+//! §2.1 — the stdio pipe is the trust boundary); every tool call inherits its
+//! verified tenant floor (WS-4 Invariant T), and the expiry window is
+//! re-checked on each call (F12) so a long-lived process hard-fails
+//! `unauthenticated` once the window closes. Admission gates
+//! (concurrency shedding, F14 write-size, F15 boundary-probe) wrap every call.
 //!
 //! Protocol: JSON-RPC 2.0 over stdin/stdout, one request per line, one
 //! response per line (newline-delimited). Implements `initialize`,
@@ -20,6 +25,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::admission::AdmissionControl;
+use crate::auth::{Principal, TokenVerifier};
 use crate::envelope::Envelope;
 use crate::error::{IngestError, QueryError};
 use crate::graph::{
@@ -27,9 +34,9 @@ use crate::graph::{
     DEFAULT_NODE_BUDGET,
 };
 use crate::model::{EntityKey, KeyedQuery, Validity};
-use crate::pipeline::CallerContext;
 use crate::service::MemKeysService;
 use crate::telemetry::{self, TRANSPORT_STDIO};
+use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, Status, TraceContextExt};
 use opentelemetry::Context;
 
@@ -95,24 +102,22 @@ fn tool_list() -> Value {
         "tools": [
             {
                 "name": "memory_store",
-                "description": "Store a fact envelope in MemKeys. Returns the fact id and resolved entity keys.",
+                "description": "Store a fact envelope in MemKeys. Returns the fact id and resolved entity keys. The tenant floor is derived from the launch-bound principal (§2.1) — never a tool argument.",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["tenant_id", "envelope"],
+                    "required": ["envelope"],
                     "properties": {
-                        "tenant_id": {"type": "string", "description": "WS-4 tenant isolation id"},
                         "envelope": {"type": "object", "description": "MemKeys fact envelope (§3)"}
                     }
                 }
             },
             {
                 "name": "memory_fetch",
-                "description": "Fetch facts by entity keys. At least one entity.* key is required.",
+                "description": "Fetch facts by entity keys. At least one entity.* key is required. The tenant floor is the launch-bound principal's (§2.1).",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["tenant_id"],
+                    "required": [],
                     "properties": {
-                        "tenant_id": {"type": "string"},
                         "entity.project": {"type": "string"},
                         "entity.issue": {"type": "string"},
                         "entity.pr": {"type": "string"},
@@ -129,12 +134,11 @@ fn tool_list() -> Value {
             },
             {
                 "name": "memory_traverse",
-                "description": "Traverse the memory graph from a start node (bounded BFS, §7.3).",
+                "description": "Traverse the memory graph from a start node (bounded BFS, §7.3). The tenant floor is the launch-bound principal's (§2.1).",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["tenant_id", "start"],
+                    "required": ["start"],
                     "properties": {
-                        "tenant_id": {"type": "string"},
                         "start": {
                             "type": "object",
                             "required": ["kind", "id"],
@@ -156,9 +160,8 @@ fn tool_list() -> Value {
                 "description": "Semantic search (not available in M3 — returns feature_disabled).",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["tenant_id", "query"],
+                    "required": ["query"],
                     "properties": {
-                        "tenant_id": {"type": "string"},
                         "query": {"type": "string"}
                     }
                 }
@@ -171,35 +174,51 @@ fn tool_list() -> Value {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_tool(service: &MemKeysService, name: &str, args: Value) -> Result<Value, String> {
+async fn dispatch_tool(
+    service: &MemKeysService,
+    principal: &Principal,
+    admission: &AdmissionControl,
+    name: &str,
+    args: Value,
+) -> Result<Value, WireError> {
     match name {
-        "memory_store" => tool_store(service, args).await,
-        "memory_fetch" => tool_fetch(service, args).await,
-        "memory_traverse" => tool_traverse(service, args).await,
+        "memory_store" => tool_store(service, principal, admission, args).await,
+        "memory_fetch" => tool_fetch(service, principal, args).await,
+        "memory_traverse" => tool_traverse(service, principal, admission, args).await,
         // M3 scope: semantic search is not available. Return `Err` so the
         // `tools/call` reply carries `isError: true`, matching the HTTP 501
         // (ISI-6134 M2) — an Ok body with an inline `error` field reads as a
         // successful call to an MCP client.
-        "memory_search" => Err("feature_disabled: semantic_search is not available in M3 \
-             (parity with HTTP 501 on POST /memory/search)"
-            .to_string()),
-        other => Err(format!("unknown tool: {other}")),
+        "memory_search" => Err(WireError::new(
+            ErrorCode::FeatureDisabled,
+            "semantic_search is not available in M3 (parity with HTTP 501 on POST /memory/search)",
+        )),
+        other => Err(WireError::new(
+            ErrorCode::InvalidArgument,
+            format!("unknown tool: {other}"),
+        )),
     }
 }
 
-async fn tool_store(service: &MemKeysService, args: Value) -> Result<Value, String> {
-    let tenant_id = args["tenant_id"]
-        .as_str()
-        .ok_or("tenant_id is required")?
-        .to_string();
-    let envelope: Envelope = serde_json::from_value(args["envelope"].clone())
-        .map_err(|e| format!("invalid envelope: {e}"))?;
+async fn tool_store(
+    service: &MemKeysService,
+    principal: &Principal,
+    admission: &AdmissionControl,
+    args: Value,
+) -> Result<Value, WireError> {
+    let envelope: Envelope = serde_json::from_value(args["envelope"].clone()).map_err(|e| {
+        WireError::new(ErrorCode::InvalidEnvelope, format!("invalid envelope: {e}"))
+    })?;
 
-    let caller = CallerContext {
-        tenant_id: tenant_id.clone(),
-        principal: "mcp".to_string(),
-        trace_id: None,
-    };
+    // F14 write-size cap BEFORE the pipeline.
+    let body_bytes = serde_json::to_vec(&envelope.fact.body)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    admission.check_write_size(body_bytes, envelope.attachments.len())?;
+
+    // The caller context is the VERIFIED principal's tenant/agent (§4 rule 1) —
+    // never a tool argument.
+    let caller = principal.caller_context();
     let now = chrono::Utc::now();
     match service.ingest(&envelope, &caller, now).await {
         Ok(r) => Ok(serde_json::json!({
@@ -210,19 +229,27 @@ async fn tool_store(service: &MemKeysService, args: Value) -> Result<Value, Stri
                 .collect::<HashMap<_, _>>(),
             "duplicate": r.duplicate,
         })),
-        Err(IngestError::Rejected { reason }) => Err(format!("rejected: {reason}")),
-        Err(IngestError::Conflict { existing_id }) => {
-            Err(format!("conflict with existing fact {existing_id}"))
-        }
-        Err(e) => Err(format!("store error: {e}")),
+        Err(IngestError::Rejected { reason }) => Err(WireError::new(
+            ErrorCode::InvalidEnvelope,
+            format!("rejected: {reason}"),
+        )),
+        Err(IngestError::Conflict { existing_id }) => Err(WireError::new(
+            ErrorCode::Conflict,
+            format!("conflict with existing fact {existing_id}"),
+        )),
+        Err(e) => Err(WireError::new(
+            ErrorCode::BackendUnavailable,
+            format!("store error: {e}"),
+        )),
     }
 }
 
-async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, String> {
-    let tenant_id = args["tenant_id"]
-        .as_str()
-        .ok_or("tenant_id is required")?
-        .to_string();
+async fn tool_fetch(
+    service: &MemKeysService,
+    principal: &Principal,
+    args: Value,
+) -> Result<Value, WireError> {
+    let tenant_id = principal.tenant_id.clone();
 
     const KEY_MAP: &[(&str, EntityKey)] = &[
         ("entity.project", EntityKey::Project),
@@ -242,8 +269,9 @@ async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, Stri
     // §7.2 documents `type`; accept `fact_type` as a legacy alias (ISI-6134 B1).
     let fact_type = match args["type"].as_str().or_else(|| args["fact_type"].as_str()) {
         Some(ft) => Some(
-            serde_json::from_value(Value::String(ft.to_string()))
-                .map_err(|e| format!("invalid type: {e}"))?,
+            serde_json::from_value(Value::String(ft.to_string())).map_err(|e| {
+                WireError::new(ErrorCode::InvalidArgument, format!("invalid type: {e}"))
+            })?,
         ),
         None => None,
     };
@@ -252,7 +280,12 @@ async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, Stri
     let as_of = match args["as_of"].as_str() {
         Some(ts) => Some(
             chrono::DateTime::parse_from_rfc3339(ts)
-                .map_err(|_| format!("as_of must be RFC3339: {ts}"))?
+                .map_err(|_| {
+                    WireError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("as_of must be RFC3339: {ts}"),
+                    )
+                })?
                 .with_timezone(&chrono::Utc),
         ),
         None => None,
@@ -278,19 +311,27 @@ async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, Stri
         Ok(records) => Ok(serde_json::json!({
             "facts": serde_json::to_value(records).unwrap_or(Value::Array(vec![])),
         })),
-        Err(QueryError::Invalid { reason }) => Err(format!("invalid query: {reason}")),
-        Err(e) => Err(format!("store error: {e}")),
+        Err(QueryError::Invalid { reason }) => Err(WireError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid query: {reason}"),
+        )),
+        Err(e) => Err(WireError::new(
+            ErrorCode::BackendUnavailable,
+            format!("store error: {e}"),
+        )),
     }
 }
 
-async fn tool_traverse(service: &MemKeysService, args: Value) -> Result<Value, String> {
-    let tenant_id = args["tenant_id"]
-        .as_str()
-        .ok_or("tenant_id is required")?
-        .to_string();
+async fn tool_traverse(
+    service: &MemKeysService,
+    principal: &Principal,
+    admission: &AdmissionControl,
+    args: Value,
+) -> Result<Value, WireError> {
+    let tenant_id = principal.tenant_id.clone();
 
-    let start: NodeRef =
-        serde_json::from_value(args["start"].clone()).map_err(|e| format!("invalid start: {e}"))?;
+    let start: NodeRef = serde_json::from_value(args["start"].clone())
+        .map_err(|e| WireError::new(ErrorCode::InvalidArgument, format!("invalid start: {e}")))?;
 
     let edges: Vec<EdgeType> = if let Some(arr) = args["edges"].as_array() {
         arr.iter()
@@ -303,8 +344,12 @@ async fn tool_traverse(service: &MemKeysService, args: Value) -> Result<Value, S
     // §7.3 documents `direction`; accept `dir` as a legacy alias (ISI-6134 B2).
     let dir: Direction =
         if let Some(s) = args["direction"].as_str().or_else(|| args["dir"].as_str()) {
-            serde_json::from_value(Value::String(s.to_string()))
-                .map_err(|e| format!("invalid direction: {e}"))?
+            serde_json::from_value(Value::String(s.to_string())).map_err(|e| {
+                WireError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid direction: {e}"),
+                )
+            })?
         } else {
             Direction::default()
         };
@@ -330,9 +375,24 @@ async fn tool_traverse(service: &MemKeysService, args: Value) -> Result<Value, S
 
     match service.traverse(&tenant_id, &req).await {
         Ok(result) => Ok(serde_json::to_value(result).unwrap()),
-        Err(GraphError::NotFound) => Err("not found".to_string()),
-        Err(GraphError::Invalid(msg)) => Err(format!("invalid request: {msg}")),
-        Err(e) => Err(format!("store error: {e}")),
+        // F15: a boundary-crossing lookup is `not_found` (§3.3); record the miss
+        // so a principal over its probe budget is throttled `rate_limited`
+        // instead of getting an unlimited existence oracle.
+        Err(GraphError::NotFound) => {
+            let now = chrono::Utc::now().timestamp();
+            match admission.record_boundary_miss(&tenant_id, now) {
+                Ok(()) => Err(WireError::new(ErrorCode::NotFound, "not found")),
+                Err(throttle) => Err(throttle),
+            }
+        }
+        Err(GraphError::Invalid(msg)) => Err(WireError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid request: {msg}"),
+        )),
+        Err(e) => Err(WireError::new(
+            ErrorCode::BackendUnavailable,
+            format!("store error: {e}"),
+        )),
     }
 }
 
@@ -343,7 +403,16 @@ async fn tool_traverse(service: &MemKeysService, args: Value) -> Result<Value, S
 /// Run the MCP stdio server until stdin closes. Blocks; call from a dedicated
 /// `tokio::task::spawn_blocking` or a separate tokio task using
 /// `BufReader<tokio::io::Stdin>`.
-pub async fn run_stdio(service: Arc<MemKeysService>) {
+///
+/// `verifier` carries the launch-bound principal (§2.1): stdio binds ONE
+/// [`StaticVerifier`] at launch, and every `tools/call` re-verifies it to
+/// enforce the expiry window (F12). `admission` applies the shared
+/// self-protection gates.
+pub async fn run_stdio(
+    service: Arc<MemKeysService>,
+    verifier: Arc<dyn TokenVerifier>,
+    admission: Arc<AdmissionControl>,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let stdin = tokio::io::stdin();
@@ -369,7 +438,7 @@ pub async fn run_stdio(service: Arc<MemKeysService>) {
 
         // JSON-RPC 2.0: notifications (no `id`) get no reply at all — `handle_line`
         // returns `None` for them, and we write nothing (ISI-6134 B4).
-        let Some(response) = handle_line(&service, trimmed).await else {
+        let Some(response) = handle_line(&service, &*verifier, &admission, trimmed).await else {
             continue;
         };
         let mut out = serde_json::to_string(&response).unwrap_or_else(|_| {
@@ -385,7 +454,12 @@ pub async fn run_stdio(service: Arc<MemKeysService>) {
     }
 }
 
-async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResponse> {
+async fn handle_line(
+    service: &MemKeysService,
+    verifier: &dyn TokenVerifier,
+    admission: &AdmissionControl,
+    line: &str,
+) -> Option<JsonRpcResponse> {
     let req: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         // A malformed line can't be told apart from a notification, so JSON-RPC
@@ -428,6 +502,24 @@ async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResp
             };
             let arguments = req.params["arguments"].clone();
 
+            // Gate 1 (concurrency shedding): take an in-flight permit; a
+            // saturated server sheds `rate_limited` rather than piling up work.
+            // The guard releases on scope exit.
+            let _admit = match admission.try_admit() {
+                Ok(g) => g,
+                Err(e) => return Some(tool_error_reply(id, e)),
+            };
+
+            // Principal binding (§2.1): re-verify the launch-bound principal on
+            // every call so the expiry window is enforced (F12). The token value
+            // is irrelevant for stdio (the pipe is the trust boundary) — the
+            // `StaticVerifier` ignores it and only checks the window.
+            let now = chrono::Utc::now().timestamp();
+            let principal = match verifier.verify("", now) {
+                Ok(p) => p,
+                Err(e) => return Some(tool_error_reply(id, e)),
+            };
+
             // ISI-6134 B2: one SERVER span per `tools/call` carrying the
             // transport surface (stdio) + tool name. Attaching its context
             // makes the service's ingest/retrieve spans nest beneath it (they
@@ -444,7 +536,7 @@ async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResp
             // still nest beneath `cx` because they read the active context on
             // their first synchronous poll.
             let cx = Context::current_with_span(span);
-            let outcome = dispatch_tool(service, &tool_name, arguments)
+            let outcome = dispatch_tool(service, &principal, admission, &tool_name, arguments)
                 .with_context(cx.clone())
                 .await;
             cx.span().set_status(match &outcome {
@@ -462,13 +554,7 @@ async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResp
                         "content": [{"type": "text", "text": result.to_string()}]
                     }),
                 ),
-                Err(msg) => JsonRpcResponse::ok(
-                    id,
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": msg}],
-                        "isError": true
-                    }),
-                ),
+                Err(e) => tool_error_reply(id, e),
             }
         }
 
@@ -476,13 +562,45 @@ async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResp
     })
 }
 
+/// Render a [`WireError`] as an MCP `tools/call` error result. Per the ISI-6134
+/// M2 decision an errored tool call is an `Ok` JSON-RPC reply carrying
+/// `isError: true`; the content text is the WS-5 §7 error body (JSON) so the
+/// client reads a stable `code`/`retriable`, matching the HTTP surface.
+fn tool_error_reply(id: Value, err: WireError) -> JsonRpcResponse {
+    let text =
+        serde_json::to_string(&err).unwrap_or_else(|_| format!("{{\"code\":\"{}\"}}", err.code));
+    JsonRpcResponse::ok(
+        id,
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": true
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::StaticVerifier;
     use crate::memstore::MemStore;
 
     fn service() -> Arc<MemKeysService> {
         Arc::new(MemKeysService::new(Arc::new(MemStore::new())))
+    }
+
+    /// A launch-bound principal for tenant `t` whose window closes at `exp`.
+    fn verifier(tenant: &str, exp: i64) -> Arc<dyn TokenVerifier> {
+        Arc::new(StaticVerifier::new(Principal {
+            tenant_id: tenant.to_string(),
+            agent_id: "stdio-agent".to_string(),
+            run_id: Some("run-1".to_string()),
+            expires_at: exp,
+            trace_id: None,
+        }))
+    }
+
+    fn admission() -> Arc<AdmissionControl> {
+        Arc::new(AdmissionControl::with_defaults())
     }
 
     #[tokio::test]
@@ -491,14 +609,18 @@ mod tests {
         // No `id` → JSON-RPC notification → server MUST NOT reply (ISI-6134 B4),
         // not even with method-not-found.
         let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(handle_line(&svc, notif).await.is_none());
+        assert!(
+            handle_line(&svc, &*verifier("t", i64::MAX), &admission(), notif)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn request_with_id_gets_a_reply() {
         let svc = service();
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
-        let resp = handle_line(&svc, req)
+        let resp = handle_line(&svc, &*verifier("t", i64::MAX), &admission(), req)
             .await
             .expect("request must get a reply");
         assert_eq!(resp.id, serde_json::json!(1));
@@ -510,10 +632,44 @@ mod tests {
         let svc = service();
         // A malformed line is indistinguishable from a notification, so JSON-RPC
         // requires a parse-error reply with null id.
-        let resp = handle_line(&svc, "not json")
+        let resp = handle_line(&svc, &*verifier("t", i64::MAX), &admission(), "not json")
             .await
             .expect("parse error replies");
         assert_eq!(resp.id, Value::Null);
         assert!(resp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn tool_call_past_expiry_window_is_unauthenticated() {
+        let svc = service();
+        // The launch window has already closed (exp=1000, now >> that): every
+        // tool call hard-fails `unauthenticated` (F12) — no fetch runs.
+        let req = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.issue":"I1"}}}"#;
+        let resp = handle_line(&svc, &*verifier("t", 1000), &admission(), req)
+            .await
+            .expect("a request gets a reply");
+        let result = resp.result.expect("errored tool call is an Ok reply");
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("unauthenticated"),
+            "expired window must surface `unauthenticated`, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_uses_bound_tenant_not_a_client_arg() {
+        let svc = service();
+        // No `tenant_id` arg is supplied; the fetch runs against the bound
+        // principal's tenant and returns an (empty) `{facts:[]}` success — proof
+        // the tenant floor comes from the principal, not the call.
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.issue":"I1"}}}"#;
+        let resp = handle_line(&svc, &*verifier("tenant-a", i64::MAX), &admission(), req)
+            .await
+            .expect("a request gets a reply");
+        let result = resp.result.expect("ok reply");
+        assert!(result.get("isError").is_none(), "should succeed: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("facts"), "got: {text}");
     }
 }
