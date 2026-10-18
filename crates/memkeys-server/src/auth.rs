@@ -87,10 +87,11 @@ impl TokenVerifier for JwtVerifier {
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(s)
             .map_err(|_| unauth("bad signature encoding"))?;
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).map_err(|_| unauth("verifier misconfigured"))?;
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|_| unauth("verifier misconfigured"))?;
         mac.update(signing_input.as_bytes());
-        mac.verify_slice(&sig).map_err(|_| unauth("bad signature"))?;
+        mac.verify_slice(&sig)
+            .map_err(|_| unauth("bad signature"))?;
 
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(p)
@@ -156,6 +157,40 @@ impl TokenVerifier for StaticVerifier {
     }
 }
 
+/// The launch-bound principal for a stdio session and for the insecure HTTP
+/// dev fallback (§2.1). The reference deployment reads the run token's identity
+/// from the environment the Paperclip runner injects; the tenant floor is
+/// therefore server-side, never client-supplied (the §7.4/R6 fix, ISI-6151).
+///
+/// Absent values fall back to a single fixed dev tenant — still server-side.
+/// `MEMKEYS_RUN_EXPIRES_AT` (unix seconds) bounds the session's validity window
+/// (F12); absent = no expiry (dev).
+pub fn run_token_principal_from_env() -> Principal {
+    Principal {
+        tenant_id: std::env::var("MEMKEYS_RUN_TENANT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("MEMKEYS_DEV_TENANT")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "dev".to_string()),
+        agent_id: std::env::var("MEMKEYS_RUN_AGENT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "stdio".to_string()),
+        run_id: std::env::var("MEMKEYS_RUN_ID")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        expires_at: std::env::var("MEMKEYS_RUN_EXPIRES_AT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(i64::MAX),
+        trace_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +213,9 @@ mod tests {
             secret,
             &serde_json::json!({"sub":"agent-a","company_id":"tenant-1","run_id":"run-9","exp":2000}),
         );
-        let p = JwtVerifier::new(secret.to_vec()).verify(&token, 1000).unwrap();
+        let p = JwtVerifier::new(secret.to_vec())
+            .verify(&token, 1000)
+            .unwrap();
         assert_eq!(p.tenant_id, "tenant-1");
         assert_eq!(p.agent_id, "agent-a");
         assert_eq!(p.run_id.as_deref(), Some("run-9"));
@@ -187,7 +224,10 @@ mod tests {
     #[test]
     fn rejects_expired_token() {
         let secret = b"test-secret";
-        let token = mint(secret, &serde_json::json!({"sub":"a","company_id":"t","exp":500}));
+        let token = mint(
+            secret,
+            &serde_json::json!({"sub":"a","company_id":"t","exp":500}),
+        );
         let err = JwtVerifier::new(secret.to_vec())
             .verify(&token, 1000)
             .unwrap_err();
@@ -196,7 +236,10 @@ mod tests {
 
     #[test]
     fn rejects_tampered_signature() {
-        let token = mint(b"real-secret", &serde_json::json!({"sub":"a","company_id":"t","exp":2000}));
+        let token = mint(
+            b"real-secret",
+            &serde_json::json!({"sub":"a","company_id":"t","exp":2000}),
+        );
         // Verifier holds a different secret → signature mismatch.
         let err = JwtVerifier::new(b"other-secret".to_vec())
             .verify(&token, 1000)

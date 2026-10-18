@@ -11,6 +11,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use memkeys_server::admission::AdmissionControl;
+use memkeys_server::auth::{run_token_principal_from_env, StaticVerifier, TokenVerifier};
 use memkeys_server::http::AppState;
 use memkeys_server::pg::PgStore;
 use memkeys_server::pg_graph::PgGraph;
@@ -48,40 +50,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // M3 (ISI-6137 B3): bind loopback by DEFAULT so an unauthenticated server is
-    // never network-reachable by accident. A non-loopback bind is permitted only
-    // when a bearer token gates admission (MEMKEYS_AUTH_TOKEN) or the operator
-    // explicitly accepts the risk (MEMKEYS_ALLOW_INSECURE=1); otherwise we refuse
-    // to start rather than expose the open admission surface the CR flagged.
+    // never network-reachable by accident. Per-request authz (ISI-6151) now
+    // derives the tenant floor from a verified bearer token when
+    // MEMKEYS_JWT_SECRET is set; a non-loopback bind is permitted only in that
+    // authenticated mode or when the operator explicitly accepts the insecure
+    // dev fallback (MEMKEYS_ALLOW_INSECURE=1). Otherwise we refuse to start.
     let http_port: u16 = std::env::var("MEMKEYS_HTTP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let http_host = std::env::var("MEMKEYS_HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let has_token = std::env::var("MEMKEYS_AUTH_TOKEN").is_ok_and(|t| !t.is_empty());
+    let has_auth = std::env::var("MEMKEYS_JWT_SECRET").is_ok_and(|t| !t.is_empty());
     let is_loopback = matches!(http_host.as_str(), "127.0.0.1" | "::1" | "localhost");
     let allow_insecure = std::env::var("MEMKEYS_ALLOW_INSECURE").is_ok_and(|v| v == "1");
-    if !is_loopback && !has_token && !allow_insecure {
+    if !is_loopback && !has_auth && !allow_insecure {
         return Err(format!(
             "refusing to bind {http_host}:{http_port}: a non-loopback bind with no \
-             MEMKEYS_AUTH_TOKEN would expose an unauthenticated admission surface. Set \
-             MEMKEYS_AUTH_TOKEN, keep the loopback default (127.0.0.1), or set \
-             MEMKEYS_ALLOW_INSECURE=1 to override (NOT recommended)."
+             MEMKEYS_JWT_SECRET would expose an unauthenticated admission surface with a \
+             single server-fixed tenant. Set MEMKEYS_JWT_SECRET for per-request token authz, \
+             keep the loopback default (127.0.0.1), or set MEMKEYS_ALLOW_INSECURE=1 to override \
+             (NOT recommended)."
         )
         .into());
     }
-    if !is_loopback && !has_token {
+    if !is_loopback && !has_auth {
         tracing::warn!(
             target: "memkeys",
-            "memkeys.admission.open: bound {http_host}:{http_port} with NO auth token \
-             (MEMKEYS_ALLOW_INSECURE); tenant is self-asserted — cross-tenant \
-             impersonation is possible (ISI-6137 S1)."
+            "memkeys.admission.insecure: bound {http_host}:{http_port} with NO MEMKEYS_JWT_SECRET \
+             (MEMKEYS_ALLOW_INSECURE); all requests map to one server-fixed dev tenant — there \
+             is no per-request principal (ISI-6151)."
         );
         eprintln!(
-            "WARNING: memkeys-server bound {http_host}:{http_port} with no auth token — \
-             open admission surface, self-asserted tenant (ISI-6137 S1)."
+            "WARNING: memkeys-server bound {http_host}:{http_port} with no JWT secret — \
+             insecure dev mode, single server-fixed tenant (ISI-6151)."
         );
     }
-    let app_state = AppState::new(service.clone());
+
+    // Shared self-protection layer across HTTP + stdio (one in-flight pool).
+    let admission = Arc::new(AdmissionControl::with_defaults());
+    let app_state = AppState::from_env(service.clone(), admission.clone());
     let router = memkeys_server::http::router(app_state);
     let listener = tokio::net::TcpListener::bind((http_host.as_str(), http_port)).await?;
     println!("memkeys-server: HTTP listening on {http_host}:{http_port}");
@@ -91,10 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // M3: MCP stdio server (spawned as a concurrent task).
+    // M3: MCP stdio server (spawned as a concurrent task). The principal is
+    // bound ONCE here from the launch run token (§2.1, ISI-6151); the stdio pipe
+    // is the trust boundary, so a StaticVerifier re-checks only expiry per call.
     let mcp_service = service.clone();
+    let mcp_verifier: Arc<dyn TokenVerifier> =
+        Arc::new(StaticVerifier::new(run_token_principal_from_env()));
+    let mcp_admission = admission.clone();
     let mcp_task = tokio::spawn(async move {
-        memkeys_server::mcp::run_stdio(mcp_service).await;
+        memkeys_server::mcp::run_stdio(mcp_service, mcp_verifier, mcp_admission).await;
     });
 
     // Steady state: drain the post-commit queue + rescan for holes.
