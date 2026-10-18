@@ -22,8 +22,10 @@
 //!   digest + "story" lineage from its current (non-superseded) member facts,
 //!   the embedder embeds the summary, and the result lands in the digest tier
 //!   with `member_fact_ids` (the R1 resolve-down path). `scope_version` (the
-//!   member count — monotonic, facts are append-only) makes a late rollup for
-//!   an older version a no-op.
+//!   wall-clock epoch of the member-snapshot read — monotonic across rollups,
+//!   unlike the member count, which a supersession-out-of-scope or retention
+//!   sweep can shrink; ISI-6192 B1) makes a late rollup for an older snapshot
+//!   a no-op.
 //! - [`CategorizeWorker`] — **W-categorize (stage 5d).** The schema-constrained
 //!   categorizer over `fact.body` → validated emergent labels →
 //!   `category_facets` rows + the `categories[]` facet surface on the keyed
@@ -154,9 +156,33 @@ async fn fetch_fact(pool: &PgPool, tenant: &str, id: Uuid) -> Result<Option<Fact
         .map_err(|e| LlmError::Backend(e.to_string()))
 }
 
-/// The `derivation_runs` stamp kinds (migration 0004).
+/// The `derivation_runs` stamp kinds (migration 0004; `digest_rollup` added in
+/// 0005 for the ISI-6192 B2 scope-level poison quarantine).
 const RUN_KIND_EXTRACT: &str = "llm_extract";
 const RUN_KIND_CATEGORIZE: &str = "categorize";
+const RUN_KIND_DIGEST: &str = "digest_rollup";
+
+/// The stable digest id per `(tenant, scope, scope_id)` — the `digests` upsert
+/// target AND the `derivation_runs.ref_id` used to quarantine a poison scope
+/// (ISI-6192 B2). Deterministic so a rollup and its poison stamp agree.
+fn digest_id(tenant: &str, scope: DigestScope, scope_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("memkeys/digest/{tenant}/{}/{scope_id}", scope.as_str()).as_bytes(),
+    )
+}
+
+/// True when an LLM-worker failure is a DETERMINISTIC poison (schema-invalid
+/// generative output, ADR Decision 8) — retrying the identical input cannot
+/// succeed, so it is quarantined rather than retried. A transient
+/// [`GenError::Unavailable`] or a DB [`LlmError::Backend`] is NOT poison: it is
+/// left unstamped so a later drain/`catch_up` retries once the cause clears.
+fn is_poison(e: &LlmError) -> bool {
+    matches!(
+        e,
+        LlmError::Generator(generative::GenError::InvalidOutput(_))
+    )
+}
 
 /// Record the derivation stamp (idempotent upsert) — marks that a generative
 /// worker ran for this fact at this derivation version, even with an EMPTY
@@ -182,6 +208,39 @@ async fn stamp_run(
     .bind(model_id)
     .bind(prompt_version)
     .execute(&mut *tx)
+    .await
+    .map_err(|e| LlmError::Backend(e.to_string()))?;
+    Ok(())
+}
+
+/// Durably quarantine a poison derivation (ISI-6192 B2): stamp `derivation_runs`
+/// at the CURRENT `(model_id, prompt_version)` so the `catch_up` hole-scan skips
+/// this ref until a version bump re-opens it (ADR Decision 8: poison STOPS
+/// reprocessing — the fact stays committed + keyed, only its derived view is
+/// absent). `ref_id` is the fact id for extract/categorize and the stable
+/// [`digest_id`] for a digest scope. Runs on the pool (no surrounding tx —
+/// there is no derived-view write to make atomic with the stamp).
+async fn stamp_poison(
+    pool: &PgPool,
+    kind: &str,
+    ref_id: Uuid,
+    tenant: &str,
+    model_id: &str,
+    prompt_version: &str,
+) -> Result<(), LlmError> {
+    sqlx::query(
+        "INSERT INTO derivation_runs (kind, ref_id, tenant_id, model_id, prompt_version) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (kind, ref_id) DO UPDATE \
+         SET model_id = EXCLUDED.model_id, prompt_version = EXCLUDED.prompt_version, \
+             applied_at = now()",
+    )
+    .bind(kind)
+    .bind(ref_id)
+    .bind(tenant)
+    .bind(model_id)
+    .bind(prompt_version)
+    .execute(pool)
     .await
     .map_err(|e| LlmError::Backend(e.to_string()))?;
     Ok(())
@@ -244,34 +303,55 @@ impl ExtractWorker {
             .worker_queue_depth(telemetry::WORKER_KIND_LLM_EXTRACT, depth);
     }
 
-    /// Apply every queued item now (tests + the binary's periodic pass). One
-    /// retry round for transient failures; a second failure dead-letters.
+    /// Apply every queued item now (tests + the binary's periodic pass). A
+    /// transient failure retries once per drain; a DETERMINISTIC poison
+    /// (schema-invalid output) is quarantined on first sight — retrying the
+    /// identical input cannot succeed (ADR Decision 8; ISI-6192 B2).
     pub async fn drain(&self) -> usize {
         let mut applied = 0usize;
         let mut retries: Vec<WorkItem> = Vec::new();
         loop {
             let item = { self.queue.lock().expect("extract queue lock").pop_front() };
             let Some(item) = item else { break };
-            if self.apply(&item).await.is_ok() {
-                applied += 1;
-            } else {
-                retries.push(item);
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                Err(_) => retries.push(item), // transient → one retry below
             }
         }
-        let mut poison_now: Vec<WorkItem> = Vec::new();
         for item in retries {
-            if self.apply(&item).await.is_ok() {
-                applied += 1;
-            } else {
-                poison_now.push(item);
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                // Still transient-failing after a retry: bump the gauge and drop
+                // from the live queue UNSTAMPED — the catch_up scan reaps the
+                // hole once the endpoint recovers (no durable quarantine).
+                Err(_) => self.dead_letter(&item),
             }
-        }
-        for item in poison_now {
-            self.dead_letter(&item);
         }
         self.instruments
             .worker_queue_depth(telemetry::WORKER_KIND_LLM_EXTRACT, 0);
         applied
+    }
+
+    /// Durable poison quarantine (ISI-6192 B2): stamp the fact so `catch_up`
+    /// skips it until a `(model_id, prompt_version)` bump re-opens it, and bump
+    /// the live poison gauge.
+    async fn quarantine(&self, item: &WorkItem) {
+        if let Err(e) = stamp_poison(
+            &self.pool,
+            RUN_KIND_EXTRACT,
+            item.fact_id,
+            &item.tenant,
+            self.generator.model_id(),
+            GenTask::Extract.prompt_version(),
+        )
+        .await
+        {
+            tracing::warn!(target: "memkeys", error = %e, fact_id = %item.fact_id,
+                "extract poison stamp failed; fact will be retried next pass");
+        }
+        self.dead_letter(item);
     }
 
     fn dead_letter(&self, item: &WorkItem) {
@@ -303,16 +383,26 @@ impl ExtractWorker {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| LlmError::Backend(e.to_string()))?;
-        let n = ids.len();
+        // Collect-and-continue (ISI-6192 B2): a single failing fact must NOT
+        // `?`-abort the tenant's backfill — at startup that would propagate to
+        // `main()` and wedge the boot. A deterministic poison is quarantined so
+        // it is not re-driven every tick; a transient failure is left for the
+        // next pass.
+        let mut applied = 0usize;
         for (id,) in ids {
-            self.apply(&WorkItem {
+            let item = WorkItem {
                 tenant: tenant.to_string(),
                 fact_id: id,
                 commit_span: None,
-            })
-            .await?;
+            };
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                Err(e) => tracing::warn!(target: "memkeys", error = %e, fact_id = %id,
+                    "extract catch_up transient failure; left for next pass"),
+            }
         }
-        Ok(n)
+        Ok(applied)
     }
 
     async fn apply(&self, item: &WorkItem) -> Result<(), LlmError> {
@@ -534,39 +624,30 @@ impl DigestWorker {
                 Err(_) => pending.push(item), // fetch failure → retry round below
             }
         }
-        // 2. One rollup per dirty scope (the coalesced debounce).
+        // 2. One rollup per dirty scope (the coalesced debounce). A transient
+        //    failure is retried once below; a DETERMINISTIC poison is
+        //    quarantined on first sight — no identical retry (ISI-6192 B2).
         let mut rolled = 0usize;
         let mut failed: Vec<(String, DigestScope, String)> = Vec::new();
         for (tenant, scope, scope_id) in &dirty {
             match self.rollup(tenant, *scope, scope_id, spans.first()).await {
                 Ok(()) => rolled += 1,
+                Err(e) if is_poison(&e) => self.quarantine_scope(tenant, *scope, scope_id).await,
                 Err(_) => failed.push((tenant.clone(), *scope, scope_id.clone())),
             }
         }
-        // 3. One retry round for transient failures; a second failure dead-letters.
-        let mut poison_now = Vec::new();
+        // 3. One retry round for transient failures; a still-failing transient
+        //    bumps the gauge only (the catch_up scan reaps the hole later), a
+        //    poison is quarantined durably so catch_up skips it.
         for key in failed {
-            if self
-                .rollup(&key.0, key.1, &key.2, spans.first())
-                .await
-                .is_err()
-            {
-                poison_now.push(key);
-            } else {
-                rolled += 1;
+            match self.rollup(&key.0, key.1, &key.2, spans.first()).await {
+                Ok(()) => rolled += 1,
+                Err(e) if is_poison(&e) => self.quarantine_scope(&key.0, key.1, &key.2).await,
+                Err(_) => self.poison_gauge(&key.0),
             }
         }
-        for (tenant, _, _) in poison_now {
-            let mut p = self.poison.lock().expect("poison lock");
-            let n = p.entry(tenant).or_insert(0);
-            *n += 1;
-            let v = *n;
-            drop(p);
-            self.instruments
-                .poison_queue_depth(telemetry::WORKER_KIND_DIGEST_ROLLUP, v);
-        }
         // Fetch-failure retries (rare — transient DB): one more pass; a second
-        // failure dead-letters the item (the catch-up scan reaps the hole later).
+        // failure bumps the gauge (the catch-up scan reaps the hole later).
         let mut pending_poison: Vec<WorkItem> = Vec::new();
         for item in pending {
             let mut scopes: BTreeSet<(String, DigestScope, String)> = BTreeSet::new();
@@ -596,23 +677,72 @@ impl DigestWorker {
             }
         }
         for item in pending_poison {
-            let mut p = self.poison.lock().expect("poison lock");
-            let n = p.entry(item.tenant).or_insert(0);
-            *n += 1;
-            let v = *n;
-            drop(p);
-            self.instruments
-                .poison_queue_depth(telemetry::WORKER_KIND_DIGEST_ROLLUP, v);
+            self.poison_gauge(&item.tenant);
         }
         self.instruments
             .worker_queue_depth(telemetry::WORKER_KIND_DIGEST_ROLLUP, 0);
         rolled
     }
 
+    /// Bump the live poison gauge for a tenant (dead-letter without a durable
+    /// stamp — a still-failing transient the catch_up scan will retry later).
+    fn poison_gauge(&self, tenant: &str) {
+        let mut p = self.poison.lock().expect("poison lock");
+        let n = p.entry(tenant.to_string()).or_insert(0);
+        *n += 1;
+        let v = *n;
+        drop(p);
+        self.instruments
+            .poison_queue_depth(telemetry::WORKER_KIND_DIGEST_ROLLUP, v);
+    }
+
+    /// Durable poison quarantine for a SCOPE (ISI-6192 B2): stamp
+    /// `derivation_runs(kind='digest_rollup', ref_id=digest_id)` at the current
+    /// version so the `catch_up` hole-scan skips this scope until a version bump
+    /// re-opens it, and bump the live gauge. A scope has no `derivation_runs`
+    /// success stamp (the `digests` row IS its success marker), so the stamp is
+    /// unambiguously a quarantine.
+    async fn quarantine_scope(&self, tenant: &str, scope: DigestScope, scope_id: &str) {
+        if let Err(e) = stamp_poison(
+            &self.pool,
+            RUN_KIND_DIGEST,
+            digest_id(tenant, scope, scope_id),
+            tenant,
+            self.generator.model_id(),
+            GenTask::Summarize.prompt_version(),
+        )
+        .await
+        {
+            tracing::warn!(target: "memkeys", error = %e, scope = scope.as_str(), scope_id,
+                "digest poison stamp failed; scope will be retried next pass");
+        }
+        self.poison_gauge(tenant);
+    }
+
     /// SoT convergence scan: scopes (per kind) with member facts but no
     /// current digest — or one stale versus the active derivation version —
-    /// are re-rolled.
+    /// are re-rolled. Scopes durably quarantined at the current version
+    /// (ISI-6192 B2) are skipped, and a per-scope failure NEVER `?`-aborts the
+    /// backfill (which at boot would wedge `main()`): a poison is quarantined,
+    /// a transient is left for the next pass.
     pub async fn catch_up(&self, tenant: &str) -> Result<usize, LlmError> {
+        // The scopes already quarantined at the CURRENT version — their
+        // digest_ids. A version bump empties this set → re-opens them.
+        let quarantined: std::collections::HashSet<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT ref_id FROM derivation_runs \
+             WHERE kind = $1 AND tenant_id = $2 AND model_id = $3 AND prompt_version = $4",
+        )
+        .bind(RUN_KIND_DIGEST)
+        .bind(tenant)
+        .bind(self.generator.model_id())
+        .bind(GenTask::Summarize.prompt_version())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| LlmError::Backend(e.to_string()))?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect();
+
         let mut n = 0usize;
         for scope in ALL_SCOPES {
             let ids: Vec<(String,)> = sqlx::query_as(&format!(
@@ -631,8 +761,18 @@ impl DigestWorker {
             .await
             .map_err(|e| LlmError::Backend(e.to_string()))?;
             for (scope_id,) in ids {
-                self.rollup(tenant, scope, &scope_id, None).await?;
-                n += 1;
+                if quarantined.contains(&digest_id(tenant, scope, &scope_id)) {
+                    continue; // durably poison at this version → do not re-drive
+                }
+                match self.rollup(tenant, scope, &scope_id, None).await {
+                    Ok(()) => n += 1,
+                    Err(e) if is_poison(&e) => {
+                        self.quarantine_scope(tenant, scope, &scope_id).await
+                    }
+                    Err(e) => tracing::warn!(target: "memkeys", error = %e,
+                        scope = scope.as_str(), scope_id,
+                        "digest catch_up transient failure; left for next pass"),
+                }
             }
         }
         Ok(n)
@@ -702,10 +842,21 @@ impl DigestWorker {
         scope_id: &str,
         members: &[MemberRow],
     ) -> Result<(), LlmError> {
-        // `scope_version` = the member count (monotonic per scope: facts are
-        // append-only, supersession only removes members) — a late rollup for
-        // an older version is a no-op (ADR Decision 6).
-        let scope_version = members.len() as i64;
+        // `scope_version` = the wall-clock microsecond epoch at which this
+        // rollup read its member snapshot (captured here, immediately after the
+        // `rollup` SELECT). It is MONOTONIC across rollups — a later rollup read
+        // a later state of the scope — so the `scope_version <= EXCLUDED`
+        // late-rollup guard still rejects a stale coalesced rollup landing late,
+        // while a correct newer rollup ALWAYS wins. The member COUNT is NOT
+        // monotonic (ISI-6192 B1): a supersession whose superseder leaves the
+        // scope, or a retention sweep, shrinks it — a count-based version would
+        // then permanently reject the correct smaller rollup and freeze the
+        // digest on a stale summary.
+        // ponytail: cross-process clock skew (microservice profile, >1 worker
+        // pod) could misorder two near-simultaneous rollups of the SAME scope;
+        // bounded by NTP + per-scope coalescing. Upgrade path if ever hit: a
+        // DB-assigned per-scope sequence.
+        let scope_version = Utc::now().timestamp_micros();
         let input = serde_json::to_value(SummarizeInput::new(
             scope.as_str(),
             scope_id,
@@ -752,10 +903,7 @@ impl DigestWorker {
             .map_err(|e| LlmError::Backend(format!("digest summary embed failed: {e}")))?;
 
         // Stable digest id per (tenant, scope, scope_id) — the upsert target.
-        let digest_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("memkeys/digest/{tenant}/{}/{scope_id}", scope.as_str()).as_bytes(),
-        );
+        let digest_id = digest_id(tenant, scope, scope_id);
         let member_ids: Vec<Uuid> = members.iter().map(|m| m.0).collect();
         let encoded = crate::pg_vector::encode_vector(&embedding);
         // Late-rollup guard: only overwrite when the incoming scope_version is
@@ -840,8 +988,9 @@ impl CategorizeWorker {
             .worker_queue_depth(telemetry::WORKER_KIND_CATEGORIZE, depth);
     }
 
-    /// Apply every queued item now (tests + the binary's periodic pass). One
-    /// retry round for transient failures; a second failure dead-letters.
+    /// Apply every queued item now (tests + the binary's periodic pass). A
+    /// transient failure retries once per drain; a DETERMINISTIC poison is
+    /// quarantined on first sight (ADR Decision 8; ISI-6192 B2).
     pub async fn drain(&self) -> usize {
         let mut applied = 0usize;
         let mut retries: Vec<WorkItem> = Vec::new();
@@ -853,26 +1002,40 @@ impl CategorizeWorker {
                     .pop_front()
             };
             let Some(item) = item else { break };
-            if self.apply(&item).await.is_ok() {
-                applied += 1;
-            } else {
-                retries.push(item);
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                Err(_) => retries.push(item),
             }
         }
-        let mut poison_now: Vec<WorkItem> = Vec::new();
         for item in retries {
-            if self.apply(&item).await.is_ok() {
-                applied += 1;
-            } else {
-                poison_now.push(item);
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                Err(_) => self.dead_letter(&item),
             }
-        }
-        for item in poison_now {
-            self.dead_letter(&item);
         }
         self.instruments
             .worker_queue_depth(telemetry::WORKER_KIND_CATEGORIZE, 0);
         applied
+    }
+
+    /// Durable poison quarantine (ISI-6192 B2) — see [`ExtractWorker::quarantine`].
+    async fn quarantine(&self, item: &WorkItem) {
+        if let Err(e) = stamp_poison(
+            &self.pool,
+            RUN_KIND_CATEGORIZE,
+            item.fact_id,
+            &item.tenant,
+            self.generator.model_id(),
+            GenTask::Categorize.prompt_version(),
+        )
+        .await
+        {
+            tracing::warn!(target: "memkeys", error = %e, fact_id = %item.fact_id,
+                "categorize poison stamp failed; fact will be retried next pass");
+        }
+        self.dead_letter(item);
     }
 
     fn dead_letter(&self, item: &WorkItem) {
@@ -902,16 +1065,23 @@ impl CategorizeWorker {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| LlmError::Backend(e.to_string()))?;
-        let n = ids.len();
+        // Collect-and-continue (ISI-6192 B2): never `?`-abort the backfill on a
+        // single poison fact (would wedge the boot-time scan).
+        let mut applied = 0usize;
         for (id,) in ids {
-            self.apply(&WorkItem {
+            let item = WorkItem {
                 tenant: tenant.to_string(),
                 fact_id: id,
                 commit_span: None,
-            })
-            .await?;
+            };
+            match self.apply(&item).await {
+                Ok(()) => applied += 1,
+                Err(e) if is_poison(&e) => self.quarantine(&item).await,
+                Err(e) => tracing::warn!(target: "memkeys", error = %e, fact_id = %id,
+                    "categorize catch_up transient failure; left for next pass"),
+            }
         }
-        Ok(n)
+        Ok(applied)
     }
 
     async fn apply(&self, item: &WorkItem) -> Result<(), LlmError> {
