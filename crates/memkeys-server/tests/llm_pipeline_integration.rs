@@ -612,7 +612,8 @@ async fn stage_5c_catch_up_fills_missing_scope_rollups() {
     let (v, m, _, _) = digest_row(&ctx, &tenant, "thread", "t-1")
         .await
         .expect("catch-up rollup exists");
-    assert_eq!((v as usize, m.len()), (1, 1));
+    assert!(v > 0, "scope_version is the member-read wall-clock epoch");
+    assert_eq!(m.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +761,7 @@ async fn derived_views_are_tenant_partitioned() {
     let (v, members, _, _) = digest_row(&ctx, &tenant_a, "thread", "t-a")
         .await
         .expect("digest");
-    assert_eq!(v, 1);
+    assert!(v > 0, "scope_version is the member-read wall-clock epoch");
     assert_eq!(
         members,
         vec![fact_a],
