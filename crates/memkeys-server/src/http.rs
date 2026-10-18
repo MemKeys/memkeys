@@ -6,9 +6,12 @@
 //!   POST /memory/graph/traverse   → service.traverse()
 //!   POST /memory/search           → 501 feature_disabled
 //!
-//! Admission: `X-MemKeys-Tenant` is required on every request. When
-//! `MEMKEYS_AUTH_TOKEN` is set, `X-MemKeys-Token` must match it
-//! (constant-time comparison).
+//! Admission + per-tenant authz (ISI-6151, WS-5 §2.2/§3, closes the §7.4/R6
+//! deviation): every request is authenticated by a verified bearer token and
+//! the tenant floor is DERIVED from its claims — never from a client-supplied
+//! `X-MemKeys-Tenant` header (which is now ignored). The admission layer then
+//! load-sheds (§7 `rate_limited`), caps write size (F14), and throttles
+//! boundary-probing (F15) via the shared [`AdmissionControl`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +19,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -24,6 +27,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::admission::AdmissionControl;
+use crate::auth::{JwtVerifier, Principal, StaticVerifier, TokenVerifier};
 use crate::envelope::Envelope;
 use crate::error::{IngestError, QueryError};
 use crate::graph::{
@@ -31,9 +36,9 @@ use crate::graph::{
     DEFAULT_NODE_BUDGET,
 };
 use crate::model::{EntityKey, KeyedQuery, Validity};
-use crate::pipeline::CallerContext;
 use crate::service::{IngestReceipt, MemKeysService};
 use crate::telemetry::{self, TRANSPORT_HTTP};
+use crate::wire::WireError;
 use opentelemetry::trace::{FutureExt, TraceContextExt};
 use opentelemetry::Context;
 
@@ -41,23 +46,46 @@ use opentelemetry::Context;
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<MemKeysService>,
-    /// Bearer token loaded from `MEMKEYS_AUTH_TOKEN`; `None` = open (dev/test).
-    pub auth_token: Option<String>,
+    /// Verifies a presented bearer token into a [`Principal`] (§3). The tenant
+    /// floor is read from the verified claims, never a request header.
+    pub verifier: Arc<dyn TokenVerifier>,
+    /// Shared self-protection layer (load shed / size caps / probe throttle).
+    pub admission: Arc<AdmissionControl>,
 }
 
 impl AppState {
-    pub fn new(service: Arc<MemKeysService>) -> Self {
-        let auth_token = std::env::var("MEMKEYS_AUTH_TOKEN").ok();
+    /// Explicit constructor — tests inject a verifier + admission directly.
+    pub fn new(
+        service: Arc<MemKeysService>,
+        verifier: Arc<dyn TokenVerifier>,
+        admission: Arc<AdmissionControl>,
+    ) -> Self {
         Self {
             service,
-            auth_token,
+            verifier,
+            admission,
         }
     }
-}
 
-/// Tenant id extracted by admission middleware; forwarded via `Extension`.
-#[derive(Clone, Debug)]
-pub struct TenantId(pub String);
+    /// Build HTTP state from the environment, sharing `admission` with the
+    /// process's other transports.
+    ///
+    /// - `MEMKEYS_JWT_SECRET` set → per-request HS256 [`JwtVerifier`]: the
+    ///   authenticated path, tenant floor from the token's `company_id` claim.
+    /// - unset → an insecure dev [`StaticVerifier`] bound to one fixed,
+    ///   server-side tenant (`MEMKEYS_RUN_TENANT`/`MEMKEYS_DEV_TENANT`, default
+    ///   `dev`). Still never client-supplied; `main` refuses a non-loopback
+    ///   bind in this mode unless the operator opts in.
+    pub fn from_env(service: Arc<MemKeysService>, admission: Arc<AdmissionControl>) -> Self {
+        let verifier: Arc<dyn TokenVerifier> = match std::env::var("MEMKEYS_JWT_SECRET") {
+            Ok(secret) if !secret.is_empty() => Arc::new(JwtVerifier::new(secret.into_bytes())),
+            _ => Arc::new(StaticVerifier::new(
+                crate::auth::run_token_principal_from_env(),
+            )),
+        };
+        Self::new(service, verifier, admission)
+    }
+}
 
 /// Build the `/memory/*` axum `Router`.
 pub fn router(state: AppState) -> Router {
@@ -71,7 +99,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 // ---------------------------------------------------------------------------
-// Admission middleware
+// Admission + authentication middleware
 // ---------------------------------------------------------------------------
 
 async fn admit(
@@ -80,41 +108,62 @@ async fn admit(
     mut req: Request,
     next: Next,
 ) -> Response {
-    // 1. Tenant header — required on every request.
-    let tenant = match headers
-        .get("x-memkeys-tenant")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-    {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "X-MemKeys-Tenant header is required"})),
-            )
-                .into_response();
-        }
+    // Gate 1 (§7 load-shed): take an in-flight permit before any work. The
+    // guard is held across `next.run`, so the in-flight gauge tracks real work
+    // and releases on every return path (RAII).
+    let _guard = match state.admission.try_admit() {
+        Ok(g) => g,
+        Err(e) => return wire_error_response(&e),
     };
 
-    // 2. Optional bearer token check (constant-time XOR-fold over same-length
-    //    bytes — short-circuits only on length mismatch, which is acceptable
-    //    for a bearer-token gate where length is not a secret).
-    if let Some(expected) = &state.auth_token {
-        let provided = headers
-            .get("x-memkeys-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !ct_eq(expected, provided) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid or missing X-MemKeys-Token"})),
-            )
-                .into_response();
+    // Authenticate: the tenant floor is DERIVED from a verified bearer token,
+    // never from a client-supplied header (§7.4/R6, ISI-6151). Any
+    // `X-MemKeys-Tenant` header is ignored. A missing/invalid/expired token is
+    // `unauthenticated` (401) — never a distinct error that reveals why (§3/§7).
+    let now = chrono::Utc::now().timestamp();
+    let principal = match state.verifier.verify(bearer_token(&headers), now) {
+        Ok(p) => p,
+        Err(e) => return wire_error_response(&e),
+    };
+
+    req.extensions_mut().insert(principal);
+    next.run(req).await
+}
+
+/// Extract the raw bearer token: `Authorization: Bearer <t>` (standard), or the
+/// legacy `X-MemKeys-Token` header. Empty when neither is present — the
+/// verifier decides whether that is acceptable (the dev `StaticVerifier`
+/// ignores it; `JwtVerifier` rejects it as `unauthenticated`).
+fn bearer_token(headers: &HeaderMap) -> &str {
+    if let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(rest) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+        {
+            return rest.trim();
         }
     }
+    headers
+        .get("x-memkeys-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
-    req.extensions_mut().insert(TenantId(tenant));
-    next.run(req).await
+/// Render a [`WireError`] as the HTTP response: the WS-5 §7 taxonomy status +
+/// the structured error body, with `Retry-After` set when the error carries it.
+fn wire_error_response(e: &WireError) -> Response {
+    let status = StatusCode::from_u16(e.error_code().http_status())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut resp = (status, Json(e)).into_response();
+    if let Some(secs) = e.retry_after_secs {
+        if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 /// The HTTP transport-boundary span context (ISI-6134 B1). Attach the returned
@@ -128,17 +177,6 @@ fn http_transport_cx() -> Context {
         TRANSPORT_HTTP,
         None,
     ))
-}
-
-/// XOR-fold constant-time equality (same length, no short-circuit on content).
-fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -170,14 +208,24 @@ impl From<IngestReceipt> for IngestResponse {
 
 async fn ingest(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Json(envelope): Json<Envelope>,
 ) -> Response {
-    let caller = CallerContext {
-        tenant_id: tenant.0.clone(),
-        principal: "http".to_string(),
-        trace_id: None,
-    };
+    // Gate 2 (F14): reject an over-cap write before the pipeline can plant an
+    // unbounded body. `fact.body` is arbitrary JSON — size it by its serialized
+    // byte length.
+    let body_bytes = serde_json::to_vec(&envelope.fact.body)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if let Err(e) = state
+        .admission
+        .check_write_size(body_bytes, envelope.attachments.len())
+    {
+        return wire_error_response(&e);
+    }
+    // The caller context — tenant floor + producer principal — comes from the
+    // verified token, not the request body (ISI-6151).
+    let caller = principal.caller_context();
     let now = chrono::Utc::now();
     // `with_context` attaches the transport span's context for each poll without
     // holding a `!Send` `ContextGuard` across `.await` (which would make the
@@ -216,7 +264,7 @@ async fn ingest(
 
 async fn fetch(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let query = match build_keyed_query(&params) {
@@ -231,10 +279,11 @@ async fn fetch(
     };
     // Transport span created on the served path (after argument validation),
     // attached via `with_context` to stay `Send` across `.await` (see `ingest`).
+    // The tenant floor is the verified principal's, not a request header.
     let cx = http_transport_cx();
     let result = state
         .service
-        .fetch_by_keys(&tenant.0, &query)
+        .fetch_by_keys(&principal.tenant_id, &query)
         .with_context(cx.clone())
         .await;
     cx.span().end();
@@ -351,11 +400,13 @@ fn default_deadline_ms() -> u64 {
 
 async fn traverse(
     State(state): State<AppState>,
-    Extension(tenant): Extension<TenantId>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<TraverseReqWire>,
 ) -> Response {
+    // The tenant floor is the verified principal's — `service.traverse`
+    // overwrites `req.tenant` with it, so a request cannot assert another.
     let req = TraverseReq {
-        tenant: tenant.0.clone(),
+        tenant: principal.tenant_id.clone(),
         project: None,
         start: body.start,
         edges: body.edges,
@@ -370,17 +421,28 @@ async fn traverse(
     let cx = http_transport_cx();
     let result = state
         .service
-        .traverse(&tenant.0, &req)
+        .traverse(&principal.tenant_id, &req)
         .with_context(cx.clone())
         .await;
     cx.span().end();
     match result {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(GraphError::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not found"})),
-        )
-            .into_response(),
+        // A boundary-crossing miss is also the §3.3 existence oracle — record it
+        // (F15) and convert to a `rate_limited` throttle once a principal is over
+        // its probe budget, so fail-closed `not_found` is not unlimited.
+        Err(GraphError::NotFound) => {
+            if let Err(throttle) = state
+                .admission
+                .record_boundary_miss(&principal.tenant_id, chrono::Utc::now().timestamp())
+            {
+                return wire_error_response(&throttle);
+            }
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not found"})),
+            )
+                .into_response()
+        }
         Err(GraphError::Invalid(msg)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": msg})),
@@ -422,12 +484,20 @@ mod tests {
     }
 
     #[test]
-    fn ct_eq_matches_only_identical_strings() {
-        assert!(ct_eq("secret", "secret"));
-        assert!(!ct_eq("secret", "Secret"));
-        assert!(!ct_eq("secret", "secre")); // length mismatch
-        assert!(!ct_eq("", "x"));
-        assert!(ct_eq("", ""));
+    fn bearer_token_reads_authorization_then_legacy_header() {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer abc.def.ghi".parse().unwrap());
+        assert_eq!(bearer_token(&h), "abc.def.ghi");
+        // Case-insensitive scheme.
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "bearer tok".parse().unwrap());
+        assert_eq!(bearer_token(&h), "tok");
+        // Legacy X-MemKeys-Token fallback.
+        let mut h = HeaderMap::new();
+        h.insert("x-memkeys-token", "legacy".parse().unwrap());
+        assert_eq!(bearer_token(&h), "legacy");
+        // Neither present → empty (verifier decides).
+        assert_eq!(bearer_token(&HeaderMap::new()), "");
     }
 
     #[test]
