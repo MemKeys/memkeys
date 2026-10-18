@@ -44,6 +44,64 @@ pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
 pub const OUTCOME_DUPLICATE: &str = "duplicate";
 
+/// M3 protocol-surface attribute values (`memkeys.transport`). stdio = a
+/// launch-bound single-principal subprocess; http = the per-request-auth
+/// Streamable-HTTP shared server (WS-5 §2).
+pub const TRANSPORT_STDIO: &str = "stdio";
+pub const TRANSPORT_HTTP: &str = "http";
+
+/// The protocol surface a service call arrived on — the transport and, for
+/// MCP, the tool name. Stamped onto the `memkeys.fact.ingest` / `memkeys.retrieve`
+/// SERVER spans as `memkeys.transport` + `memkeys.mcp.tool` (WS-5 §7 / ISI-6137
+/// B1+B2). A direct library/test call has no protocol surface ([`INTERNAL`]) and
+/// emits neither attribute — the transport registry keys carry only real
+/// protocol traffic. Tool *names* only; never argument values (the deny-list).
+///
+/// [`INTERNAL`]: CallScope::INTERNAL
+#[derive(Debug, Clone, Copy)]
+pub struct CallScope {
+    pub transport: Option<&'static str>,
+    pub tool: Option<&'static str>,
+}
+
+impl CallScope {
+    /// A direct library/test call: no protocol surface, no transport attrs.
+    pub const INTERNAL: CallScope = CallScope {
+        transport: None,
+        tool: None,
+    };
+
+    /// An HTTP `/memory/*` request (no MCP tool name on this transport).
+    pub const fn http() -> CallScope {
+        CallScope {
+            transport: Some(TRANSPORT_HTTP),
+            tool: None,
+        }
+    }
+
+    /// An MCP `tools/call` over stdio, carrying the ratified tool name.
+    pub const fn stdio(tool: &'static str) -> CallScope {
+        CallScope {
+            transport: Some(TRANSPORT_STDIO),
+            tool: Some(tool),
+        }
+    }
+
+    /// The span attributes this scope contributes (empty for [`INTERNAL`]).
+    ///
+    /// [`INTERNAL`]: CallScope::INTERNAL
+    pub fn span_attrs(&self) -> Vec<KeyValue> {
+        let mut v = Vec::new();
+        if let Some(t) = self.transport {
+            v.push(attr("memkeys.transport", t));
+        }
+        if let Some(tool) = self.tool {
+            v.push(attr("memkeys.mcp.tool", tool));
+        }
+        v
+    }
+}
+
 /// The complete attribute-key registry every signal may carry (signal-catalog
 /// "Custom attribute registry" + the pinned stable db.* group). Anything not
 /// listed is a catalog violation and is refused in debug builds.
@@ -56,6 +114,11 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memkeys.projection.kind",
     "memkeys.graph.depth",
     "memkeys.graph.truncate.reason",
+    // M3 protocol surface (WS-5 §2/§7): the transport the request arrived on
+    // and the MCP tool name. Kinds/names only — never argument VALUES (the
+    // deny-list still holds: no bodies, no entity-key values, no query text).
+    "memkeys.transport",
+    "memkeys.mcp.tool",
     "outcome",
     // Pinned stable db.* group (semconv-pins.yaml; db.query.text is DISABLED).
     "db.system.name",
@@ -124,6 +187,29 @@ pub fn start_child_span(
         .with_kind(kind)
         .with_attributes(attrs)
         .start_with_context(&tracer(), parent)
+}
+
+/// Transport-boundary SERVER span (M3, WS-5 §7.6). This is the ingress span for
+/// a single protocol call; it carries the protocol surface (`memkeys.transport`)
+/// and, for an MCP `tools/call`, the tool name (`memkeys.mcp.tool`). Emitting
+/// here is what makes those two registry keys *live* — before M3 they were
+/// registered in [`ALLOWED_ATTR_KEYS`] but never emitted (ISI-6134 B1/B2).
+///
+/// The service's own `memkeys.fact.ingest` / `memkeys.retrieve` spans nest
+/// beneath this one when the returned span's context is attached around the
+/// service call (OTel parents a new span to the current context on its first,
+/// synchronous poll). Attribute VALUES are kinds/names only — never argument
+/// bodies (the deny-list still holds).
+pub fn transport_span(
+    span_name: &'static str,
+    transport: &'static str,
+    mcp_tool: Option<&str>,
+) -> global::BoxedSpan {
+    let mut attrs = vec![attr("memkeys.transport", transport)];
+    if let Some(tool) = mcp_tool {
+        attrs.push(attr("memkeys.mcp.tool", tool.to_string()));
+    }
+    start_span(span_name, SpanKind::Server, attrs)
 }
 
 /// The M1 instrument set, built once per process from the global meter.
@@ -312,5 +398,20 @@ mod tests {
         // M2 graph additions (WS-7 catalog enums; ISI-5911 promotion signals).
         assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.graph.depth"));
         assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.worker.kind"));
+        // M3 protocol surface — now emitted via transport_span (ISI-6134 B1/B2).
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.transport"));
+        assert!(ALLOWED_ATTR_KEYS.contains(&"memkeys.mcp.tool"));
+    }
+
+    #[test]
+    fn transport_span_attrs_are_registry_valid() {
+        // Would panic in debug (attr()'s debug_assert) if either key were not
+        // registered — the regression guard for "registered but never emitted".
+        let _http = transport_span("memkeys.http.request", TRANSPORT_HTTP, None);
+        let _mcp = transport_span(
+            "memkeys.mcp.tool_call",
+            TRANSPORT_STDIO,
+            Some("memory_store"),
+        );
     }
 }

@@ -13,10 +13,14 @@
 //! `memkeys.commit` (db.* attributes, db.query.text denied), retrieval is
 //! `memkeys.retrieve` → `memkeys.store.query`.
 
+pub mod admission;
+pub mod auth;
 pub mod envelope;
 pub mod error;
 pub mod graph;
 pub mod health;
+pub mod http;
+pub mod mcp;
 pub mod memstore;
 pub mod model;
 pub mod pg;
@@ -26,8 +30,11 @@ pub mod service;
 pub mod store;
 pub mod telemetry;
 pub mod telemetry_setup;
+pub mod wire;
 pub mod worker;
 
+pub use admission::{AdmissionConfig, AdmissionControl};
+pub use auth::{JwtVerifier, Principal, StaticVerifier, TokenVerifier};
 pub use envelope::{EntityHints, Envelope, FactBlock, SourceBlock, SourceKind};
 pub use error::{IngestError, QueryError};
 pub use graph::{
@@ -41,4 +48,5 @@ pub use pg_graph::PgGraph;
 pub use pipeline::{CallerContext, EntityResolver, NoopResolver, RunBinding, ThreadBinding};
 pub use service::{IngestReceipt, MemKeysService};
 pub use store::{CommitOutcome, FactStore};
+pub use wire::{ErrorCode, WireError};
 pub use worker::GraphProjectionWorker;

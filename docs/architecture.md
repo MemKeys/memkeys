@@ -703,6 +703,44 @@ store. Operations 3 and 4 never carry body text from the graph or vector index �
 ids; the hydration step in §5.2 is always the final authority. This is what allows callers
 to mix retrieval operations and still get coherent, authoritative results.
 
+### 7.6 Principal↔tenant binding — known M3 limitation (ISI-6137 S1)
+
+§7.4/R6 states the governing invariant: *the tenant floor is the caller's authenticated
+principal — "never supplied by, nor omittable by, the client."* **The M3 transport does not
+yet realize that invariant, and ships with a documented deviation from it.**
+
+- **What M3 ships.** Both transports accept the tenant as a *self-asserted* value — the
+  `X-MemKeys-Tenant` HTTP header and the MCP `tenant_id` tool argument — gated (on HTTP) only
+  by a single optional global bearer token (`MEMKEYS_AUTH_TOKEN`). There is no per-principal
+  token whose claims *derive* the tenant floor. stdio has no principal check at all; it trusts
+  the launch-bound pipe (unlike the WS-5 §2.1 launch-bound run token, which M3 does not verify).
+- **Consequence.** Any caller who clears the single token (or reaches an untokened server) can
+  assert *any* tenant id → **cross-tenant read/write impersonation**. This is a confidentiality
+  and integrity boundary violation, not a degraded-mode inconvenience.
+- **Decision (Architect, Winston).** Full per-tenant authz is **deferred out of the M3 transport
+  milestone**. M3's charter is transport wiring (HTTP + MCP over the existing service); replacing
+  the tenant-trust model with token-claim-derived floors is a security-critical change to the
+  contract on *both* transports and must land as its own reviewed, integration-tested PR — not
+  bundled into transport plumbing where it cannot be reviewed on its merits. Bundling it here
+  would make an un-reviewable PR and risk shipping an under-tested authz path, which is worse
+  than a clearly-fenced known limitation.
+- **Mitigation shipped in M3 (ISI-6137 B3).** The server binds **loopback by default**
+  (`127.0.0.1`). A non-loopback bind with no `MEMKEYS_AUTH_TOKEN` is **refused at startup**
+  unless the operator sets `MEMKEYS_ALLOW_INSECURE=1`, which also emits a loud warning. The
+  fail-open admission surface is therefore not network-reachable in the default deployment, and
+  single-tenant / trusted-loopback deployments are safe to run today.
+- **Closure path.** A dedicated follow-up issue wires token-verified principals into the tenant
+  floor on both transports: HTTP verifies a per-request bearer token and derives `tenant_id`
+  from its claims (never the header); stdio binds the principal once at launch from the run
+  token (§2.1). Reference groundwork already exists in the M3 branch as an uncommitted module
+  (`crates/memkeys-server/src/auth.rs` — an HS256 `JwtVerifier` deriving the R6 floor from
+  `company_id`, plus a `StaticVerifier` for the stdio launch binding) and the `wire.rs` §7 error
+  taxonomy (`unauthenticated`/`forbidden`/`not_found` collapse). That follow-up, not M3, is where
+  §7.4/R6 becomes enforced rather than asserted.
+
+Until that follow-up lands, **MemKeys M3 must not be exposed to mutually-distrusting tenants on
+a shared network bind.** This limitation is restated in the ISI-6077 PR body.
+
 ## 8. What the first prototype proves
 
 **Roundtrip: flush → key → hydrate-by-issue.**
