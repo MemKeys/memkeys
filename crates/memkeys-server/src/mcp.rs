@@ -438,7 +438,17 @@ async fn tool_search(
     let mut fact_type: Option<FactType> = None;
     if let Some(obj) = args["scope"].as_object() {
         for (k, v) in obj {
-            let Some(val) = v.as_str() else { continue };
+            // A non-string scope value is rejected, never silently skipped: HTTP
+            // types `scope` as a string→string map and rejects these, so a
+            // dropped value here would silently WIDEN the within-tenant result
+            // set (the narrowing filter vanishes) with no caller signal. Reject
+            // for transport parity (ISI-6172 NB2 / CR ISI-6168).
+            let Some(val) = v.as_str() else {
+                return Err(WireError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("scope value for '{k}' must be a string"),
+                ));
+            };
             if let Some((_, ek)) = KEY_MAP.iter().find(|(name, _)| name == k) {
                 scope.push((*ek, val.to_string()));
             } else if k == "fact.type" || k == "type" {

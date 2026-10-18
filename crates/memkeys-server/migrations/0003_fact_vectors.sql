@@ -30,6 +30,13 @@ CREATE TABLE fact_vectors (
     tenant_id      TEXT        NOT NULL,      -- §7.4 R6 hard isolation floor
     embedding      vector(256) NOT NULL,      -- dim MUST match the embedder (HashEmbedder = 256)
     fact_type      TEXT        NOT NULL,      -- carried key (scope facet; never body)
+    -- Transaction axis (= facts.ingested_at): the "known by then" clock §7.4's
+    -- `as_of` bounds the candidate set against — WHERE ingested_at <= as_of.
+    -- Carried here so the UNSCOPED (whole-tenant, CandidateSet::All) semantic
+    -- path can honor `as_of` without a FactStore round-trip; the keyed-scope
+    -- path already bounds candidates via fetch_by_keys. Without it, an unscoped
+    -- `as_of` search would silently rank over facts newer than as_of (ISI-6172).
+    ingested_at    TIMESTAMPTZ NOT NULL,
     entity_project TEXT,
     entity_issue   TEXT,
     entity_pr      TEXT,

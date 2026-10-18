@@ -460,6 +460,7 @@ impl VectorProjectionWorker {
                     service: row.entity_service.clone(),
                     counterpart_agent: row.counterpart_agent.clone(),
                 },
+                ingested_at: row.ingested_at,
             })
             .await
     }

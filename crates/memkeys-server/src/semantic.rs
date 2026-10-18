@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::model::EntityKeys;
@@ -171,6 +172,11 @@ pub struct FactVector {
     pub embedding: Vec<f32>,
     pub fact_type: String,
     pub entity: EntityKeys,
+    /// Transaction axis (= `facts.ingested_at`): the fact's "known by" time.
+    /// The unscoped (`CandidateSet::All`) ANN pass filters `ingested_at <=
+    /// as_of` so a whole-tenant `as_of` search is temporally bounded — not a
+    /// silent read over newer-than-as_of facts (§7.4; ISI-6172).
+    pub ingested_at: DateTime<Utc>,
 }
 
 /// A similarity hit from the index: an id and its score (cosine, in `[-1, 1]`).
@@ -204,12 +210,20 @@ pub trait VectorIndex: Send + Sync {
     /// ANN search for the top-`k` most similar facts to `query`, bounded to
     /// `tenant` (the hard multi-tenancy boundary) and restricted to
     /// `candidates` (the scope pre-filter). Results are score-descending.
+    ///
+    /// `as_of` is the §7.4 point-in-time bound ("facts known by then"): when
+    /// `Some`, only facts with `ingested_at <= as_of` are eligible. It MUST be
+    /// honored on the `CandidateSet::All` (whole-tenant) path too — a keyed
+    /// scope already bounds its candidate ids by `as_of`, but the unscoped path
+    /// has no such pre-filter, so without this an unscoped `as_of` search would
+    /// silently rank over facts newer than `as_of` (ISI-6172 / CR ISI-6168 B1).
     async fn search(
         &self,
         tenant: &str,
         candidates: &CandidateSet,
         query: &[f32],
         k: usize,
+        as_of: Option<DateTime<Utc>>,
     ) -> Result<Vec<ScoredId>, VectorError>;
 
     /// Drop every vector for a tenant/fact (retention sweep / disable, §5.4.2).
@@ -263,6 +277,7 @@ impl VectorIndex for MemVectorIndex {
         candidates: &CandidateSet,
         query: &[f32],
         k: usize,
+        as_of: Option<DateTime<Utc>>,
     ) -> Result<Vec<ScoredId>, VectorError> {
         let g = self.inner.lock().expect("vector index lock");
         let Some(by_id) = g.get(tenant) else {
@@ -274,6 +289,9 @@ impl VectorIndex for MemVectorIndex {
                 CandidateSet::All => true,
                 CandidateSet::Only(ids) => ids.contains(&fv.fact_id),
             })
+            // §7.4 point-in-time bound: drop facts not yet known at `as_of`.
+            // Applies on every candidate path, All included (ISI-6172).
+            .filter(|fv| as_of.is_none_or(|t| fv.ingested_at <= t))
             .map(|fv| ScoredId {
                 fact_id: fv.fact_id,
                 score: cosine(query, &fv.embedding),
@@ -449,13 +467,30 @@ mod tests {
         assert_eq!(cosine(&q, &z), 0.0);
     }
 
+    /// A fixed "long ago" ingest time so the as_of-agnostic tests (which pass
+    /// `None`) are unaffected; the temporal test uses [`vec_of_at`].
+    fn epoch() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_600_000_000, 0).unwrap()
+    }
+
     async fn vec_of(e: &HashEmbedder, tenant: &str, n: u128, text: &str) -> FactVector {
+        vec_of_at(e, tenant, n, text, epoch()).await
+    }
+
+    async fn vec_of_at(
+        e: &HashEmbedder,
+        tenant: &str,
+        n: u128,
+        text: &str,
+        at: DateTime<Utc>,
+    ) -> FactVector {
         FactVector {
             fact_id: id(n),
             tenant_id: tenant.into(),
             embedding: e.embed(text).await.unwrap(),
             fact_type: "decision".into(),
             entity: EntityKeys::default(),
+            ingested_at: at,
         }
     }
 
@@ -473,7 +508,7 @@ mod tests {
         let q = e.embed("postgres decision").await.unwrap();
         // team-a's search must NEVER see team-b's fact (§5.4.2 hard boundary).
         let hits = idx
-            .search("team-a", &CandidateSet::All, &q, 10)
+            .search("team-a", &CandidateSet::All, &q, 10, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -493,11 +528,45 @@ mod tests {
 
         let q = e.embed("postgres decision").await.unwrap();
         let hits = idx
-            .search("t", &CandidateSet::Only(vec![id(2)]), &q, 10)
+            .search("t", &CandidateSet::Only(vec![id(2)]), &q, 10, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].fact_id, id(2));
+    }
+
+    #[tokio::test]
+    async fn as_of_bounds_unscoped_candidate_set() {
+        // Regression for ISI-6172 (CR ISI-6168 B1): on the UNSCOPED
+        // (CandidateSet::All, whole-tenant) path, `as_of` must still drop facts
+        // ingested after it — not silently rank over newer-than-as_of vectors.
+        let e = HashEmbedder::new();
+        let idx = MemVectorIndex::new();
+        let old = DateTime::from_timestamp(1_000, 0).unwrap();
+        let new = DateTime::from_timestamp(2_000, 0).unwrap();
+        idx.upsert(&vec_of_at(&e, "t", 1, "postgres decision", old).await)
+            .await
+            .unwrap();
+        idx.upsert(&vec_of_at(&e, "t", 2, "postgres decision", new).await)
+            .await
+            .unwrap();
+
+        let q = e.embed("postgres decision").await.unwrap();
+        // as_of between the two ingests: only the older fact is "known by then".
+        let cutoff = DateTime::from_timestamp(1_500, 0).unwrap();
+        let hits = idx
+            .search("t", &CandidateSet::All, &q, 10, Some(cutoff))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "as_of must bound the whole-tenant path");
+        assert_eq!(hits[0].fact_id, id(1));
+
+        // No as_of ⇒ both facts eligible (the live-head read).
+        let all = idx
+            .search("t", &CandidateSet::All, &q, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

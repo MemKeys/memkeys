@@ -657,6 +657,11 @@ impl MemKeysService {
         // fetch to bound the candidate ids; an empty scope is the whole tenant
         // floor (CandidateSet::All). Either way the tenant floor is enforced by
         // `vector.search`, which is the hard boundary.
+        // An empty scope is the whole tenant floor (CandidateSet::All, R6 — so
+        // `unkeyed` facts stay reachable). `as_of` is NOT dropped here: it is
+        // honored on the All path by the vector tier's `ingested_at <= as_of`
+        // filter below, so an unscoped `as_of` search is temporally bounded
+        // (ISI-6172 / CR ISI-6168 B1), not a silent newer-than-as_of read.
         let candidates = if req.scope.is_empty() {
             CandidateSet::All
         } else {
@@ -677,7 +682,7 @@ impl MemKeysService {
             .await
             .map_err(|e| QueryError::Semantic(e.to_string()))?;
         let scored = vector
-            .search(caller_tenant, &candidates, &qvec, k)
+            .search(caller_tenant, &candidates, &qvec, k, req.as_of)
             .await
             .map_err(|e| QueryError::Semantic(e.to_string()))?;
 
@@ -1006,6 +1011,7 @@ mod tests {
                 embedding: embedder.embed(&f.body).await.unwrap(),
                 fact_type: f.fact_type.as_str().into(),
                 entity: f.entity.clone(),
+                ingested_at: f.ingested_at,
             })
             .await
             .unwrap();

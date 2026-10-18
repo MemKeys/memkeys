@@ -15,6 +15,7 @@
 //! [`CandidateSet`] narrows WITHIN that floor (a `fact_id = ANY(...)` filter),
 //! never across it.
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -62,12 +63,13 @@ impl VectorIndex for PgVectorIndex {
         let embedding = encode_vector(&v.embedding);
         sqlx::query(
             "INSERT INTO fact_vectors \
-               (fact_id, tenant_id, embedding, fact_type, entity_project, entity_issue, \
-                entity_pr, entity_agent, entity_run, entity_thread, entity_service) \
-             VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11) \
+               (fact_id, tenant_id, embedding, fact_type, ingested_at, entity_project, \
+                entity_issue, entity_pr, entity_agent, entity_run, entity_thread, entity_service) \
+             VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (fact_id) DO UPDATE SET \
                tenant_id = EXCLUDED.tenant_id, embedding = EXCLUDED.embedding, \
-               fact_type = EXCLUDED.fact_type, entity_project = EXCLUDED.entity_project, \
+               fact_type = EXCLUDED.fact_type, ingested_at = EXCLUDED.ingested_at, \
+               entity_project = EXCLUDED.entity_project, \
                entity_issue = EXCLUDED.entity_issue, entity_pr = EXCLUDED.entity_pr, \
                entity_agent = EXCLUDED.entity_agent, entity_run = EXCLUDED.entity_run, \
                entity_thread = EXCLUDED.entity_thread, entity_service = EXCLUDED.entity_service",
@@ -76,6 +78,7 @@ impl VectorIndex for PgVectorIndex {
         .bind(&v.tenant_id)
         .bind(&embedding)
         .bind(&v.fact_type)
+        .bind(v.ingested_at)
         .bind(&v.entity.project)
         .bind(&v.entity.issue)
         .bind(&v.entity.pr)
@@ -100,18 +103,27 @@ impl VectorIndex for PgVectorIndex {
         candidates: &CandidateSet,
         query: &[f32],
         k: usize,
+        as_of: Option<DateTime<Utc>>,
     ) -> Result<Vec<ScoredId>, VectorError> {
         let qvec = encode_vector(query);
         let limit = k as i64;
+        // §7.4 point-in-time bound: `ingested_at <= as_of` ("facts known by
+        // then"). A NULL `as_of` is the live-head read — the `IS NULL` short-
+        // circuit makes one SQL serve both, and the predicate applies on the
+        // CandidateSet::All (unscoped) path too so a whole-tenant `as_of`
+        // search is temporally bounded, not a silent newer-than-as_of read
+        // (ISI-6172 / CR ISI-6168 B1).
         let rows: Vec<(Uuid, f64)> = match candidates {
             CandidateSet::All => {
                 sqlx::query_as(
                     "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score \
                      FROM fact_vectors WHERE tenant_id = $1 \
-                     ORDER BY embedding <=> $2::vector LIMIT $3",
+                       AND ($3::timestamptz IS NULL OR ingested_at <= $3) \
+                     ORDER BY embedding <=> $2::vector LIMIT $4",
                 )
                 .bind(tenant)
                 .bind(&qvec)
+                .bind(as_of)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await
@@ -122,11 +134,13 @@ impl VectorIndex for PgVectorIndex {
                 sqlx::query_as(
                     "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score \
                      FROM fact_vectors WHERE tenant_id = $1 AND fact_id = ANY($3) \
-                     ORDER BY embedding <=> $2::vector LIMIT $4",
+                       AND ($4::timestamptz IS NULL OR ingested_at <= $4) \
+                     ORDER BY embedding <=> $2::vector LIMIT $5",
                 )
                 .bind(tenant)
                 .bind(&qvec)
                 .bind(ids)
+                .bind(as_of)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await

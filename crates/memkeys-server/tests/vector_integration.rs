@@ -12,7 +12,8 @@
 //! - stage-5b idempotency (re-embed overwrites, never duplicates) + catch_up
 //!   (SoT hole scan builds the projection from the FactStore),
 //! - op-4 feature-disabled (501 at the service seam) when the module is off,
-//! - as_of scoping (a fact unknown as-of the query time is excluded).
+//! - as_of scoping (a fact unknown as-of the query time is excluded) on BOTH
+//!   the scoped and the unscoped/whole-tenant candidate paths (ISI-6172).
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -151,7 +152,7 @@ async fn pg_index_enforces_tenant_isolation() {
     // team A's search must never see team B's identically-bodied fact (R6).
     let hits = ctx
         .index
-        .search(&ta, &CandidateSet::All, &q, 10)
+        .search(&ta, &CandidateSet::All, &q, 10, None)
         .await
         .unwrap();
     assert_eq!(
@@ -181,7 +182,7 @@ async fn stage_5b_is_idempotent_and_catch_up_fills_holes() {
         .unwrap();
     let hits = ctx
         .index
-        .search(&t, &CandidateSet::All, &q, 10)
+        .search(&t, &CandidateSet::All, &q, 10, None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 1, "replayed upsert is idempotent on fact_id");
@@ -192,7 +193,7 @@ async fn stage_5b_is_idempotent_and_catch_up_fills_holes() {
     ctx.store.commit_fact(&f2).await.unwrap();
     let before = ctx
         .index
-        .search(&t, &CandidateSet::Only(vec![f2.id]), &q, 10)
+        .search(&t, &CandidateSet::Only(vec![f2.id]), &q, 10, None)
         .await
         .unwrap();
     assert!(before.is_empty(), "hole: f2 not embedded yet");
@@ -361,4 +362,56 @@ async fn as_of_scopes_out_facts_unknown_at_query_time() {
         !ids.contains(&f_new.id),
         "the later fact is unknown as-of the cutoff and must be excluded"
     );
+}
+
+#[tokio::test]
+async fn as_of_scopes_out_facts_on_the_unscoped_whole_tenant_path() {
+    // Regression for ISI-6172 (CR ISI-6168 B1): with NO scope the candidate set
+    // is CandidateSet::All, which used to drop `as_of` entirely — returning
+    // facts ingested after as_of with no signal. The vector tier now carries
+    // `ingested_at` and bounds the ANN pass, so the unscoped path is temporally
+    // correct, exactly like the scoped path above.
+    let Some(ctx) = ctx().await else { return };
+    let t = next_tenant();
+    let old_time = Utc::now() - ChronoDuration::hours(2);
+    let mut f_old = fact(&t, 1, "r", "postgres was chosen early in the project");
+    f_old.event_time = old_time;
+    f_old.ingested_at = old_time;
+    let mut f_new = fact(&t, 2, "r", "postgres tuning happened much later on");
+    f_new.event_time = Utc::now();
+    f_new.ingested_at = Utc::now();
+    commit_and_project(&ctx, &f_old).await;
+    commit_and_project(&ctx, &f_new).await;
+
+    let cutoff = Utc::now() - ChronoDuration::hours(1);
+    // No `scope` → whole-tenant floor (R6). `as_of` must still bound it.
+    let req = SearchRequest {
+        query: "postgres".into(),
+        scope: vec![],
+        fact_type: None,
+        k: 10,
+        as_of: Some(cutoff),
+    };
+    let hits = ctx.service.semantic_search(&t, &req).await.unwrap();
+    let ids: Vec<Uuid> = hits.iter().map(|h| h.record.id).collect();
+    assert!(
+        ids.contains(&f_old.id),
+        "the old fact is known as-of the cutoff on the unscoped path"
+    );
+    assert!(
+        !ids.contains(&f_new.id),
+        "the later fact must be excluded on the unscoped path too (ISI-6172)"
+    );
+
+    // Sanity: with no `as_of` the live-head read surfaces both.
+    let live = SearchRequest { as_of: None, ..req };
+    let all: Vec<Uuid> = ctx
+        .service
+        .semantic_search(&t, &live)
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| h.record.id)
+        .collect();
+    assert!(all.contains(&f_old.id) && all.contains(&f_new.id));
 }
