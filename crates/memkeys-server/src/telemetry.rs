@@ -35,10 +35,16 @@ pub const PIPELINE_STAGE_COMMIT: &str = "commit";
 pub const RETRIEVAL_OP_KEYED: &str = "keyed";
 /// `memkeys.retrieval.op` value for graph reads (signal catalog enum).
 pub const RETRIEVAL_OP_GRAPH: &str = "graph";
+/// `memkeys.retrieval.op` value for op-3 semantic search (M5, §7.4).
+pub const RETRIEVAL_OP_SEMANTIC: &str = "semantic";
 /// `memkeys.worker.kind` value for the stage-5a graph-projection worker.
 pub const WORKER_KIND_GRAPH_PROJECTION: &str = "graph_projection";
+/// `memkeys.worker.kind` value for the stage-5b vector-projection worker (M5).
+pub const WORKER_KIND_VECTOR_PROJECTION: &str = "vector_projection";
 /// `memkeys.projection.kind` value for the graph projection.
 pub const PROJECTION_KIND_GRAPH: &str = "graph";
+/// `memkeys.projection.kind` value for the fact-vector projection (M5 stage 5b).
+pub const PROJECTION_KIND_VECTOR: &str = "vector";
 pub const OUTCOME_SUCCESS: &str = "success";
 pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";

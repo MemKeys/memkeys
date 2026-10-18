@@ -26,6 +26,7 @@ pub mod model;
 pub mod pg;
 pub mod pg_graph;
 pub mod pipeline;
+pub mod semantic;
 pub mod service;
 pub mod store;
 pub mod telemetry;
@@ -46,6 +47,10 @@ pub use model::{EntityKey, EntityKeys, FactRecord, KeyedQuery, ProcessedFact, Va
 pub use pg::PgStore;
 pub use pg_graph::PgGraph;
 pub use pipeline::{CallerContext, EntityResolver, NoopResolver, RunBinding, ThreadBinding};
+pub use semantic::{
+    cosine, rrf_fuse, CandidateSet, EmbedError, Embedder, FactVector, FusedHit, FusionSource,
+    HashEmbedder, MemVectorIndex, RankedList, ScoredId, VectorError, VectorIndex, K_RRF,
+};
 pub use service::{IngestReceipt, MemKeysService};
 pub use store::{CommitOutcome, FactStore};
 pub use wire::{ErrorCode, WireError};
