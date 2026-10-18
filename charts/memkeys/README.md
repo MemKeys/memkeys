@@ -1,7 +1,10 @@
 # MemKeys Helm chart
 
 Deploys [memkeys-server](../../crates/memkeys-server) — the attribute-based
-memory server — to Kubernetes.
+memory server — to Kubernetes. Covers **both deployment profiles** (M10a):
+a single all-in-one node and a K8s microservice split with async-projection
+workers. For a Kubernetes-free container/VM quickstart, skip to
+[Single-container quickstart](#single-container-quickstart-no-kubernetes).
 
 ## TL;DR
 
@@ -10,12 +13,77 @@ helm install memkeys charts/memkeys \
   --set database.url="postgres://user:pass@host:5432/memkeys"
 ```
 
+## Deployment profiles
+
+The `profile` value selects which workloads render. An invalid value fails
+`helm template`/`helm install` fast.
+
+| `profile` | Renders | Use for |
+|-----------|---------|---------|
+| `single-node` (default) | one all-in-one `Deployment` (server = writer + inline projection) | single VM/container, laptops, dev, small installs |
+| `microservice` | server `Deployment` **+** a separate async-projection worker `Deployment` **+** a `PodDisruptionBudget` | scaled K8s where projection rebuild is isolated from the request path |
+
+```sh
+# Microservice profile: server + workers + PDB.
+helm install memkeys charts/memkeys \
+  --set profile=microservice \
+  --set database.url="postgres://user:pass@host:5432/memkeys"
+```
+
+Workers run the same image as the server; the worker role is selected via
+`workers.command`/`workers.args`. Tune with `workers.replicaCount`,
+`workers.resources`, and the usual scheduling keys under `workers.*`. Force the
+worker Deployment on/off independently of the profile with
+`--set workers.enabled=true|false` (same for `podDisruptionBudget.enabled`).
+
+The server `Service` selects `app.kubernetes.io/component=server`, so it never
+routes to worker pods.
+
+**Replicas & the PDB.** `replicaCount` defaults per profile: **1** for
+single-node, **2** for microservice (HA). The `PodDisruptionBudget` renders
+only when the effective server replica count is **> 1** — a PDB with
+`minAvailable: 1` on a single replica would make `kubectl drain` block forever.
+So `--set profile=microservice --set replicaCount=1` yields no PDB (by design);
+set `replicaCount >= 2` (the default) to get one.
+
+> **Upgrading from 0.1.0.** The server `Service` selector gains
+> `app.kubernetes.io/component=server`. Pods from a running 0.1.0 release lack
+> that label, so during `helm upgrade` the Service has no endpoints until the
+> first relabeled pod is Ready. On a single-replica install this can be a brief
+> blip; run `replicaCount >= 2` (or a quick `helm uninstall`/`install` for the
+> M1 bootstrap) to avoid it.
+
+### Operator hooks
+
+Every rendered resource carries `app.kubernetes.io/part-of=memkeys` so an
+operator or GitOps controller can select the whole release. Merge extra
+selection labels/annotations with `operator.labels` and `operator.annotations`
+(labels go on every resource; annotations go on the workloads). No operator
+ships with this chart yet — these are forward-looking extension points.
+
+## Single-container quickstart (no Kubernetes)
+
+For a single VM or laptop, [`deploy/docker-compose.yaml`](../../deploy/docker-compose.yaml)
+brings up Postgres + memkeys-server (container-first, the single-node profile
+without Kubernetes):
+
+```sh
+# From the repo root — builds the image from the Dockerfile and starts both.
+docker compose -f deploy/docker-compose.yaml up --build
+# memkeys-server listens on http://localhost:8080 ; Postgres on localhost:5432.
+```
+
+Set `MEMKEYS_IMAGE` (e.g. `ghcr.io/memkeys/memkeys:<tag>`) to run a prebuilt
+image instead of building locally.
+
 ## What it renders
 
 | Resource | Purpose |
 |----------|---------|
-| `Deployment` | the memkeys-server workload (non-root, read-only rootfs, dropped caps) |
-| `Service` (ClusterIP) | in-cluster access on `service.port` (default 8080) |
+| `Deployment` (server) | the memkeys-server workload (non-root, read-only rootfs, dropped caps) |
+| `Deployment` (worker) | async-projection workers — **microservice profile only** |
+| `PodDisruptionBudget` | server availability during voluntary disruptions — **microservice profile only** |
+| `Service` (ClusterIP) | in-cluster access on `service.port` (default 8080), selects the server component |
 | `ConfigMap` | non-secret config: `MEMKEYS_DEPLOYMENT_ENV`, OTLP endpoint, service namespace, sampler ratio |
 | `Secret` | `MEMKEYS_DATABASE_URL` (only when `database.url` is set and no `existingSecret`) |
 | `ServiceAccount` | dedicated identity (token automount off by default) |

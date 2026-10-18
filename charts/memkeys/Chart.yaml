@@ -6,7 +6,7 @@ description: |
   derived, rebuildable projections over a keyed/temporal source of truth.
 type: application
 # Chart version — bump on every chart change (SemVer).
-version: 0.1.0
+version: 0.2.0
 # The memkeys-server image version this chart defaults to.
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
@@ -26,3 +26,11 @@ annotations:
   artifacthub.io/changes: |
     - kind: added
       description: Initial chart scaffold — Deployment, Service, config/secret wiring, probes, non-root securityContext.
+    - kind: added
+      description: Deployment profiles (M10a) — profile=single-node (default) | microservice; microservice adds an async-projection worker Deployment and a PodDisruptionBudget.
+    - kind: added
+      description: Operator hook points — app.kubernetes.io/part-of label plus operator.labels/operator.annotations applied release-wide.
+    - kind: changed
+      description: Service selector now narrows to app.kubernetes.io/component=server so it never routes to worker pods.
+    - kind: changed
+      description: replicaCount defaults per profile (single-node 1, microservice 2) and the PodDisruptionBudget renders only when effective server replicas > 1, so a singleton + PDB can no longer deadlock kubectl drain.

@@ -1,7 +1,25 @@
 # Default values for the memkeys chart.
 # This is a YAML-formatted file. Values are documented inline.
 
-replicaCount: 1
+# --- Deployment profile -----------------------------------------------------
+# Selects which workloads the chart renders (M10a — both profiles):
+#   single-node  — one all-in-one memkeys-server Deployment (writer + inline
+#                  projection). Default; maps to the single VM/container
+#                  profile. For the plain container/VM quickstart (Docker /
+#                  Compose, no Kubernetes) see deploy/docker-compose.yaml and
+#                  charts/memkeys/README.md.
+#   microservice — server Deployment + a separate async-projection worker
+#                  Deployment, plus a PodDisruptionBudget. Operator hook points
+#                  (labels/annotations) are available in both profiles.
+# Invalid values fail `helm template`/`helm install` fast.
+profile: single-node
+
+# Server replica count. null → profile default: 1 for single-node, 2 for
+# microservice (so the PodDisruptionBudget can tolerate a node drain / rolling
+# upgrade without blocking it). Set an explicit integer to override. A PDB is
+# only rendered when the effective server replica count is > 1 — a PDB with
+# minAvailable: 1 on a single replica would make `kubectl drain` block forever.
+replicaCount: null
 
 image:
   # Registry/repository for the memkeys-server image (built by the P0 docker.yml
@@ -150,3 +168,51 @@ topologySpreadConstraints: []
 # bootstrap). Empty uses the image entrypoint.
 command: []
 args: []
+
+# --- Workers (microservice profile) -----------------------------------------
+# Async projection workers rebuild the graph/vector projections off the
+# keyed/temporal source of truth. Rendered as a SEPARATE Deployment only in the
+# microservice profile (or when workers.enabled is forced). Same image as the
+# server; the worker role is selected via command/args. Not fronted by the
+# Service.
+workers:
+  # null → follow the profile (on for microservice, off for single-node).
+  # true/false forces the worker Deployment on/off regardless of profile.
+  enabled: null
+  replicaCount: 1
+  # Command/args that select the worker role. Empty uses the image entrypoint;
+  # set these once the server exposes a worker subcommand.
+  command: []
+  args: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# --- PodDisruptionBudget (microservice profile) -----------------------------
+# Keeps the Service-backed server available during voluntary disruptions.
+# Set exactly one of minAvailable / maxUnavailable (maxUnavailable wins if set).
+podDisruptionBudget:
+  # null → follow the profile (on for microservice, off for single-node).
+  enabled: null
+  minAvailable: 1
+  maxUnavailable: ""
+
+# --- Operator integration hooks ---------------------------------------------
+# Forward-looking extension points for a MemKeys/K8s operator or GitOps
+# controller to select and manage the release. Labels are merged into every
+# resource's metadata; annotations are applied to the rendered workloads. No
+# operator ships with this chart yet. Every resource also carries
+# app.kubernetes.io/part-of=memkeys for release-wide selection.
+operator:
+  labels: {}
+  annotations: {}
