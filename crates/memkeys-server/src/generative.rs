@@ -209,8 +209,11 @@ pub enum GenError {
 /// - `key` MUST be in the allowed key space (anything else is dropped, not an
 ///   error — the contract says the server drops unknown keys),
 /// - MUST NOT propose a key already in `existing_keys` (no overwrite path),
-/// - `evidence_span` MUST be a verbatim substring of `fact_body` (the
-///   anti-hallucination guard — a non-substring span invalidates the proposal),
+/// - `evidence_span` MUST be a verbatim substring of `fact_body` AND the
+///   proposed `value` MUST occur inside that span (case-insensitively) — the
+///   anti-hallucination guard: the value appears verbatim in the source, bound
+///   to the cited evidence; a span-without-the-value or value-without-the-span
+///   invalidates the proposal,
 /// - value/confidence bounds.
 ///
 /// The typed structs simply cannot carry provenance/tenant authority (unknown
@@ -240,6 +243,13 @@ pub fn validate_extract(
             if evidence.trim().is_empty() || !fact_body.contains(evidence) {
                 return None; // anti-hallucination: MUST be a verbatim substring
             }
+            // The proposed VALUE is bound to the cited evidence: it MUST occur
+            // inside `evidence_span` (case-insensitively — the template adapter
+            // normalizes issue ids to uppercase, so the binding is
+            // case-normalized, never free). A value that merely co-occurs with
+            // a valid span (`evidence_span: "e"`, `value: "victim-project-id"`)
+            // is a hallucination → dropped (R8 intra-tenant mis-keying).
+            find_ci(evidence, p.value.trim(), 0)?; // value MUST appear in the span
             let confidence = p.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
             Some((p.clone(), confidence))
         })
@@ -929,6 +939,52 @@ mod tests {
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].0.key, "entity.pr");
         assert_eq!(accepted[0].1, 1.0); // clamped from 2.0
+    }
+
+    #[test]
+    fn validate_extract_binds_value_to_the_cited_evidence() {
+        // CR ISI-6080 B2: a valid span alone is NOT sufficient — the proposed
+        // value must occur inside the span, otherwise a hallucinating/
+        // compromised generator can smuggle an arbitrary value past the guard
+        // on the back of a trivially-present span (`"e"` matches most bodies).
+        let out = ExtractOutput {
+            proposed_keys: vec![
+                ProposedKey {
+                    // The exact attack: span present in the body, value is not.
+                    key: "entity.project".into(),
+                    value: "victim-project-id".into(),
+                    confidence: Some(1.0),
+                    evidence_span: Some("e".into()),
+                },
+                ProposedKey {
+                    // Bound value → accepted.
+                    key: "entity.thread".into(),
+                    value: "t-42".into(),
+                    confidence: Some(1.0),
+                    evidence_span: Some("thread t-42".into()),
+                },
+                ProposedKey {
+                    // Case-normalized value (issue-id uppercase) is still
+                    // bound to the lowercase verbatim span.
+                    key: "entity.issue".into(),
+                    value: "ISI-6080".into(),
+                    confidence: Some(1.0),
+                    evidence_span: Some("isi-6080".into()),
+                },
+            ],
+        };
+        let accepted = validate_extract(
+            &out,
+            "plain e letter; isi-6080 once; thread t-42 also mentioned",
+            &std::collections::HashMap::new(),
+            &[
+                "entity.project".to_string(),
+                "entity.thread".to_string(),
+                "entity.issue".to_string(),
+            ],
+        );
+        let keys: Vec<&str> = accepted.iter().map(|(p, _)| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["entity.thread", "entity.issue"]);
     }
 
     #[tokio::test]
