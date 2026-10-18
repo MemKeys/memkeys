@@ -14,8 +14,12 @@
 # Invalid values fail `helm template`/`helm install` fast.
 profile: single-node
 
-# Server replica count (both profiles).
-replicaCount: 1
+# Server replica count. null → profile default: 1 for single-node, 2 for
+# microservice (so the PodDisruptionBudget can tolerate a node drain / rolling
+# upgrade without blocking it). Set an explicit integer to override. A PDB is
+# only rendered when the effective server replica count is > 1 — a PDB with
+# minAvailable: 1 on a single replica would make `kubectl drain` block forever.
+replicaCount: null
 
 image:
   # Registry/repository for the memkeys-server image (built by the P0 docker.yml

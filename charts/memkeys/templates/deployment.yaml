@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "memkeys.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ include "memkeys.serverReplicas" . }}
   selector:
     matchLabels:
       {{- include "memkeys.selectorLabels" . | nindent 6 }}

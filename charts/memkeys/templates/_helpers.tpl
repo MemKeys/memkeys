@@ -109,13 +109,31 @@ false
 {{- end }}
 
 {{/*
-Whether the PodDisruptionBudget renders. Explicit bool wins; otherwise
-follows the profile (on for microservice). Emits "true"/"false".
+Effective server replica count. An explicit .Values.replicaCount wins;
+otherwise it defaults per profile — microservice → 2 (HA, drain-tolerant PDB),
+single-node → 1.
+*/}}
+{{- define "memkeys.serverReplicas" -}}
+{{- if not (kindIs "invalid" .Values.replicaCount) -}}
+{{- .Values.replicaCount -}}
+{{- else if eq (include "memkeys.profile" .) "microservice" -}}
+2
+{{- else -}}
+1
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the PodDisruptionBudget renders. An explicit
+podDisruptionBudget.enabled bool wins (the operator owns the consequences);
+otherwise it renders for the microservice profile ONLY when effective server
+replicas > 1 — a PDB with minAvailable: 1 on a singleton would deadlock
+`kubectl drain`. Emits "true"/"false".
 */}}
 {{- define "memkeys.pdbEnabled" -}}
 {{- if kindIs "bool" .Values.podDisruptionBudget.enabled -}}
 {{- .Values.podDisruptionBudget.enabled | ternary "true" "false" -}}
-{{- else if eq (include "memkeys.profile" .) "microservice" -}}
+{{- else if and (eq (include "memkeys.profile" .) "microservice") (gt (int (include "memkeys.serverReplicas" .)) 1) -}}
 true
 {{- else -}}
 false

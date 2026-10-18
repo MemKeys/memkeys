@@ -32,3 +32,5 @@ annotations:
       description: Operator hook points — app.kubernetes.io/part-of label plus operator.labels/operator.annotations applied release-wide.
     - kind: changed
       description: Service selector now narrows to app.kubernetes.io/component=server so it never routes to worker pods.
+    - kind: changed
+      description: replicaCount defaults per profile (single-node 1, microservice 2) and the PodDisruptionBudget renders only when effective server replicas > 1, so a singleton + PDB can no longer deadlock kubectl drain.

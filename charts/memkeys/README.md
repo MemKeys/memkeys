@@ -39,6 +39,20 @@ worker Deployment on/off independently of the profile with
 The server `Service` selects `app.kubernetes.io/component=server`, so it never
 routes to worker pods.
 
+**Replicas & the PDB.** `replicaCount` defaults per profile: **1** for
+single-node, **2** for microservice (HA). The `PodDisruptionBudget` renders
+only when the effective server replica count is **> 1** — a PDB with
+`minAvailable: 1` on a single replica would make `kubectl drain` block forever.
+So `--set profile=microservice --set replicaCount=1` yields no PDB (by design);
+set `replicaCount >= 2` (the default) to get one.
+
+> **Upgrading from 0.1.0.** The server `Service` selector gains
+> `app.kubernetes.io/component=server`. Pods from a running 0.1.0 release lack
+> that label, so during `helm upgrade` the Service has no endpoints until the
+> first relabeled pod is Ready. On a single-replica install this can be a brief
+> blip; run `replicaCount >= 2` (or a quick `helm uninstall`/`install` for the
+> M1 bootstrap) to avoid it.
+
 ### Operator hooks
 
 Every rendered resource carries `app.kubernetes.io/part-of=memkeys` so an
