@@ -7,6 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"strconv"
 
 	memkeysv1alpha1 "github.com/MemKeys/memkeys/operator/api/v1alpha1"
 )
@@ -25,16 +26,19 @@ const (
 
 	defaultImageRepo = "ghcr.io/memkeys/memkeys"
 	defaultImageTag  = "latest"
+
+	// roleWorker is the MEMKEYS_ROLE value selecting the projection-only role
+	// in the memkeys-server binary (health + reconciler, no memory transport).
+	roleWorker = "worker"
 )
 
 func ptrInt32(i int32) *int32 { return &i }
 
 // --- names ------------------------------------------------------------------
 
-func serverName(mki *memkeysv1alpha1.MemKeysInstance) string    { return mki.Name }
-func workerName(mki *memkeysv1alpha1.MemKeysInstance) string    { return mki.Name + "-worker" }
-func configMapName(mki *memkeysv1alpha1.MemKeysInstance) string { return mki.Name + "-config" }
-func dbSecretName(mki *memkeysv1alpha1.MemKeysInstance) string  { return mki.Name + "-db" }
+func serverName(mki *memkeysv1alpha1.MemKeysInstance) string   { return mki.Name }
+func workerName(mki *memkeysv1alpha1.MemKeysInstance) string   { return mki.Name + "-worker" }
+func dbSecretName(mki *memkeysv1alpha1.MemKeysInstance) string { return mki.Name + "-db" }
 
 // --- effective values (profile-aware, mirrors _helpers.tpl) -----------------
 
@@ -84,10 +88,18 @@ func pdbEnabled(mki *memkeysv1alpha1.MemKeysInstance) bool {
 }
 
 func pdbMinAvailable(mki *memkeysv1alpha1.MemKeysInstance) int32 {
+	minAvail := int32(1)
 	if mki.Spec.PodDisruptionBudget.MinAvailable > 0 {
-		return mki.Spec.PodDisruptionBudget.MinAvailable
+		minAvail = mki.Spec.PodDisruptionBudget.MinAvailable
 	}
-	return 1
+	// Drain-deadlock guard: minAvailable >= replicas leaves allowedDisruptions
+	// at 0, so `kubectl drain` blocks forever — clamp to replicas-1. pdbEnabled
+	// only renders a PDB with replicas > 1, so the clamp target is positive
+	// whenever the value is used.
+	if max := serverReplicas(mki) - 1; max > 0 && minAvail > max {
+		return max
+	}
+	return minAvail
 }
 
 func workerReplicas(mki *memkeysv1alpha1.MemKeysInstance) int32 {
@@ -180,6 +192,11 @@ func containerEnv(mki *memkeysv1alpha1.MemKeysInstance) []corev1.EnvVar {
 			},
 		},
 	}}
+	// Keep the health surface's listen port pinned to spec.servicePort so the
+	// Service port, container port, and MEMKEYS_HTTP_PORT always agree (the
+	// server defaults to 8080 — a non-8080 servicePort without this env left
+	// /readyz bound to 8080 and the pod never Ready).
+	env = append(env, corev1.EnvVar{Name: "MEMKEYS_HTTP_PORT", Value: strconv.Itoa(int(servicePort(mki)))})
 	deployEnv := mki.Spec.OTel.DeploymentEnv
 	if deployEnv == "" {
 		deployEnv = "dev"
@@ -334,6 +351,11 @@ func buildServerDeployment(mki *memkeysv1alpha1.MemKeysInstance) *appsv1.Deploym
 
 func buildWorkerDeployment(mki *memkeysv1alpha1.MemKeysInstance) *appsv1.Deployment {
 	workerRes := resourcesOrDefault(mki.Spec.Workers.Resources)
+	// The worker role: projection-only (health surface + reconciler tick, no
+	// memory transport) — honoured by the memkeys-server binary. Mirrors the
+	// chart's workers-deployment.yaml env; spec.workers.command/args remain
+	// user-overridable entrypoints.
+	workerEnv := append(containerEnv(mki), corev1.EnvVar{Name: "MEMKEYS_ROLE", Value: string(roleWorker)})
 	container := corev1.Container{
 		Name:            "memkeys-worker",
 		Image:           imageRef(mki.Spec.Image),
@@ -341,7 +363,7 @@ func buildWorkerDeployment(mki *memkeysv1alpha1.MemKeysInstance) *appsv1.Deploym
 		SecurityContext: containerSecurityContext(),
 		Command:         mki.Spec.Workers.Command,
 		Args:            mki.Spec.Workers.Args,
-		Env:             containerEnv(mki),
+		Env:             workerEnv,
 		Resources:       workerRes,
 	}
 	return &appsv1.Deployment{

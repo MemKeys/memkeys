@@ -53,8 +53,19 @@ func (r *MemKeysInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// The operator renders the DB Secret only when an inline url is given and no
 	// existing Secret is referenced (mirrors charts/memkeys/templates/secret.yaml).
+	// Otherwise the operator-managed Secret is pruned — most importantly on a
+	// url → existingSecret switch, so the old rendered credential does not
+	// linger until instance deletion. A Secret named identically to the
+	// operator's (<name>-db) is left alone: then existingSecret points at it
+	// and it is user-managed, not operator-rendered.
 	if mki.Spec.Database.URL != "" && mki.Spec.Database.ExistingSecret == "" {
 		if err := r.apply(ctx, &mki, buildDBSecret(&mki)); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if mki.Spec.Database.ExistingSecret != dbSecretName(&mki) {
+		if err := r.prune(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: dbSecretName(&mki), Namespace: mki.Namespace},
+		}); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

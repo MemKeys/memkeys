@@ -62,6 +62,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "memkeys.databaseSecretName" . }}
                   key: {{ .Values.database.existingSecretKey }}
+            # The worker role: projection-only (health surface + reconciler
+            # tick, no memory transport) — honoured by the memkeys-server
+            # binary via MEMKEYS_ROLE=worker.
+            - name: MEMKEYS_ROLE
+              value: worker
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

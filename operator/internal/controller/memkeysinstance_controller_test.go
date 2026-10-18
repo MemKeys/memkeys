@@ -264,3 +264,131 @@ func TestProfileSwitchPrunesWorkerAndPDB(t *testing.T) {
 		t.Errorf("PDB should be pruned after switching to single-node, got err=%v", err)
 	}
 }
+
+func TestUrlToExistingSecretSwitchPrunesDBSecret(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.Database = memkeysv1alpha1.DatabaseSpec{URL: "postgres://u:p@db:5432/memkeys"}
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	// Inline url → the operator-rendered Secret exists.
+	var sec corev1.Secret
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name + "-db", Namespace: ns}, &sec); err != nil {
+		t.Fatalf("operator-rendered db Secret should exist with inline url: %v", err)
+	}
+
+	// Flip to an existingSecret reference: the rendered Secret must be pruned
+	// and the Deployment must point at the referenced Secret.
+	cur := getInstance(t, mki.Name, ns)
+	cur.Spec.Database = memkeysv1alpha1.DatabaseSpec{ExistingSecret: "my-db-secret"}
+	if err := k8sClient.Update(ctx, cur); err != nil {
+		t.Fatalf("update instance: %v", err)
+	}
+	reconcile(t, r, mki.Name, ns)
+
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name + "-db", Namespace: ns}, &sec); !apierrors.IsNotFound(err) {
+		t.Errorf("operator-rendered db Secret should be pruned after switching to existingSecret, got err=%v", err)
+	}
+	srv, ok := getDeployment(t, mki.Name, ns)
+	if !ok {
+		t.Fatal("server Deployment not found")
+	}
+	for _, e := range srv.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "MEMKEYS_DATABASE_URL" && e.ValueFrom != nil {
+			if got := e.ValueFrom.SecretKeyRef.Name; got != "my-db-secret" {
+				t.Errorf("secretKeyRef name = %s, want my-db-secret", got)
+			}
+		}
+	}
+}
+
+func TestPDBMinAvailableClampedBelowReplicas(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	replicas := int32(3)
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.Profile = memkeysv1alpha1.ProfileMicroservice
+		m.Spec.Replicas = &replicas
+		// >= replicas → allowedDisruptions 0 → drain deadlock; must clamp to 2.
+		m.Spec.PodDisruptionBudget.MinAvailable = 3
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	var pdb policyv1.PodDisruptionBudget
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name, Namespace: ns}, &pdb); err != nil {
+		t.Fatalf("PDB not created: %v", err)
+	}
+	if pdb.Spec.MinAvailable == nil {
+		t.Fatal("PDB minAvailable not set")
+	}
+	if got := pdb.Spec.MinAvailable.IntValue(); got != 2 {
+		t.Errorf("PDB minAvailable = %d, want 2 (clamped below replicas=3)", got)
+	}
+}
+
+func TestServicePortWiredToHTTPPortEnv(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.ServicePort = 9090
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	srv, ok := getDeployment(t, mki.Name, ns)
+	if !ok {
+		t.Fatal("server Deployment not created")
+	}
+	container := srv.Spec.Template.Spec.Containers[0]
+	if len(container.Ports) != 1 || container.Ports[0].ContainerPort != 9090 {
+		t.Errorf("containerPort = %+v, want 9090", container.Ports)
+	}
+	httpPort := ""
+	for _, e := range container.Env {
+		if e.Name == "MEMKEYS_HTTP_PORT" {
+			httpPort = e.Value
+		}
+	}
+	if httpPort != "9090" {
+		t.Errorf("MEMKEYS_HTTP_PORT = %q, want 9090 (servicePort must reach the container env)", httpPort)
+	}
+
+	var svc corev1.Service
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name, Namespace: ns}, &svc); err != nil {
+		t.Fatalf("Service not created: %v", err)
+	}
+	if got := svc.Spec.Ports[0].Port; got != 9090 {
+		t.Errorf("Service port = %d, want 9090", got)
+	}
+}
+
+func TestWorkerDeploymentSelectsWorkerRole(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.Profile = memkeysv1alpha1.ProfileMicroservice
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	w, ok := getDeployment(t, mki.Name+"-worker", ns)
+	if !ok {
+		t.Fatal("worker Deployment not created")
+	}
+	role := ""
+	for _, e := range w.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "MEMKEYS_ROLE" {
+			role = e.Value
+		}
+	}
+	if role != "worker" {
+		t.Errorf("worker MEMKEYS_ROLE = %q, want worker", role)
+	}
+
+	srv, _ := getDeployment(t, mki.Name, ns)
+	for _, e := range srv.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "MEMKEYS_ROLE" {
+			t.Errorf("server container must not set MEMKEYS_ROLE, got %q", e.Value)
+		}
+	}
+}

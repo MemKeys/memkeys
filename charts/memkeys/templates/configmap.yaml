@@ -6,6 +6,10 @@ metadata:
     {{- include "memkeys.labels" . | nindent 4 }}
 data:
   MEMKEYS_DEPLOYMENT_ENV: {{ .Values.otel.deploymentEnv | quote }}
+  # Keep the health surface's listen port pinned to the Service port so
+  # containerPort / targetPort / MEMKEYS_HTTP_PORT always agree (a non-8080
+  # service.port without this left /readyz bound to 8080 → never Ready).
+  MEMKEYS_HTTP_PORT: {{ .Values.service.port | quote }}
   {{- with .Values.otel.endpoint }}
   OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
   {{- end }}

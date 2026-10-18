@@ -30,14 +30,21 @@ helm install memkeys charts/memkeys \
   --set database.url="postgres://user:pass@host:5432/memkeys"
 ```
 
-Workers run the same image as the server; the worker role is selected via
-`workers.command`/`workers.args`. Tune with `workers.replicaCount`,
-`workers.resources`, and the usual scheduling keys under `workers.*`. Force the
-worker Deployment on/off independently of the profile with
-`--set workers.enabled=true|false` (same for `podDisruptionBudget.enabled`).
+Workers run the same image as the server in the **worker role**: the template
+sets `MEMKEYS_ROLE=worker`, which makes `memkeys-server` start projection-only
+(health surface + projection reconciler; no `/memory/*` HTTP transport and no
+stdio MCP — see `crates/memkeys-server/src/main.rs`). `workers.command` /
+`workers.args` remain available for custom entrypoints. Tune with
+`workers.replicaCount`, `workers.resources`, and the usual scheduling keys
+under `workers.*`. Force the worker Deployment on/off independently of the
+profile with `--set workers.enabled=true|false` (same for
+`podDisruptionBudget.enabled`).
 
 The server `Service` selects `app.kubernetes.io/component=server`, so it never
-routes to worker pods.
+routes to worker pods. The Service fronts the **health surface** (the
+`/healthz`/`/readyz` listener); `service.port` is pinned to the container's
+`MEMKEYS_HTTP_PORT` so the Service port, container port, and probe listener
+always agree.
 
 **Replicas & the PDB.** `replicaCount` defaults per profile: **1** for
 single-node, **2** for microservice (HA). The `PodDisruptionBudget` renders

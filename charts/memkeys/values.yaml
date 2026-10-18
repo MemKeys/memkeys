@@ -180,8 +180,10 @@ workers:
   # true/false forces the worker Deployment on/off regardless of profile.
   enabled: null
   replicaCount: 1
-  # Command/args that select the worker role. Empty uses the image entrypoint;
-  # set these once the server exposes a worker subcommand.
+  # Optional container command/args override for the worker container. The
+  # worker role itself is selected by the MEMKEYS_ROLE=worker env rendered by
+  # the template (projection-only: no memory transport); command/args remain
+  # for custom entrypoints.
   command: []
   args: []
   resources:
