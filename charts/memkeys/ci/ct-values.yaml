@@ -9,7 +9,7 @@
 # The image tag is overridden on the ct command line (--helm-extra-set-args)
 # with the SHA the workflow built, so it is intentionally not pinned here.
 image:
-  pullPolicy: Never # image is side-loaded into kind, never pulled
+  pullPolicy: Never  # image is side-loaded into kind, never pulled
 
 database:
   url: "postgres://memkeys:memkeys@memkeys-test-postgres.default.svc.cluster.local:5432/memkeys_test"
