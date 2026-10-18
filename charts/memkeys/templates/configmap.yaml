@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "memkeys.fullname" . }}-config
+  labels:
+    {{- include "memkeys.labels" . | nindent 4 }}
+data:
+  MEMKEYS_DEPLOYMENT_ENV: {{ .Values.otel.deploymentEnv | quote }}
+  {{- with .Values.otel.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.otel.serviceNamespace }}
+  MEMKEYS_SERVICE_NAMESPACE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.otel.tracesSamplerRatio }}
+  MEMKEYS_TRACES_SAMPLER_RATIO: {{ . | quote }}
+  {{- end }}

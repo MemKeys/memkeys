@@ -1,0 +1,11 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+.vscode/
+.idea/
+*.tmproj
+*.bak
+*.orig
+# CI test values are not shipped in the packaged chart.
+ci/
