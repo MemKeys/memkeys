@@ -686,6 +686,17 @@ impl MemKeysService {
             .await
             .map_err(|e| QueryError::Semantic(e.to_string()))?;
 
+        // A semantic hit must carry actual signal: drop non-positive cosine
+        // similarities (`<= 0` = orthogonal or anti-correlated — no shared
+        // direction, not a match). ANN backends return the k nearest rows
+        // regardless of similarity, so without this filter a zero-signal fact
+        // surfaces as a hit and, worse, earns undeserved RRF credit in
+        // `fused_search` — which let a single-path keyed fact tie out a genuine
+        // cross-path agreement (ISI-6079 / CR ISI-6168 DB suite). Score is
+        // cosine similarity on both backends (MemVectorIndex and PgVectorIndex's
+        // `1 - (embedding <=> q)`), so the predicate is backend-agnostic.
+        let scored: Vec<_> = scored.into_iter().filter(|s| s.score > 0.0).collect();
+
         // Step 4 — hydrate authoritative records (R1 resolve-to-ground-truth),
         // preserving ANN rank order. A vanished fact (retention sweep racing
         // the index) is skipped, not an error.
@@ -1122,5 +1133,42 @@ mod tests {
         assert!(hits[0].via.contains(&FusionSource::Keyed));
         assert!(hits[0].via.contains(&FusionSource::SemanticFact));
         assert_eq!(hits.len(), 2, "deduped across the two paths");
+    }
+
+    #[tokio::test]
+    async fn semantic_search_drops_zero_similarity_hits() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+        // f1 shares tokens with the query; f2 is orthogonal (cosine 0.0 under
+        // HashEmbedder — verified: no shared tokens, no hash collision).
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(1, "t", "r", "chose postgres for the durable fact store"),
+        )
+        .await;
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(2, "t", "r", "the standup meeting was moved to Tuesday"),
+        )
+        .await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let req = SearchRequest {
+            query: "postgres database durability".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc.semantic_search("t", &req).await.unwrap();
+        // The orthogonal fact must NOT surface — a zero-signal hit would earn
+        // undeserved RRF credit in fused_search (ISI-6079 regression guard).
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, Uuid::from_u128(1));
     }
 }
