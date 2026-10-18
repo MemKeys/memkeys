@@ -856,26 +856,27 @@ fn validate_supersedes_target(
     fact: &ProcessedFact,
     target: &crate::model::FactRecord,
 ) -> Result<(), IngestError> {
-    // §6 stage 3: "validate the target shares (entity, subject, type)". The
-    // supersession grain is the *thing the fact is about*: subject and type
-    // must match exactly, and the two records must share at least one anchor
-    // entity key value (project/issue/pr/run/thread/service). Exact entity
-    // equality was considered and rejected: legitimate versioning crosses
-    // runs (a new decision in a later run supersedes the old one on the same
-    // issue), and the §5.2 collapse is per (entity, subject, type) group.
-    let shared_anchor = [
-        (&fact.entity.project, &target.entity_project),
-        (&fact.entity.issue, &target.entity_issue),
-        (&fact.entity.pr, &target.entity_pr),
-        (&fact.entity.run, &target.entity_run),
-        (&fact.entity.thread, &target.entity_thread),
-        (&fact.entity.service, &target.entity_service),
-    ]
-    .into_iter()
-    .any(|(a, b)| a.is_some() && a == b);
-    if !shared_anchor {
+    // §6 stage 3 (§7.6 T3-pin, Q2 unified on H-equality; Q1 corrected a4d3522):
+    // "validate the target shares (entity, subject, type)". The supersession
+    // grain is the *thing the fact is about* — `entity_identity`, the work-item
+    // coordinate `(project, issue, pr)`. An explicit `supersedes` is valid iff
+    // the target has the **same entity_identity**, subject, and type. The
+    // per-source transport anchors `run`/`thread`/`service` are NOT compared:
+    // they are excluded from identity, so sharing only a run/thread/service is
+    // not a shared statement (that would re-introduce the cross-run / cross-
+    // thread fork the gate removes). Cross-run versioning still works because
+    // `run` is excluded on BOTH sides — a later-run decision on the same issue
+    // has the same coordinate. Compared normalized so blank == absent.
+    fn coord(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    let same_entity_identity = coord(&fact.entity.project) == coord(&target.entity_project)
+        && coord(&fact.entity.issue) == coord(&target.entity_issue)
+        && coord(&fact.entity.pr) == coord(&target.entity_pr);
+    if !same_entity_identity {
         return Err(IngestError::Rejected {
-            reason: "supersedes target does not share the entity keys".into(),
+            reason: "supersedes target does not share the entity_identity (project/issue/pr)"
+                .into(),
         });
     }
     if target.subject != fact.subject {

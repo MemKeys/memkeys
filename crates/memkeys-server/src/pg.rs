@@ -5,6 +5,7 @@
 //! Queries are runtime-built (no compile-time DB requirement); `db.query.text`
 //! is never emitted (deny-list).
 
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
@@ -45,17 +46,177 @@ INSERT INTO facts (\
   entity_project, entity_issue, entity_pr, entity_agent, entity_run, \
   entity_thread, entity_service, counterpart_agent, \
   keyed, provenance_principal, provenance_source_kind, provenance_trace_id, \
-  rejected_hints, attachments) \
+  rejected_hints, attachments, entity_identity) \
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-  $16, $17, $18, $19, $20, $21, $22, $23, $24) \
+  $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) \
 ON CONFLICT (id) DO NOTHING \
 RETURNING id";
 
+/// Current live head of the live-head key H = (tenant_id, entity_identity,
+/// fact_type, subject): the record on H that nothing supersedes (≤1 under the
+/// per-H advisory lock). Liveness is the read-time `supersedes`-chain property
+/// (§5.1), so no `superseded` flag and no write-back to prior records.
+const LIVE_HEAD_SQL: &str = "\
+SELECT f.id FROM facts f \
+WHERE f.tenant_id = $1 AND f.entity_identity = $2 AND f.fact_type = $3 AND f.subject = $4 \
+  AND NOT EXISTS (SELECT 1 FROM facts s WHERE s.supersedes = f.id AND s.tenant_id = f.tenant_id) \
+FOR UPDATE";
+
+/// ASCII unit separator — joins the live-head entity components unambiguously
+/// (never valid inside an opaque entity-key value).
+const EID_SEP: &str = "\u{1f}";
+
+/// The entity component of the live-head key `H` (§7.6 **T3-pin**, ratified by
+/// ISI-6131) for a subject-bearing fact, else `None` (the fact skips the gate).
+///
+/// Composition: the **work-item coordinate tuple** `(project, issue, pr)` — the
+/// §4 keys that identify *what the fact is about* — taken from the **enriched**
+/// entity (this runs after §4 enrichment). Excluded: `entity.agent` (ISI-6053
+/// R1: the head is per statement, not per producing agent; agent stays in the
+/// `fact.id` salt only) and **all three per-source transport anchors `run`,
+/// `thread`, `service`** (how the fact arrived, not what it is about). §4
+/// enrichment lifts a resolvable anchor to its work-item container *before* `H`
+/// is computed, so the same statement keeps chaining across runs/threads/
+/// services; keeping `thread`/`service` would re-fork cross-thread / cross-
+/// service versioning of one work-item statement (ISI-6131 Q1 correction,
+/// a4d3522). An **empty composite ⇒ unkeyed for `H` ⇒ gate bypassed** (`None`)
+/// — an anchor-only fact enrichment could not lift is an independent
+/// observation, not a competing head. The value is written once at commit and
+/// is immutable (append-only SoT preserved).
+fn entity_identity(fact: &ProcessedFact) -> Option<String> {
+    // Gate scope: subject-bearing (the supersession grain).
+    let has_subject = fact
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if !has_subject {
+        return None;
+    }
+    let e = &fact.entity;
+    let coordinate: Vec<String> = [("project", &e.project), ("issue", &e.issue), ("pr", &e.pr)]
+        .into_iter()
+        .filter_map(|(k, v)| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|v| format!("{k}={v}"))
+        })
+        .collect();
+    if coordinate.is_empty() {
+        // Unkeyed for H (e.g. an unlifted anchor-only fact) — skip the gate.
+        return None;
+    }
+    Some(coordinate.join(EID_SEP))
+}
+
+/// A stable 64-bit key for `pg_advisory_xact_lock` derived from the full
+/// live-head key `H = (tenant_id, entity_identity, subject, fact_type)`.
+/// Length-prefixed so distinct tuples cannot alias to one lock key.
+fn live_head_lock_key(
+    tenant_id: &str,
+    entity_identity: &str,
+    subject: &str,
+    fact_type: &str,
+) -> i64 {
+    let mut h = Sha256::new();
+    for part in [tenant_id, entity_identity, subject, fact_type] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    let digest = h.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("sha256 >= 8 bytes"))
+}
+
 #[async_trait::async_trait]
 impl FactStore for PgStore {
-    /// Stage 4 — the commit point. Idempotent on `fact.id`; a same-id replay
-    /// with a different body is a conflict (409), per the FactStore contract.
+    /// Stage 3–4 — the live-head critical section and the commit point
+    /// (§7.6 T3). Idempotent on `fact.id`; a same-id replay with a different
+    /// body is a conflict (409), per the FactStore contract.
+    ///
+    /// For a **subject-bearing keyed** fact (`entity_identity(fact)` is
+    /// `Some`) the whole insert runs inside one transaction holding a
+    /// transaction-scoped advisory lock on `hash(H)`, so all writers to the
+    /// same live-head key `H = (tenant_id, entity_identity, subject, type)`
+    /// serialize (realization (b), §7.6 T3):
+    /// - a plain write to an occupied `H` **auto-supersedes** the current head;
+    /// - an explicit `supersedes` MUST name the **current** head — a stale or
+    ///   foreign id is a `conflict` (this also forecloses supersession cycles).
+    ///
+    /// Subject-null / unkeyed facts (`entity_identity` is `None`) skip the gate
+    /// entirely — independent observations that may share `(entity, null, type)`.
     async fn commit_fact(&self, fact: &ProcessedFact) -> Result<CommitOutcome, IngestError> {
+        let eid = entity_identity(fact);
+
+        let mut tx = self.pool.begin().await?;
+
+        // The server owns supersession (§3): for a gated write we may override
+        // the envelope's `supersedes` with the auto-superseded current head.
+        let mut effective_supersedes = fact.supersedes;
+
+        if let Some(eid) = eid.as_deref() {
+            let subject = fact.subject.as_deref().unwrap_or("");
+            let ftype = fact.fact_type.as_str();
+
+            // Serialize every writer on this statement's live-head key. The
+            // lock auto-releases at COMMIT/ROLLBACK.
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(live_head_lock_key(&fact.tenant_id, eid, subject, ftype))
+                .execute(&mut *tx)
+                .await?;
+
+            // Idempotency short-circuit under the lock (before any head CAS so
+            // a retried flush of a gated fact never mis-reads as a conflict).
+            let existing: Option<(String,)> =
+                sqlx::query_as("SELECT body_hash FROM facts WHERE id = $1 AND tenant_id = $2")
+                    .bind(fact.id)
+                    .bind(&fact.tenant_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some((hash,)) = existing {
+                tx.commit().await?;
+                return if hash == fact.body_hash {
+                    Ok(CommitOutcome::Duplicate)
+                } else {
+                    Err(IngestError::Conflict {
+                        existing_id: fact.id,
+                    })
+                };
+            }
+
+            // Compare-and-set against the current head of H.
+            let head: Option<(uuid::Uuid,)> = sqlx::query_as(LIVE_HEAD_SQL)
+                .bind(&fact.tenant_id)
+                .bind(eid)
+                .bind(ftype)
+                .bind(subject)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let head_id = head.map(|h| h.0);
+
+            effective_supersedes = match (fact.supersedes, head_id) {
+                // Explicit supersedes naming the current head → advance.
+                (Some(explicit), Some(h)) if explicit == h => Some(h),
+                // Explicit supersedes naming a stale/foreign id → conflict
+                // (report the real head so the caller can retry against it).
+                (Some(_), Some(h)) => {
+                    tx.rollback().await.ok();
+                    return Err(IngestError::Conflict { existing_id: h });
+                }
+                // Explicit supersedes but no live head on H → stale/foreign.
+                (Some(_), None) => {
+                    tx.rollback().await.ok();
+                    return Err(IngestError::Conflict {
+                        existing_id: fact.id,
+                    });
+                }
+                // Plain write to an occupied head → auto-supersede it.
+                (None, Some(h)) => Some(h),
+                // First head on H.
+                (None, None) => None,
+            };
+        }
+
         let inserted = sqlx::query(INSERT_FACT_SQL)
             .bind(fact.id)
             .bind(&fact.tenant_id)
@@ -64,7 +225,7 @@ impl FactStore for PgStore {
             .bind(&fact.body)
             .bind(&fact.body_hash)
             .bind(fact.confidence)
-            .bind(fact.supersedes)
+            .bind(effective_supersedes)
             .bind(fact.event_time)
             .bind(fact.ingested_at)
             .bind(&fact.entity.project)
@@ -81,21 +242,25 @@ impl FactStore for PgStore {
             .bind(&fact.provenance_trace_id)
             .bind(serde_json::json!(&fact.rejected_hints))
             .bind(&fact.attachments)
-            .fetch_optional(&self.pool)
+            .bind(eid.as_deref())
+            .fetch_optional(&mut *tx)
             .await?;
 
         if inserted.is_some() {
+            tx.commit().await?;
             return Ok(CommitOutcome::Inserted);
         }
 
-        // Same fact id already exists: retried flush (same body → duplicate,
-        // no error) or conflicting replay (different body → 409).
+        // Same fact id already exists (non-gated path; the gated path handled
+        // idempotency under the lock above): retried flush (same body →
+        // duplicate) or conflicting replay (different body → 409).
         let existing: Option<(String,)> =
             sqlx::query_as("SELECT body_hash FROM facts WHERE id = $1 AND tenant_id = $2")
                 .bind(fact.id)
                 .bind(&fact.tenant_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await?;
         match existing {
             Some((hash,)) if hash == fact.body_hash => Ok(CommitOutcome::Duplicate),
             Some(_) => Err(IngestError::Conflict {
@@ -215,11 +380,143 @@ pub(crate) const FACT_COLUMNS_ALIAS: &str = "f.id, f.fact_type, f.subject, f.bod
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EntityKey, FactType};
+    use crate::model::{EntityKey, EntityKeys, FactType};
+
+    fn gated_fact(entity: EntityKeys, subject: Option<&str>) -> ProcessedFact {
+        ProcessedFact {
+            id: uuid::Uuid::nil(),
+            tenant_id: "t".into(),
+            fact_type: FactType::Decision,
+            subject: subject.map(str::to_string),
+            body: "b".into(),
+            body_hash: "h".into(),
+            confidence: None,
+            supersedes: None,
+            event_time: chrono::Utc::now(),
+            ingested_at: chrono::Utc::now(),
+            keyed: entity.any_anchor_key(),
+            entity,
+            provenance_principal: "p".into(),
+            provenance_source_kind: "gateway_flush".into(),
+            provenance_trace_id: None,
+            rejected_hints: vec![],
+            attachments: serde_json::json!([]),
+        }
+    }
 
     #[test]
     fn insert_sql_conflict_clause_is_idempotent() {
         assert!(INSERT_FACT_SQL.contains("ON CONFLICT (id) DO NOTHING"));
+    }
+
+    fn keys(
+        project: Option<&str>,
+        issue: Option<&str>,
+        run: Option<&str>,
+        agent: Option<&str>,
+    ) -> EntityKeys {
+        EntityKeys {
+            project: project.map(str::to_string),
+            issue: issue.map(str::to_string),
+            run: run.map(str::to_string),
+            agent: agent.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entity_identity_is_run_insensitive_when_a_durable_key_resolves() {
+        // The existing cross-run supersession test relies on this: same issue
+        // + subject + type is ONE statement regardless of the incidental run.
+        let a = keys(None, Some("I1"), Some("r1"), None);
+        let b = keys(None, Some("I1"), Some("r2"), None);
+        let ha = entity_identity(&gated_fact(a, Some("the chosen database")));
+        let hb = entity_identity(&gated_fact(b, Some("the chosen database")));
+        assert_eq!(ha, hb);
+        assert_eq!(ha.as_deref(), Some("issue=I1"));
+    }
+
+    #[test]
+    fn entity_identity_excludes_agent() {
+        // Two agents' same-subject fact on one issue share a head (latest-wins).
+        let a = keys(None, Some("I1"), None, Some("agent-a"));
+        let b = keys(None, Some("I1"), None, Some("agent-b"));
+        assert_eq!(
+            entity_identity(&gated_fact(a, Some("s"))),
+            entity_identity(&gated_fact(b, Some("s")))
+        );
+    }
+
+    #[test]
+    fn entity_identity_excludes_run_so_an_unlifted_run_only_fact_is_not_gated() {
+        // §4 enrichment lifts a resolvable run into project/issue/pr before H;
+        // a run that was not lifted leaves an empty work-item composite → the
+        // fact is unkeyed for H and skips the gate (T3-pin / ISI-6131).
+        let run_only = keys(None, None, Some("r1"), None);
+        assert!(entity_identity(&gated_fact(run_only, Some("s"))).is_none());
+    }
+
+    #[test]
+    fn entity_identity_excludes_thread_and_service_as_transport_anchors() {
+        // ISI-6131 Q1 correction (a4d3522): thread/service are §4 per-source
+        // transport anchors, excluded alongside run. An anchor-only fact that
+        // enrichment could not lift to a work-item coordinate is unkeyed for H
+        // and gate-skipped (an independent observation, not a competing head).
+        let thread_only = EntityKeys {
+            thread: Some("T1".into()),
+            ..Default::default()
+        };
+        let service_only = EntityKeys {
+            service: Some("svc-a".into()),
+            ..Default::default()
+        };
+        assert!(entity_identity(&gated_fact(thread_only, Some("s"))).is_none());
+        assert!(entity_identity(&gated_fact(service_only, Some("s"))).is_none());
+    }
+
+    #[test]
+    fn entity_identity_collapses_cross_thread_and_cross_service_on_one_work_item() {
+        // The same work-item statement reached over two threads (or two
+        // services) resolves to ONE live head — excluding thread/service is
+        // exactly what prevents the cross-thread / cross-service fork on the
+        // A2A and telemetry paths (ISI-6131 Q1).
+        let via_t1 = EntityKeys {
+            issue: Some("I1".into()),
+            thread: Some("T1".into()),
+            ..Default::default()
+        };
+        let via_t2 = EntityKeys {
+            issue: Some("I1".into()),
+            thread: Some("T2".into()),
+            ..Default::default()
+        };
+        let via_svc = EntityKeys {
+            issue: Some("I1".into()),
+            service: Some("svc-a".into()),
+            ..Default::default()
+        };
+        let h1 = entity_identity(&gated_fact(via_t1, Some("s")));
+        let h2 = entity_identity(&gated_fact(via_t2, Some("s")));
+        let h3 = entity_identity(&gated_fact(via_svc, Some("s")));
+        assert_eq!(h1.as_deref(), Some("issue=I1"));
+        assert_eq!(h1, h2);
+        assert_eq!(h1, h3);
+    }
+
+    #[test]
+    fn entity_identity_is_none_for_subjectless_or_unkeyed() {
+        assert!(entity_identity(&gated_fact(keys(None, Some("I1"), None, None), None)).is_none());
+        // Unkeyed for H (no work-item coordinate) → None even with a subject.
+        assert!(entity_identity(&gated_fact(EntityKeys::default(), Some("s"))).is_none());
+    }
+
+    #[test]
+    fn live_head_lock_key_is_stable_and_tuple_sensitive() {
+        let k = live_head_lock_key("t", "issue=I1", "s", "decision");
+        assert_eq!(k, live_head_lock_key("t", "issue=I1", "s", "decision"));
+        // Length-prefixing prevents boundary aliasing between distinct tuples.
+        assert_ne!(k, live_head_lock_key("t", "issue=I1s", "", "decision"));
+        assert_ne!(k, live_head_lock_key("t", "issue=I1", "s", "outcome"));
     }
 
     #[test]

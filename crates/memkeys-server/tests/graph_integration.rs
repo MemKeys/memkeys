@@ -599,15 +599,33 @@ async fn supersedes_reports_legacy_forks_as_branch_points() {
     let x = ctx().await;
     let ent = serde_json::json!({ "project": "proj-1", "issue": "iss-1", "agent": "agent-a", "run": "run-1" });
     let e1 = ingest(&x, &envelope(gw_flush(Some("status"), "v1", ent.clone()))).await;
-    // Two successors of v1 — a legacy fork (pre-rule history; today's stage-3
-    // admission does not yet reject forks — flagged for the reconciler/M7).
+    // The first successor of v1 is admitted normally: v2a names the current
+    // head (e1), so the T3 CAS gate accepts it and advances the head to e2.
     let mut j2 = gw_flush(Some("status"), "v2a", ent.clone());
     j2["fact"]["supersedes"] = serde_json::json!(e1.fact_id.to_string());
     let e2 = ingest(&x, &envelope(j2)).await;
-    let mut j3 = gw_flush(Some("status"), "v2b", ent);
-    j3["fact"]["supersedes"] = serde_json::json!(e1.fact_id.to_string());
-    let e3 = ingest(&x, &envelope(j3)).await;
     drain(&x).await;
+
+    // A SECOND successor of v1 is a legacy fork. v2b also supersedes e1, but
+    // e1 is no longer the live head (e2 is), so today's stage-3 admission — the
+    // T3 CAS gate this branch implements — rejects it as a `Conflict`. Such
+    // forks therefore only exist in pre-rule / reconciler-pending history, so
+    // we inject one directly at the storage layer (exactly as the reconciling
+    // rebuild test injects drift) to prove `supersedes` still REPORTS it as a
+    // branch point rather than hiding it.
+    let e3_id = Uuid::new_v4();
+    let e3_node = node_id(&x.tenant, NodeKind::Fact, &e3_id.to_string());
+    let e1_node = node_id(&x.tenant, NodeKind::Fact, &e1.fact_id.to_string());
+    sqlx::query(
+        "INSERT INTO edges (tenant, project, src_kind, src_id, dst_kind, dst_id, edge_type, event_time, rule_ver) \
+         VALUES ($1, 'proj-1', 'fact', $2, 'fact', $3, 'supersedes', now(), 'legacy-fork')",
+    )
+    .bind(&x.tenant)
+    .bind(&e3_node)
+    .bind(&e1_node)
+    .execute(x.graph.pool())
+    .await
+    .expect("inject legacy fork edge");
 
     let req = memkeys_server::graph::SupersedesReq {
         tenant: x.tenant.clone(),
@@ -629,7 +647,7 @@ async fn supersedes_reports_legacy_forks_as_branch_points() {
     heads.sort();
     let mut expected = vec![
         node_id(&x.tenant, NodeKind::Fact, &e2.fact_id.to_string()),
-        node_id(&x.tenant, NodeKind::Fact, &e3.fact_id.to_string()),
+        e3_node.clone(),
     ];
     expected.sort();
     assert_eq!(heads, expected);
