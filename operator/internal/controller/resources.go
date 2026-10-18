@@ -143,14 +143,6 @@ func memoryTransportCredentialed(mki *memkeysv1alpha1.MemKeysInstance) bool {
 	return mki.Spec.MemoryTransport.RunTokenSecret != nil || mki.Spec.MemoryTransport.AllowInsecure
 }
 
-// memoryTransportValid is the fail-closed gate: enabled AND credentialed AND
-// no port collision with the health surface (the two listeners are distinct;
-// equal ports would crash the process on the second bind).
-func memoryTransportValid(mki *memkeysv1alpha1.MemKeysInstance) bool {
-	return !memoryTransportEnabled(mki) ||
-		(memoryTransportCredentialed(mki) && memoryTransportPort(mki) != servicePort(mki))
-}
-
 // memoryTransportEnv renders the exposure env for the SERVER container only
 // (the worker role never binds the transport). The chart's deployment.yaml
 // renders the same keys.
