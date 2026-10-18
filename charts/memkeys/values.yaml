@@ -69,11 +69,43 @@ securityContext:
 # --- Service ----------------------------------------------------------------
 service:
   type: ClusterIP
-  # Port the Service exposes and the container listens on. The HTTP/MCP
-  # transport is a later milestone; this is the forward-looking default.
+  # Port the Service exposes and the health listener (MEMKEYS_HTTP_PORT)
+  # binds: containerPort / targetPort / probes all follow it. The /memory/*
+  # transport has its own listener — see memoryTransport below.
   port: 8080
   # Named container port.
   portName: http
+
+# --- Memory transport (/memory/*) -------------------------------------------
+# The server runs TWO distinct listeners: the health surface (/healthz, /readyz)
+# on MEMKEYS_HTTP_PORT (service.port above) and the /memory/* transport on
+# MEMKEYS_MEMORY_HTTP_PORT (default 3000). Exposing the memory transport off
+# loopback requires a run-token issuer secret — the server refuses a
+# non-loopback bind without one (open admission surface, ISI-6137 S1). The
+# chart mirrors that gate: it fails `helm template`/`helm install` fast when
+# memoryTransport is enabled with neither a credential nor an explicit
+# dev-only insecure opt-in.
+memoryTransport:
+  # Whether the memory transport gets a containerPort + Service port and binds
+  # 0.0.0.0. Disable to render the health-only surface (M10a behaviour).
+  enabled: true
+  # Port the memory transport listens on (MEMKEYS_MEMORY_HTTP_PORT) and the
+  # Service exposes. Must differ from service.port — the two listeners would
+  # collide inside the process otherwise.
+  port: 3000
+  # Named container/Service port for the memory transport.
+  portName: memory
+  runTokenSecret:
+    # Inline issuer secret → the chart renders a Secret
+    # <fullname>-run-token holding it. Dev convenience; prefer existingSecret.
+    value: ""
+    # Reference a pre-provisioned Secret holding the issuer secret instead.
+    existingSecret: ""
+    # Key within that Secret (or the rendered one).
+    key: "MEMKEYS_RUN_TOKEN_SECRET"
+  # Dev-only escape hatch: bind 0.0.0.0 with NO run-token verifier (the server
+  # warns; tenant is self-asserted). Never use in a shared cluster.
+  allowInsecure: false
 
 # --- Gateway API ingress (HTTPRoute, not legacy Ingress) --------------------
 # Disabled by default; enable and point at a parentRef Gateway to expose the

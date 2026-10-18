@@ -116,6 +116,72 @@ func servicePort(mki *memkeysv1alpha1.MemKeysInstance) int32 {
 	return 8080
 }
 
+// memoryTransportEnabled resolves whether the /memory/* transport is exposed:
+// an explicit spec.memoryTransport.enabled wins; nil → enabled (the product
+// API is the point of the deployment, ISI-6233).
+func memoryTransportEnabled(mki *memkeysv1alpha1.MemKeysInstance) bool {
+	if mki.Spec.MemoryTransport.Enabled != nil {
+		return *mki.Spec.MemoryTransport.Enabled
+	}
+	return true
+}
+
+// memoryTransportPort is the /memory/* listen + Service port. The server has
+// its own default (3000) — 0 (unset) mirrors it.
+func memoryTransportPort(mki *memkeysv1alpha1.MemKeysInstance) int32 {
+	if mki.Spec.MemoryTransport.Port > 0 {
+		return mki.Spec.MemoryTransport.Port
+	}
+	return 3000
+}
+
+// memoryTransportCredentialed reports whether the transport may legally bind
+// off loopback: a run-token verifier secret (preferred) or the explicit
+// dev-only insecure opt-in. Mirrors the server's own bind gate — without one
+// of these the server refuses to start, so the reconciler must fail closed.
+func memoryTransportCredentialed(mki *memkeysv1alpha1.MemKeysInstance) bool {
+	return mki.Spec.MemoryTransport.RunTokenSecret != nil || mki.Spec.MemoryTransport.AllowInsecure
+}
+
+// memoryTransportValid is the fail-closed gate: enabled AND credentialed AND
+// no port collision with the health surface (the two listeners are distinct;
+// equal ports would crash the process on the second bind).
+func memoryTransportValid(mki *memkeysv1alpha1.MemKeysInstance) bool {
+	return !memoryTransportEnabled(mki) ||
+		(memoryTransportCredentialed(mki) && memoryTransportPort(mki) != servicePort(mki))
+}
+
+// memoryTransportEnv renders the exposure env for the SERVER container only
+// (the worker role never binds the transport). The chart's deployment.yaml
+// renders the same keys.
+func memoryTransportEnv(mki *memkeysv1alpha1.MemKeysInstance) []corev1.EnvVar {
+	if !memoryTransportEnabled(mki) {
+		return nil
+	}
+	env := []corev1.EnvVar{
+		{Name: "MEMKEYS_MEMORY_HTTP_PORT", Value: strconv.Itoa(int(memoryTransportPort(mki)))},
+		{Name: "MEMKEYS_HTTP_HOST", Value: "0.0.0.0"},
+	}
+	if s := mki.Spec.MemoryTransport.RunTokenSecret; s != nil {
+		key := s.Key
+		if key == "" {
+			key = "MEMKEYS_RUN_TOKEN_SECRET"
+		}
+		env = append(env, corev1.EnvVar{
+			Name: "MEMKEYS_RUN_TOKEN_SECRET",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.Name},
+					Key:                  key,
+				},
+			},
+		})
+	} else {
+		env = append(env, corev1.EnvVar{Name: "MEMKEYS_ALLOW_INSECURE", Value: "1"})
+	}
+	return env
+}
+
 // --- labels -----------------------------------------------------------------
 
 func commonLabels(mki *memkeysv1alpha1.MemKeysInstance) map[string]string {
@@ -279,6 +345,22 @@ func buildDBSecret(mki *memkeysv1alpha1.MemKeysInstance) *corev1.Secret {
 
 func buildService(mki *memkeysv1alpha1.MemKeysInstance) *corev1.Service {
 	port := servicePort(mki)
+	ports := []corev1.ServicePort{{
+		Name:       "http",
+		Port:       port,
+		TargetPort: intstr.FromString("http"),
+		Protocol:   corev1.ProtocolTCP,
+	}}
+	// The /memory/* transport Service port — the port clients target. The
+	// health port above stays probe-only (ISI-6233).
+	if memoryTransportEnabled(mki) {
+		ports = append(ports, corev1.ServicePort{
+			Name:       "memory",
+			Port:       memoryTransportPort(mki),
+			TargetPort: intstr.FromString("memory"),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -289,30 +371,33 @@ func buildService(mki *memkeysv1alpha1.MemKeysInstance) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
 			Selector: selectorLabels(mki, componentServer),
-			Ports: []corev1.ServicePort{{
-				Name:       "http",
-				Port:       port,
-				TargetPort: intstr.FromString("http"),
-				Protocol:   corev1.ProtocolTCP,
-			}},
+			Ports:    ports,
 		},
 	}
 }
 
 func buildServerDeployment(mki *memkeysv1alpha1.MemKeysInstance) *appsv1.Deployment {
 	port := servicePort(mki)
+	containerPorts := []corev1.ContainerPort{{
+		Name:          "http",
+		ContainerPort: port,
+		Protocol:      corev1.ProtocolTCP,
+	}}
+	if memoryTransportEnabled(mki) {
+		containerPorts = append(containerPorts, corev1.ContainerPort{
+			Name:          "memory",
+			ContainerPort: memoryTransportPort(mki),
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
 	container := corev1.Container{
 		Name:            "memkeys",
 		Image:           imageRef(mki.Spec.Image),
 		ImagePullPolicy: pullPolicy(mki.Spec.Image),
 		SecurityContext: containerSecurityContext(),
-		Ports: []corev1.ContainerPort{{
-			Name:          "http",
-			ContainerPort: port,
-			Protocol:      corev1.ProtocolTCP,
-		}},
-		Env:       containerEnv(mki),
-		Resources: resourcesOrDefault(mki.Spec.Resources),
+		Ports:           containerPorts,
+		Env:             append(containerEnv(mki), memoryTransportEnv(mki)...),
+		Resources:       resourcesOrDefault(mki.Spec.Resources),
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/healthz", Port: intstr.FromString("http"),

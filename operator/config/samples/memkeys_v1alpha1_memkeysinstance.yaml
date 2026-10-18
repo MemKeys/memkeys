@@ -6,6 +6,12 @@
 # it first, e.g.:
 #   kubectl create secret generic memkeys-db \
 #     --from-literal=MEMKEYS_DATABASE_URL=postgres://user:pass@host:5432/memkeys
+#
+# The /memory/* transport is exposed by default (ISI-6233) and requires a
+# run-token issuer secret — the server refuses a non-loopback bind without one.
+# Create it and reference it via spec.memoryTransport.runTokenSecret, e.g.:
+#   kubectl create secret generic memkeys-run-token \
+#     --from-literal=MEMKEYS_RUN_TOKEN_SECRET=<issuer-secret>
 ---
 apiVersion: memkeys.io/v1alpha1
 kind: MemKeysInstance
@@ -19,6 +25,11 @@ spec:
     tag: latest
   database:
     existingSecret: memkeys-db
+  # Memory transport: its own listener (default 3000) + Service port, bound
+  # 0.0.0.0 with per-request run-token verification.
+  memoryTransport:
+    runTokenSecret:
+      name: memkeys-run-token
   otel:
     deploymentEnv: dev
 ---
@@ -35,6 +46,9 @@ spec:
     tag: latest
   database:
     existingSecret: memkeys-db
+  memoryTransport:
+    runTokenSecret:
+      name: memkeys-run-token
   otel:
     deploymentEnv: prod
     endpoint: otel-collector.observability.svc:4317

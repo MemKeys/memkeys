@@ -21,7 +21,21 @@ Profile: {{ include "memkeys.profile" . }}
 {{- end }}
 
 Service (ClusterIP) reachable in-cluster at:
-  {{ include "memkeys.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+  {{ include "memkeys.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}   (health: /healthz, /readyz)
+{{- if eq (include "memkeys.memoryTransportEnabled" .) "true" }}
+  {{ include "memkeys.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.memoryTransport.port }}   (memory transport: /memory/*)
+{{- end }}
+
+{{- if and (eq (include "memkeys.memoryTransportEnabled" .) "true") .Values.memoryTransport.allowInsecure }}
+
+⚠  memoryTransport.allowInsecure=true: the memory transport is bound with NO
+   run-token verifier — tenant is self-asserted (ISI-6137 S1). Dev clusters only.
+{{- end }}
+{{- if and (eq (include "memkeys.memoryTransportEnabled" .) "true") .Values.memoryTransport.runTokenSecret.value }}
+
+⚠  memoryTransport.runTokenSecret.value is set — the issuer secret is stored in
+   the Helm release. Prefer memoryTransport.runTokenSecret.existingSecret.
+{{- end }}
 
 {{- if .Values.httpRoute.enabled }}
 

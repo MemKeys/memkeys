@@ -51,6 +51,22 @@ func (r *MemKeysInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"spec.database requires either url or existingSecret")
 	}
 
+	// Fail closed on an unusable /memory/* exposure (ISI-6233): the server
+	// refuses a non-loopback bind without a run-token verifier, and equal
+	// health/transport ports would crash the process on the second bind.
+	// Rolling out anyway would surface as an opaque crash loop — degrade
+	// with the exact fix instead.
+	if memoryTransportEnabled(&mki) {
+		if !memoryTransportCredentialed(&mki) {
+			return ctrl.Result{}, r.markDegraded(ctx, &mki, "MemoryTransportUnauthenticated",
+				"spec.memoryTransport requires runTokenSecret (or allowInsecure=true, dev only) — the server refuses a non-loopback /memory/* bind without a run-token verifier, or set enabled=false for a health-only surface")
+		}
+		if memoryTransportPort(&mki) == servicePort(&mki) {
+			return ctrl.Result{}, r.markDegraded(ctx, &mki, "MemoryTransportPortCollision",
+				"spec.memoryTransport.port must differ from spec.servicePort — the health and /memory/* listeners are distinct and would collide on the second bind")
+		}
+	}
+
 	// The operator renders the DB Secret only when an inline url is given and no
 	// existing Secret is referenced (mirrors charts/memkeys/templates/secret.yaml).
 	// Otherwise the operator-managed Secret is pruned — most importantly on a
