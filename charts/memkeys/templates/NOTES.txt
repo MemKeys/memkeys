@@ -1,0 +1,34 @@
+MemKeys ({{ include "memkeys.fullname" . }}) has been deployed.
+
+Chart version: {{ .Chart.Version }}  •  App version: {{ .Chart.AppVersion }}
+Image: {{ include "memkeys.image" . }}
+
+{{- if not .Values.database.url }}
+{{- if not .Values.database.existingSecret }}
+
+⚠  No database configured. Set either:
+     --set database.url=postgres://user:pass@host:5432/memkeys
+   or reference an existing secret:
+     --set database.existingSecret=my-pg-secret
+
+   The server requires MEMKEYS_DATABASE_URL and will not start without it.
+{{- end }}
+{{- end }}
+
+Service (ClusterIP) reachable in-cluster at:
+  {{ include "memkeys.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+{{- if .Values.httpRoute.enabled }}
+
+HTTPRoute is enabled (Gateway API). Hostnames:
+{{- range .Values.httpRoute.hostnames }}
+  - http://{{ . }}
+{{- end }}
+{{- end }}
+
+NOTE: The current memkeys-server image (M1) is a migrate-and-exit bootstrap and
+does not yet expose an HTTP transport. The liveness/readiness probes and Service
+port target the forthcoming HTTP health surface (/healthz, /readyz). Until the
+server transport milestone lands, disable the probes for a running Deployment:
+  --set livenessProbe.enabled=false --set readinessProbe.enabled=false
+See charts/memkeys/README.md for details.

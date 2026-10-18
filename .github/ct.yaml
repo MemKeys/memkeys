@@ -1,0 +1,11 @@
+# chart-testing (ct) configuration — used by .github/workflows/helm.yml.
+# https://github.com/helm/chart-testing
+target-branch: main
+chart-dirs:
+  - charts
+# We maintain charts in-repo; don't require upstream maintainer validation.
+validate-maintainers: false
+# Lint even when ct's git-diff heuristic doesn't flag a change (the workflow
+# paths filter already scopes runs to charts/**).
+check-version-increment: false
+helm-extra-args: --timeout 300s

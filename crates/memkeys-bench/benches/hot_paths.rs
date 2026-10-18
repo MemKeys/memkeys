@@ -1,229 +1,186 @@
-//! Criterion microbenchmarks for the CPU-bound hot paths of memkeys-server.
+//! Criterion micro-benchmarks for the CPU-bound hot paths of memkeys-server
+//! (ISI-6100 / ISI-6094 P2). Runnable with `cargo bench -p memkeys-bench`.
 //!
-//! These are the regression-tracked paths run by `cargo bench` and the
-//! `bench.yml` workflow on `main`. They are deliberately **database-free**:
-//! the DB-bound single-writer ceiling is owned by the `write-bench` binary
-//! (sustained ops/sec against a real Postgres, run by `scripts/run-write-bench.sh`),
-//! which is too heavy and too environment-sensitive for per-commit criterion
-//! sampling. Here we isolate the pure, deterministic CPU work so a regression
-//! shows up as a clean statistical signal, not postgres jitter.
+//! These complement the `write-bench` binary: `write-bench` measures the
+//! end-to-end single-writer ceiling against a real Postgres (I/O bound), while
+//! these criterion benches isolate the *pure* compute of the write pipeline and
+//! the in-memory keyed lookup so a regression in the code — not the database —
+//! is what gets tracked. No Postgres is required, so they run fast enough to be
+//! scheduled in CI on `main` (see `.github/workflows/bench.yml`).
 //!
-//! Two hot paths (the ISI-6100 / ISI-6094-P2 targets):
-//!   1. **Write pipeline** — `pipeline::normalize` (stage 1-2 key extraction +
-//!      principal-salted fact.id) and `pipeline::temporalize` (stage 3
-//!      bi-temporal placement).
-//!   2. **Attribute key lookup / index** — `MemStore::fetch_by_keys` (op 1,
-//!      §7.2) over a populated in-memory FactStore, plus the stage-4
-//!      `commit_fact` insert and idempotent-duplicate paths.
-//!
-//! All inputs derive from the pinned deterministic workload
-//! (`memkeys_bench::workload`) so benchmarks are reproducible across machines.
+//! Two hot paths, per the P2 brief:
+//!   * **FactStore write pipeline** — stages 1-3 (`normalize` → `key_stage` →
+//!     `temporalize`): envelope validation, SHA-256 body hash, UUIDv5
+//!     idempotent id derivation, entity-key resolution.
+//!   * **Attribute key lookup / index** — `MemStore::fetch_by_keys`: the keyed
+//!     read with AND-filtering, newest-first sort, limit, and read-time
+//!     supersession collapse (§5.2), over a representative corpus.
 
-use chrono::{DateTime, Utc};
+use std::hint::black_box;
+use std::sync::Arc;
+use std::time::Duration;
+
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use tokio::runtime::Runtime;
 
 use memkeys_bench::workload::{generate, WorkloadConfig};
 use memkeys_server::memstore::MemStore;
-use memkeys_server::model::{EntityKey, EntityKeys, FactType, KeyedQuery, ProcessedFact, Validity};
-use memkeys_server::pipeline::{normalize, temporalize, CallerContext};
+use memkeys_server::model::{EntityKey, KeyedQuery, Validity};
+use memkeys_server::pipeline::{key_stage, normalize, temporalize, CallerContext, NoopResolver};
 use memkeys_server::store::FactStore;
-use memkeys_server::Envelope;
 
-/// Fixed wall-clock the normalize/temporalize stages are stamped against — the
-/// benchmark must not read the real clock (non-determinism) and must not drift
-/// run-to-run.
-fn bench_now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-10-17T12:00:00Z")
-        .expect("fixed now")
-        .with_timezone(&Utc)
+/// Single current-thread runtime shared by every async bench. The hot-path
+/// futures resolve without yielding (NoopResolver does no I/O, MemStore is a
+/// lock-guarded map), so `block_on` adds negligible, constant overhead.
+fn rt() -> Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime")
 }
 
 fn caller() -> CallerContext {
     CallerContext {
-        tenant_id: "bench-tenant".to_string(),
-        principal: "memkeys-bench".to_string(),
-        trace_id: None,
+        tenant_id: "bench-tenant".into(),
+        principal: "memkeys-bench".into(),
+        trace_id: Some("bench-trace".into()),
     }
 }
 
-/// One realistic gateway_flush envelope from the pinned workload.
-fn sample_envelopes(n: u64) -> Vec<Envelope> {
-    let cfg = WorkloadConfig {
-        ops: n,
+/// The canonical write-pipeline hot path: parse-validate, hash, derive id,
+/// resolve keys, enforce the supersession grain.
+fn bench_write_pipeline(c: &mut Criterion) {
+    let rt = rt();
+    let caller = caller();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-17T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // One representative gateway_flush envelope (256-byte body, run anchor +
+    // issue/project hints) — the dominant v1 write shape.
+    let op = generate(&WorkloadConfig {
+        ops: 1,
         ..WorkloadConfig::default()
-    };
-    generate(&cfg).into_iter().map(|op| op.envelope).collect()
-}
+    })
+    .remove(0);
+    let env = op.envelope;
+    let resolver = NoopResolver;
 
-/// Write pipeline stage 1-2: normalize (required-field checks, canonicalization,
-/// principal-salted idempotency id). Pure, no DB.
-fn bench_normalize(c: &mut Criterion) {
-    let envelopes = sample_envelopes(256);
-    let caller = caller();
-    let now = bench_now();
+    let mut g = c.benchmark_group("write_pipeline");
+    g.throughput(Throughput::Elements(1));
 
-    let mut group = c.benchmark_group("write_pipeline");
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("normalize", |b| {
-        let mut i = 0usize;
-        b.iter(|| {
-            let env = &envelopes[i % envelopes.len()];
-            i += 1;
-            normalize(std::hint::black_box(env), &caller, now).expect("normalize ok")
-        });
+    // Stage 1 — normalize (pure: SHA-256 body hash + UUIDv5 content-digest id).
+    g.bench_function("normalize", |b| {
+        b.iter(|| normalize(black_box(&env), black_box(&caller), black_box(now)).unwrap())
     });
-    group.finish();
-}
 
-/// Write pipeline stage 3: temporalize (bi-temporal placement). Operates on a
-/// pre-normalized fact; the clone is done in untimed setup via iter_batched.
-fn bench_temporalize(c: &mut Criterion) {
-    let caller = caller();
-    let now = bench_now();
-    let template = normalize(&sample_envelopes(1)[0], &caller, now).expect("normalize ok");
-
-    let mut group = c.benchmark_group("write_pipeline");
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("temporalize", |b| {
+    // Stage 2 — key (entity-key resolution + anchor enforcement, NoopResolver).
+    g.bench_function("key_stage", |b| {
         b.iter_batched(
-            || template.clone(),
+            || normalize(&env, &caller, now).unwrap(),
             |mut fact| {
-                temporalize(&mut fact).expect("temporalize ok");
-                fact
+                rt.block_on(key_stage(&env, &caller, &mut fact, &resolver))
+                    .unwrap();
+                black_box(fact)
             },
             BatchSize::SmallInput,
-        );
+        )
     });
-    group.finish();
-}
 
-/// Build a keyed `ProcessedFact` directly (stage 2 `key_stage` is crate-private,
-/// so we construct the committed shape the store sees). Facts spread over
-/// `cardinality` distinct issue keys, matching the workload's read fan-in.
-fn keyed_fact(i: u64, cardinality: u64) -> ProcessedFact {
-    let issue = format!("bench-issue-{}", i % cardinality);
-    // UUIDv5 keeps ids stable across runs (no real randomness in a benchmark).
-    let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("fact-{i}").as_bytes());
-    let event_time = bench_now() + chrono::Duration::milliseconds(i as i64);
-    ProcessedFact {
-        id,
-        tenant_id: "bench-tenant".into(),
-        fact_type: FactType::Context,
-        subject: Some(format!("bench-statement-{i}")),
-        body: format!("bench body {i}"),
-        body_hash: String::new(),
-        confidence: Some(0.9),
-        supersedes: None,
-        event_time,
-        ingested_at: event_time,
-        entity: EntityKeys {
-            project: Some("bench-project".into()),
-            issue: Some(issue),
-            run: Some("bench-run".into()),
-            ..EntityKeys::default()
-        },
-        keyed: true,
-        provenance_principal: "memkeys-bench".into(),
-        provenance_source_kind: "gateway_flush".into(),
-        provenance_trace_id: None,
-        rejected_hints: Vec::new(),
-        attachments: serde_json::Value::Null,
-    }
-}
-
-/// A single-threaded tokio runtime to drive the async FactStore port. The store
-/// itself is in-memory (RwLock over a HashMap); the runtime overhead is
-/// constant across samples, so the delta we measure is the lookup/index work.
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("current-thread runtime")
-}
-
-fn populated_store(rt: &tokio::runtime::Runtime, n: u64, cardinality: u64) -> MemStore {
-    let store = MemStore::new();
-    rt.block_on(async {
-        for i in 0..n {
-            store
-                .commit_fact(&keyed_fact(i, cardinality))
-                .await
-                .expect("seed commit");
-        }
+    // Stage 3 — temporalize (supersession-grain guard).
+    g.bench_function("temporalize", |b| {
+        b.iter_batched(
+            || normalize(&env, &caller, now).unwrap(),
+            |mut fact| {
+                temporalize(&mut fact).unwrap();
+                black_box(fact)
+            },
+            BatchSize::SmallInput,
+        )
     });
-    store
+
+    // Stages 1-3 end to end — the full per-op synchronous compute before the
+    // stage-4 durable write.
+    g.bench_function("stages_1_3", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut fact = normalize(&env, &caller, now).unwrap();
+                key_stage(&env, &caller, &mut fact, &resolver)
+                    .await
+                    .unwrap();
+                temporalize(&mut fact).unwrap();
+                black_box(fact)
+            })
+        })
+    });
+
+    g.finish();
 }
 
-/// Attribute key lookup / index — op 1 `fetch_by_keys` over a store whose size
-/// scales so a regression in the linear scan + collapse is visible.
-fn bench_fetch_by_keys(c: &mut Criterion) {
+/// Attribute-key lookup / index: `fetch_by_keys` over a representative corpus,
+/// across two corpus sizes so a complexity regression (e.g. losing the limit
+/// truncation or the collapse bound) shows up as a super-linear slope.
+fn bench_keyed_lookup(c: &mut Criterion) {
     let rt = rt();
-    let cardinality = 64u64;
+    let caller = caller();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-17T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let resolver = NoopResolver;
 
-    let mut group = c.benchmark_group("attr_key_lookup");
-    for &n in &[1_000u64, 10_000u64] {
-        let store = populated_store(&rt, n, cardinality);
+    let mut g = c.benchmark_group("keyed_lookup");
+
+    for corpus in [1_000u64, 8_000u64] {
+        // Build the store once per size, outside the timed loop, through the
+        // real pipeline so the committed records match production shape.
+        let store = Arc::new(MemStore::new());
+        let ops = generate(&WorkloadConfig {
+            ops: corpus,
+            key_cardinality: 64,
+            ..WorkloadConfig::default()
+        });
+        rt.block_on(async {
+            for op in &ops {
+                let mut fact = normalize(&op.envelope, &caller, now).unwrap();
+                key_stage(&op.envelope, &caller, &mut fact, &resolver)
+                    .await
+                    .unwrap();
+                temporalize(&mut fact).unwrap();
+                store.commit_fact(&fact).await.unwrap();
+            }
+        });
+
+        // Query one issue key: scans the full corpus, matches ~corpus/64 rows,
+        // sorts newest-first, truncates to limit, collapses supersessions.
         let query = KeyedQuery {
-            keys: vec![(EntityKey::Issue, "bench-issue-7".into())],
+            keys: vec![(EntityKey::Issue, "bench-issue-0".into())],
             fact_type: None,
             as_of: None,
             valid: Validity::Current,
-            limit: 50,
+            limit: KeyedQuery::DEFAULT_LIMIT,
         };
-        group.throughput(Throughput::Elements(n));
-        group.bench_with_input(BenchmarkId::new("fetch_by_keys", n), &n, |b, _| {
+
+        g.throughput(Throughput::Elements(corpus));
+        g.bench_with_input(BenchmarkId::from_parameter(corpus), &corpus, |b, _| {
             b.iter(|| {
-                rt.block_on(async {
-                    store
-                        .fetch_by_keys(std::hint::black_box("bench-tenant"), &query)
-                        .await
-                        .expect("fetch ok")
-                })
-            });
+                let rows = rt
+                    .block_on(store.fetch_by_keys("bench-tenant", black_box(&query)))
+                    .unwrap();
+                black_box(rows)
+            })
         });
     }
-    group.finish();
+
+    g.finish();
 }
 
-/// Stage 4 commit — the fresh-insert path (HashMap insert + record build) and
-/// the idempotent-duplicate path (lookup + body compare, no write).
-fn bench_commit(c: &mut Criterion) {
-    let rt = rt();
-    let cardinality = 64u64;
-
-    let mut group = c.benchmark_group("write_pipeline");
-    group.throughput(Throughput::Elements(1));
-
-    group.bench_function("commit_fact_insert", |b| {
-        b.iter_batched(
-            MemStore::new,
-            |store| {
-                rt.block_on(async {
-                    store
-                        .commit_fact(&keyed_fact(0, cardinality))
-                        .await
-                        .expect("insert ok")
-                })
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    // Duplicate path: id already present with the same body -> idempotent ack.
-    let dup_store = MemStore::new();
-    let dup = keyed_fact(0, cardinality);
-    rt.block_on(async { dup_store.commit_fact(&dup).await.expect("seed") });
-    group.bench_function("commit_fact_duplicate", |b| {
-        b.iter(|| rt.block_on(async { dup_store.commit_fact(&dup).await.expect("dup ok") }));
-    });
-
-    group.finish();
+criterion_group! {
+    name = benches;
+    // Keep CI runtime bounded while retaining statistical signal.
+    config = Criterion::default()
+        .sample_size(60)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(4));
+    targets = bench_write_pipeline, bench_keyed_lookup
 }
-
-criterion_group!(
-    hot_paths,
-    bench_normalize,
-    bench_temporalize,
-    bench_fetch_by_keys,
-    bench_commit
-);
-criterion_main!(hot_paths);
+criterion_main!(benches);
