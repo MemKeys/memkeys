@@ -41,7 +41,9 @@ impl PgVectorIndex {
 /// Render a vector as pgvector's text input form `[f0,f1,…]`. `f32::to_string`
 /// round-trips exactly (shortest decimal that parses back), so the stored
 /// vector equals the embedder's output.
-fn encode_vector(v: &[f32]) -> String {
+/// pgvector text form of a vector (`[1,0.5,-0.25]`) — shared with the M6
+/// digest-tier writer (llm_worker).
+pub(crate) fn encode_vector(v: &[f32]) -> String {
     let mut s = String::with_capacity(v.len() * 8 + 2);
     s.push('[');
     for (i, x) in v.iter().enumerate() {

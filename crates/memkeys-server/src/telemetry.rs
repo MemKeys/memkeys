@@ -45,6 +45,15 @@ pub const WORKER_KIND_VECTOR_PROJECTION: &str = "vector_projection";
 pub const PROJECTION_KIND_GRAPH: &str = "graph";
 /// `memkeys.projection.kind` value for the fact-vector projection (M5 stage 5b).
 pub const PROJECTION_KIND_VECTOR: &str = "vector";
+/// `memkeys.worker.kind` values for the M6 LLM pipeline workers (ADR-llm-pipeline
+/// Decision 2: W-extract = stage 5e, W-digest = 5c, W-categorize = 5d).
+pub const WORKER_KIND_LLM_EXTRACT: &str = "llm_extract";
+pub const WORKER_KIND_DIGEST_ROLLUP: &str = "digest_rollup";
+pub const WORKER_KIND_CATEGORIZE: &str = "categorize";
+/// `memkeys.projection.kind` values for the M6 derived views.
+pub const PROJECTION_KIND_DERIVED_KEYS: &str = "derived_keys";
+pub const PROJECTION_KIND_DIGEST: &str = "digest";
+pub const PROJECTION_KIND_CATEGORY_FACETS: &str = "category_facets";
 pub const OUTCOME_SUCCESS: &str = "success";
 pub const OUTCOME_ERROR: &str = "error";
 pub const OUTCOME_REJECTED: &str = "rejected";
@@ -130,6 +139,18 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "db.system.name",
     "db.operation.name",
     "db.collection.name",
+    // M6 (WS-3, ADR-llm-pipeline): the gen_ai.* EXPERIMENTAL semconv group,
+    // pinned + isolated in the single emission helper `gen_attr` (signal
+    // catalog: "behind one helper"). Values are model/operation/token KINDS
+    // and COUNTS only — the forbidden list still holds: no prompt, no
+    // completion, never fact bodies or key values.
+    "gen_ai.operation.name",
+    "gen_ai.system",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.token.type",
 ];
 
 /// The single emission helper (signal-catalog: "enforced by the single SDK
@@ -143,12 +164,31 @@ pub fn attr(key: &'static str, value: impl Into<Value>) -> KeyValue {
     KeyValue::new(key, value)
 }
 
+/// The gen_ai.* emission helper (M6, WS-3). The experimental semconv group is
+/// deliberately isolated in its own helper (same registry validation; the
+/// catalog forbids prompt/completion CONTENT — kinds, model ids, and token
+/// COUNTS only).
+pub fn gen_attr(key: &'static str, value: impl Into<Value>) -> KeyValue {
+    attr(key, value)
+}
+
 fn tracer() -> global::BoxedTracer {
     global::tracer("memkeys")
 }
 
 /// Start a named span with registry-validated attributes.
 pub fn start_span(name: &'static str, kind: SpanKind, attrs: Vec<KeyValue>) -> global::BoxedSpan {
+    tracer()
+        .span_builder(name)
+        .with_kind(kind)
+        .with_attributes(attrs)
+        .start(&tracer())
+}
+
+/// Start a span with a RUNTIME-composed name (M6: the gen_ai semconv span-name
+/// convention is "{gen_ai.operation.name} {gen_ai.request.model}", where the
+/// model id is configuration). Same registry validation as [`start_span`].
+pub fn start_dynamic_span(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> global::BoxedSpan {
     tracer()
         .span_builder(name)
         .with_kind(kind)
@@ -230,6 +270,8 @@ pub struct Instruments {
     graph_edges_cardinality: opentelemetry::metrics::Gauge<u64>,
     worker_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
     poison_queue_depth_gauge: opentelemetry::metrics::Gauge<i64>,
+    llm_token_usage: opentelemetry::metrics::Histogram<f64>,
+    llm_operation_duration: opentelemetry::metrics::Histogram<f64>,
 }
 
 impl Instruments {
@@ -294,6 +336,19 @@ impl Instruments {
                      that exhausted retries (WS-3/ADR-llm Decision 8; companion to \
                      poison.oldest_age).",
                 )
+                .build(),
+            llm_token_usage: meter
+                .f64_histogram("gen_ai.client.token.usage")
+                .with_unit("{token}")
+                .with_description(
+                    "Token usage per LLM call (standard GenAI metric, WS-3 signal \
+                     catalog; input and output recorded as separate points).",
+                )
+                .build(),
+            llm_operation_duration: meter
+                .f64_histogram("gen_ai.client.operation.duration")
+                .with_unit("s")
+                .with_description("LLM call duration (standard GenAI metric, WS-3 signal catalog).")
                 .build(),
         }
     }
@@ -362,6 +417,48 @@ impl Instruments {
     pub fn poison_queue_depth(&self, worker_kind: &'static str, count: i64) {
         self.poison_queue_depth_gauge
             .record(count, &[attr("memkeys.worker.kind", worker_kind)]);
+    }
+
+    /// `gen_ai.client.token.usage` (WS-3) — input and output recorded as two
+    /// points (the standard GenAI metric carries `gen_ai.token.type`).
+    /// Counts are byte/4 estimates until adapters surface real usage.
+    pub fn llm_token_usage(
+        &self,
+        model: &str,
+        system: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) {
+        self.llm_token_usage.record(
+            input_tokens as f64,
+            &[
+                gen_attr("gen_ai.token.type", "input"),
+                gen_attr("gen_ai.operation.name", "chat"),
+                gen_attr("gen_ai.request.model", model.to_string()),
+                gen_attr("gen_ai.system", system.to_string()),
+            ],
+        );
+        self.llm_token_usage.record(
+            output_tokens as f64,
+            &[
+                gen_attr("gen_ai.token.type", "output"),
+                gen_attr("gen_ai.operation.name", "chat"),
+                gen_attr("gen_ai.request.model", model.to_string()),
+                gen_attr("gen_ai.system", system.to_string()),
+            ],
+        );
+    }
+
+    /// `gen_ai.client.operation.duration` (WS-3).
+    pub fn llm_operation_duration(&self, model: &str, system: &str, seconds: f64) {
+        self.llm_operation_duration.record(
+            seconds,
+            &[
+                gen_attr("gen_ai.operation.name", "chat"),
+                gen_attr("gen_ai.request.model", model.to_string()),
+                gen_attr("gen_ai.system", system.to_string()),
+            ],
+        );
     }
 }
 
