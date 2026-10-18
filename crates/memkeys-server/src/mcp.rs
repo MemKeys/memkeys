@@ -29,6 +29,9 @@ use crate::graph::{
 use crate::model::{EntityKey, KeyedQuery, Validity};
 use crate::pipeline::CallerContext;
 use crate::service::MemKeysService;
+use crate::telemetry::{self, TRANSPORT_STDIO};
+use opentelemetry::trace::{FutureExt, Status, TraceContextExt};
+use opentelemetry::Context;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 wire types
@@ -117,7 +120,8 @@ fn tool_list() -> Value {
                         "entity.run": {"type": "string"},
                         "entity.thread": {"type": "string"},
                         "entity.service": {"type": "string"},
-                        "fact_type": {"type": "string", "enum": ["decision","outcome","observation","learning","context"]},
+                        "type": {"type": "string", "enum": ["decision","outcome","observation","learning","context"]},
+                        "as_of": {"type": "string", "description": "RFC3339 point-in-time replay (§7.2)"},
                         "limit": {"type": "integer", "default": 100},
                         "valid": {"type": "string", "enum": ["current","all"], "default": "current"}
                     }
@@ -140,7 +144,7 @@ fn tool_list() -> Value {
                             }
                         },
                         "edges": {"type": "array", "items": {"type": "string"}},
-                        "dir": {"type": "string", "enum": ["out","in","both"], "default": "out"},
+                        "direction": {"type": "string", "enum": ["out","in","both"], "default": "out"},
                         "depth": {"type": "integer", "default": 2},
                         "hydrate": {"type": "boolean", "default": false},
                         "deadline_ms": {"type": "integer", "default": 500}
@@ -172,10 +176,13 @@ async fn dispatch_tool(service: &MemKeysService, name: &str, args: Value) -> Res
         "memory_store" => tool_store(service, args).await,
         "memory_fetch" => tool_fetch(service, args).await,
         "memory_traverse" => tool_traverse(service, args).await,
-        "memory_search" => Ok(serde_json::json!({
-            "error": "feature_disabled",
-            "feature": "semantic_search"
-        })),
+        // M3 scope: semantic search is not available. Return `Err` so the
+        // `tools/call` reply carries `isError: true`, matching the HTTP 501
+        // (ISI-6134 M2) — an Ok body with an inline `error` field reads as a
+        // successful call to an MCP client.
+        "memory_search" => Err("feature_disabled: semantic_search is not available in M3 \
+             (parity with HTTP 501 on POST /memory/search)"
+            .to_string()),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -232,13 +239,23 @@ async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, Stri
         .filter_map(|(name, ek)| args[name].as_str().map(|v| (*ek, v.to_string())))
         .collect();
 
-    let fact_type = if args["fact_type"].is_string() {
-        Some(
-            serde_json::from_value(args["fact_type"].clone())
-                .map_err(|e| format!("invalid fact_type: {e}"))?,
-        )
-    } else {
-        None
+    // §7.2 documents `type`; accept `fact_type` as a legacy alias (ISI-6134 B1).
+    let fact_type = match args["type"].as_str().or_else(|| args["fact_type"].as_str()) {
+        Some(ft) => Some(
+            serde_json::from_value(Value::String(ft.to_string()))
+                .map_err(|e| format!("invalid type: {e}"))?,
+        ),
+        None => None,
+    };
+
+    // §7.2 `as_of` point-in-time replay (S1); absent = live head.
+    let as_of = match args["as_of"].as_str() {
+        Some(ts) => Some(
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .map_err(|_| format!("as_of must be RFC3339: {ts}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
     };
 
     let limit = args["limit"].as_i64().unwrap_or(KeyedQuery::DEFAULT_LIMIT);
@@ -250,13 +267,17 @@ async fn tool_fetch(service: &MemKeysService, args: Value) -> Result<Value, Stri
     let query = KeyedQuery {
         keys,
         fact_type,
-        as_of: None,
+        as_of,
         valid,
         limit,
     };
 
     match service.fetch_by_keys(&tenant_id, &query).await {
-        Ok(records) => Ok(serde_json::to_value(records).unwrap_or(Value::Array(vec![]))),
+        // §7.2/§7.5 response-shape invariant: `{ facts: [ … ] }`, not a bare
+        // array — parity with the HTTP surface (ISI-6134 B3).
+        Ok(records) => Ok(serde_json::json!({
+            "facts": serde_json::to_value(records).unwrap_or(Value::Array(vec![])),
+        })),
         Err(QueryError::Invalid { reason }) => Err(format!("invalid query: {reason}")),
         Err(e) => Err(format!("store error: {e}")),
     }
@@ -279,12 +300,14 @@ async fn tool_traverse(service: &MemKeysService, args: Value) -> Result<Value, S
         vec![]
     };
 
-    let dir: Direction = if let Some(s) = args["dir"].as_str() {
-        serde_json::from_value(Value::String(s.to_string()))
-            .map_err(|e| format!("invalid dir: {e}"))?
-    } else {
-        Direction::default()
-    };
+    // §7.3 documents `direction`; accept `dir` as a legacy alias (ISI-6134 B2).
+    let dir: Direction =
+        if let Some(s) = args["direction"].as_str().or_else(|| args["dir"].as_str()) {
+            serde_json::from_value(Value::String(s.to_string()))
+                .map_err(|e| format!("invalid direction: {e}"))?
+        } else {
+            Direction::default()
+        };
 
     let depth = args["depth"].as_u64().map(|d| d as u8).unwrap_or(2);
     let hydrate = args["hydrate"].as_bool().unwrap_or(false);
@@ -344,7 +367,11 @@ pub async fn run_stdio(service: Arc<MemKeysService>) {
             continue;
         }
 
-        let response = handle_line(&service, trimmed).await;
+        // JSON-RPC 2.0: notifications (no `id`) get no reply at all — `handle_line`
+        // returns `None` for them, and we write nothing (ISI-6134 B4).
+        let Some(response) = handle_line(&service, trimmed).await else {
+            continue;
+        };
         let mut out = serde_json::to_string(&response).unwrap_or_else(|_| {
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"serialize error"}}"#
                 .to_string()
@@ -358,17 +385,24 @@ pub async fn run_stdio(service: Arc<MemKeysService>) {
     }
 }
 
-async fn handle_line(service: &MemKeysService, line: &str) -> JsonRpcResponse {
+async fn handle_line(service: &MemKeysService, line: &str) -> Option<JsonRpcResponse> {
     let req: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
+        // A malformed line can't be told apart from a notification, so JSON-RPC
+        // 2.0 requires a parse-error reply with null id.
         Err(_) => {
-            return JsonRpcResponse::err(Value::Null, -32700, "parse error");
+            return Some(JsonRpcResponse::err(Value::Null, -32700, "parse error"));
         }
     };
 
-    let id = req.id.clone().unwrap_or(Value::Null);
+    // JSON-RPC 2.0: a request with no `id` is a notification — the server MUST
+    // NOT reply, not even with method-not-found (ISI-6134 B4).
+    let id = match req.id.clone() {
+        Some(id) => id,
+        None => return None,
+    };
 
-    match req.method.as_str() {
+    Some(match req.method.as_str() {
         "initialize" => JsonRpcResponse::ok(
             id,
             serde_json::json!({
@@ -389,12 +423,39 @@ async fn handle_line(service: &MemKeysService, line: &str) -> JsonRpcResponse {
             let tool_name = match req.params["name"].as_str() {
                 Some(n) => n.to_string(),
                 None => {
-                    return JsonRpcResponse::err(id, -32602, "missing tool name");
+                    return Some(JsonRpcResponse::err(id, -32602, "missing tool name"));
                 }
             };
             let arguments = req.params["arguments"].clone();
 
-            match dispatch_tool(service, &tool_name, arguments).await {
+            // ISI-6134 B2: one SERVER span per `tools/call` carrying the
+            // transport surface (stdio) + tool name. Attaching its context
+            // makes the service's ingest/retrieve spans nest beneath it (they
+            // parent to the current context on their first synchronous poll).
+            let span = telemetry::transport_span(
+                "memkeys.mcp.tool_call",
+                TRANSPORT_STDIO,
+                Some(&tool_name),
+            );
+            // `with_context` attaches `cx` for each poll of the dispatch future
+            // WITHOUT holding a thread-local `ContextGuard` across `.await` —
+            // the guard is `!Send` and would make `run_stdio`'s spawned future
+            // `!Send` (telemetry.rs §doc). The service's ingest/retrieve spans
+            // still nest beneath `cx` because they read the active context on
+            // their first synchronous poll.
+            let cx = Context::current_with_span(span);
+            let outcome = dispatch_tool(service, &tool_name, arguments)
+                .with_context(cx.clone())
+                .await;
+            cx.span().set_status(match &outcome {
+                Ok(_) => Status::Ok,
+                Err(_) => Status::Error {
+                    description: "tool call failed".into(),
+                },
+            });
+            cx.span().end();
+
+            match outcome {
                 Ok(result) => JsonRpcResponse::ok(
                     id,
                     serde_json::json!({
@@ -412,5 +473,47 @@ async fn handle_line(service: &MemKeysService, line: &str) -> JsonRpcResponse {
         }
 
         _ => JsonRpcResponse::err(id, -32601, format!("method not found: {}", req.method)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memstore::MemStore;
+
+    fn service() -> Arc<MemKeysService> {
+        Arc::new(MemKeysService::new(Arc::new(MemStore::new())))
+    }
+
+    #[tokio::test]
+    async fn notification_gets_no_reply() {
+        let svc = service();
+        // No `id` → JSON-RPC notification → server MUST NOT reply (ISI-6134 B4),
+        // not even with method-not-found.
+        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(handle_line(&svc, notif).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_with_id_gets_a_reply() {
+        let svc = service();
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let resp = handle_line(&svc, req)
+            .await
+            .expect("request must get a reply");
+        assert_eq!(resp.id, serde_json::json!(1));
+        assert!(resp.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn parse_error_still_replies_with_null_id() {
+        let svc = service();
+        // A malformed line is indistinguishable from a notification, so JSON-RPC
+        // requires a parse-error reply with null id.
+        let resp = handle_line(&svc, "not json")
+            .await
+            .expect("parse error replies");
+        assert_eq!(resp.id, Value::Null);
+        assert!(resp.error.is_some());
     }
 }
