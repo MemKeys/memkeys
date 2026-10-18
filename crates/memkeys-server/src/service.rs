@@ -297,7 +297,8 @@ fn validate_supersedes_target(
         && coord(&fact.entity.pr) == coord(&target.entity_pr);
     if !same_entity_identity {
         return Err(IngestError::Rejected {
-            reason: "supersedes target does not share the entity_identity (project/issue/pr)".into(),
+            reason: "supersedes target does not share the entity_identity (project/issue/pr)"
+                .into(),
         });
     }
     if target.subject != fact.subject {

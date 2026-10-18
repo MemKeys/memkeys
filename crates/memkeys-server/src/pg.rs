@@ -94,19 +94,15 @@ fn entity_identity(fact: &ProcessedFact) -> Option<String> {
         return None;
     }
     let e = &fact.entity;
-    let coordinate: Vec<String> = [
-        ("project", &e.project),
-        ("issue", &e.issue),
-        ("pr", &e.pr),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| {
-        v.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|v| format!("{k}={v}"))
-    })
-    .collect();
+    let coordinate: Vec<String> = [("project", &e.project), ("issue", &e.issue), ("pr", &e.pr)]
+        .into_iter()
+        .filter_map(|(k, v)| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|v| format!("{k}={v}"))
+        })
+        .collect();
     if coordinate.is_empty() {
         // Unkeyed for H (e.g. an unlifted anchor-only fact) — skip the gate.
         return None;
