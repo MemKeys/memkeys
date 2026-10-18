@@ -1,15 +1,13 @@
 name: Helm
 
-# Joins the PR gate only when the chart is touched (the paths filter). ct lint
-# and kubeconform are self-contained and gate PRs now; the kind-based ct install
-# job is gated on the P0 Dockerfile (ISI-6097) existing — until then it reports
-# success without running, so it never reddens the gate before the image exists.
+# Runs on every PR so its checks can be required in branch protection on main
+# (a pull_request paths filter would leave non-charts PRs with a permanently
+# pending "expected" check). ct lint and kubeconform are self-contained and gate
+# PRs now; the kind-based ct install job is gated on the P0 Dockerfile
+# (ISI-6097) existing — until then it reports success without running, so it
+# never reddens the gate before the image exists.
 on:
   pull_request:
-    paths:
-      - "charts/**"
-      - ".github/workflows/helm.yml"
-      - ".github/ct.yaml"
   push:
     branches: [main]
     paths:
