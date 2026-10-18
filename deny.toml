@@ -1,0 +1,47 @@
+# cargo-deny configuration: advisories, bans, licenses (and sources policy).
+# Run via `cargo deny check` (see .github/workflows/docker.yml).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+# --- advisories -----------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained advisories: unmaintained deps in a transitive position are
+# warnings (e.g. RUSTSEC-2025-0052 async-std via opentelemetry_sdk); an
+# unmaintained dependency declared directly in the workspace fails the
+# check. Real vulnerabilities and yanked crates always fail.
+unmaintained = "workspace"
+ignore = []
+
+# --- bans -----------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# --- licenses -------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "warn"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+]
+
+# --- sources --------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

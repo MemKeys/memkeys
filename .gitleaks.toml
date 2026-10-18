@@ -1,0 +1,16 @@
+# gitleaks configuration for MemKeys.
+# Extends the built-in default rules; adds repo-specific allowlists.
+# Scanned via .github/workflows/security.yml (full PR git history).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives: branding asset filename list in make_package.py (generic-api-key entropy rule matched SVG/PDF asset names)."
+
+# Historical commit 1234c8f added branding/make_package.py, whose MANIFEST
+# lists generated asset filenames like "memkeys-m3-keyhole-mono.svg"; the
+# generic-api-key rule flags one of those strings. The file is not a secret.
+paths = [
+  '''branding/make_package\.py''',
+]

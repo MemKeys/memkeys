@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-memkeys-server = { path = "../memkeys-server" }
+memkeys-server = { path = "../memkeys-server", version = "0.1.0" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

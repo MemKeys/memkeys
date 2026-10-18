@@ -1,0 +1,57 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Signed-off-by trailer on every commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          failures="$(mktemp)"
+          page=1
+
+          while :; do
+            resp="$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100&page=$page")"
+
+            count="$(jq 'length' <<<"$resp")"
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+
+            for i in $(seq 0 $((count - 1))); do
+              commit="$(jq -r ".[$i]" <<<"$resp")"
+              sha="$(jq -r '.sha' <<<"$commit")"
+              author_name="$(jq -r '.commit.author.name' <<<"$commit")"
+              author_email="$(jq -r '.commit.author.email' <<<"$commit")"
+              message="$(jq -r '.commit.message' <<<"$commit")"
+              expected="Signed-off-by: ${author_name} <${author_email}>"
+
+              if ! grep -qF "$expected" <<<"$message"; then
+                echo "$sha: missing or mismatched DCO sign-off (expected trailer: $expected)" | tee -a "$failures"
+              fi
+            done
+
+            page=$((page + 1))
+          done
+
+          if [ -s "$failures" ]; then
+            echo "::error::DCO check failed — every commit needs a Signed-off-by trailer matching its author. See CONTRIBUTING.md."
+            exit 1
+          fi
+
+          echo "DCO ok: every commit carries a matching Signed-off-by trailer."

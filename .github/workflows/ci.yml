@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -54,3 +58,96 @@ jobs:
           cargo run --release -p memkeys-bench --bin write-bench -- \
             --ops 200 --warmup 20 --read-ops 200 --json -
 
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: memkeys
+          POSTGRES_PASSWORD: memkeys
+          POSTGRES_DB: memkeys_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U memkeys"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://memkeys:memkeys@localhost:5432/memkeys_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run tests under cargo-llvm-cov (lcov report)
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Coverage summary (report-only, no threshold)
+        run: |
+          read -r lh lf < <(awk '/^LH:/{lh+=$2} /^LF:/{lf+=$2} END{print lh+0, lf+0}' lcov.info)
+          if [ "$lf" -gt 0 ]; then
+            pct=$(awk -v lh="$lh" -v lf="$lf" 'BEGIN{printf "%.2f", 100*lh/lf}')
+          else
+            pct="n/a"
+          fi
+          {
+            echo "### Coverage (report-only)"
+            echo ""
+            echo "- Line coverage: **${pct}%** (no threshold enforced yet)"
+            echo "- Full lcov report is uploaded as the \`coverage-lcov\` workflow artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint (pinned)
+        run: |
+          curl -sSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin actionlint
+          actionlint --version
+
+      - name: Lint GitHub Actions workflow files
+        run: actionlint
+
+  machete:
+    name: cargo-machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Check for unused dependencies
+        run: cargo-machete

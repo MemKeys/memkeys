@@ -1,0 +1,8 @@
+.git
+.github
+target
+bench-results
+branding
+docs
+*.md
+.dockerignore
