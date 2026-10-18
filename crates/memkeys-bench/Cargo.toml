@@ -16,6 +16,13 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
 [[bin]]
 name = "write-bench"
 path = "src/bin/write-bench.rs"

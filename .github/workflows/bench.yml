@@ -1,0 +1,107 @@
+name: Bench
+
+# Perf regression tracking (ISI-6100 / ISI-6094-P2). Criterion microbenchmarks
+# for the memkeys-server CPU hot paths run on `main` only — never on PRs, so the
+# PR check suite stays fast. The previous run's criterion data is restored from
+# an actions/cache keyed on the workflow ref and used as the comparison baseline;
+# criterion prints the per-benchmark delta, regressions are surfaced as job
+# annotations and a step summary, and the full report is uploaded as an artifact.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  schedule:
+    # Weekly drift check even when main is quiet (Mondays 06:00 UTC).
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: criterion hot paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Baseline store: last run's target/criterion carried forward. restore-keys
+      # lets a fresh branch inherit the most recent baseline it can find.
+      - name: Restore criterion baseline
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            criterion-${{ github.ref_name }}-
+            criterion-main-
+
+      - name: Run benchmarks (save + compare against baseline)
+        run: |
+          set -o pipefail
+          cargo bench -p memkeys-bench --bench hot_paths -- \
+            --save-baseline main --noplot 2>&1 | tee bench-output.txt
+
+      - name: Summarize and flag regressions
+        if: always()
+        run: |
+          {
+            echo "### Criterion hot-path benchmarks"
+            echo ""
+            echo "Comparison is against the previous \`main\` baseline restored from cache."
+            echo ""
+            echo '```'
+            grep -E 'Benchmarking|time:|change:|Performance has|No change|thrpt:' bench-output.txt || cat bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Criterion prints "Performance has regressed." for a statistically
+          # significant slowdown. Emit one annotation per regressed benchmark.
+          regressed=0
+          bench_name="(unknown)"
+          while IFS= read -r line; do
+            if printf '%s' "$line" | grep -qE '^[A-Za-z0-9_]+/'; then
+              bench_name=$(printf '%s' "$line" | awk '{print $1}')
+            fi
+            if printf '%s' "$line" | grep -q 'Performance has regressed'; then
+              regressed=$((regressed + 1))
+              echo "::warning title=Perf regression::${bench_name} regressed vs baseline (see job summary)"
+            fi
+          done < bench-output.txt
+          if [ "$regressed" -gt 0 ]; then
+            echo "::notice::${regressed} benchmark(s) regressed vs the main baseline (tracking only, non-blocking)."
+          else
+            echo "::notice::No criterion regressions vs the main baseline."
+          fi
+
+      - name: Save criterion baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload criterion report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: |
+            target/criterion/**
+            bench-output.txt
+          if-no-files-found: warn

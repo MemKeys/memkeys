@@ -90,6 +90,10 @@ jobs:
           --health-retries 10
     env:
       TEST_DATABASE_URL: postgres://memkeys:memkeys@localhost:5432/memkeys_test
+      # Line-coverage floor (ISI-6100 / ISI-6094-P2). Default 70% per the
+      # approved plan; override without a code change via the repo/org variable
+      # COVERAGE_MIN (Settings → Variables).
+      COVERAGE_MIN: ${{ vars.COVERAGE_MIN || '70' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -104,22 +108,32 @@ jobs:
       - name: Run tests under cargo-llvm-cov (lcov report)
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 
-      - name: Coverage summary (report-only, no threshold)
+      - name: Coverage gate (fail below COVERAGE_MIN)
         run: |
           read -r lh lf < <(awk '/^LH:/{lh+=$2} /^LF:/{lf+=$2} END{print lh+0, lf+0}' lcov.info)
-          if [ "$lf" -gt 0 ]; then
-            pct=$(awk -v lh="$lh" -v lf="$lf" 'BEGIN{printf "%.2f", 100*lh/lf}')
-          else
-            pct="n/a"
+          if [ "$lf" -le 0 ]; then
+            echo "::error::Coverage report has no instrumented lines (LF=0) — llvm-cov produced no data."
+            exit 1
           fi
+          pct=$(awk -v lh="$lh" -v lf="$lf" 'BEGIN{printf "%.2f", 100*lh/lf}')
+          min="$COVERAGE_MIN"
           {
-            echo "### Coverage (report-only)"
+            echo "### Coverage"
             echo ""
-            echo "- Line coverage: **${pct}%** (no threshold enforced yet)"
+            echo "- Line coverage: **${pct}%** (${lh}/${lf} lines)"
+            echo "- Threshold: **${min}%** (\`COVERAGE_MIN\`)"
             echo "- Full lcov report is uploaded as the \`coverage-lcov\` workflow artifact."
           } >> "$GITHUB_STEP_SUMMARY"
+          # awk exits non-zero when pct < min, so the step fails the job.
+          if awk -v p="$pct" -v m="$min" 'BEGIN{exit !(p+0 >= m+0)}'; then
+            echo "Coverage ${pct}% meets the ${min}% threshold."
+          else
+            echo "::error title=Coverage below threshold::Line coverage ${pct}% is below the required ${min}% (COVERAGE_MIN). Add tests or lower COVERAGE_MIN."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: coverage-lcov
           path: lcov.info
