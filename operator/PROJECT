@@ -1,0 +1,18 @@
+# Kubebuilder project metadata for the MemKeys operator (M10b / ISI-6085).
+# Hand-maintained to match the layout controller-gen operates on.
+domain: memkeys.io
+layout:
+- go.kubebuilder.io/v4
+projectName: memkeys-operator
+repo: github.com/MemKeys/memkeys/operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: memkeys.io
+  group: memkeys
+  kind: MemKeysInstance
+  path: github.com/MemKeys/memkeys/operator/api/v1alpha1
+  version: v1alpha1
+version: "3"

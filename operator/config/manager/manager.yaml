@@ -1,0 +1,76 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memkeys-operator
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memkeys-operator
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+    control-plane: controller-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: memkeys-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: ghcr.io/memkeys/memkeys-operator:latest
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=0
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+      terminationGracePeriodSeconds: 10

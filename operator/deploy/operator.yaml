@@ -1,0 +1,155 @@
+# All-in-one install manifest for the MemKeys operator (M10b / ISI-6085).
+# Apply the CRD first, then this file:
+#   kubectl apply -f config/crd/bases/memkeys.io_memkeysinstances.yaml
+#   kubectl apply -f deploy/operator.yaml
+#
+# The ClusterRole rules mirror config/rbac/role.yaml (controller-gen output);
+# keep them in sync. `make manifests` regenerates the canonical role.yaml.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: memkeys-system
+  labels:
+    app.kubernetes.io/part-of: memkeys
+    app.kubernetes.io/managed-by: memkeys-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memkeys-operator
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/part-of: memkeys
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: memkeys-operator-role
+  labels:
+    app.kubernetes.io/part-of: memkeys
+rules:
+- apiGroups: [""]
+  resources: [secrets, services]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [apps]
+  resources: [deployments]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [memkeys.io]
+  resources: [memkeysinstances]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [memkeys.io]
+  resources: [memkeysinstances/finalizers]
+  verbs: [update]
+- apiGroups: [memkeys.io]
+  resources: [memkeysinstances/status]
+  verbs: [get, patch, update]
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [create, delete, get, list, patch, update, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: memkeys-operator-rolebinding
+  labels:
+    app.kubernetes.io/part-of: memkeys
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: memkeys-operator-role
+subjects:
+- kind: ServiceAccount
+  name: memkeys-operator
+  namespace: memkeys-system
+---
+# Leader-election permissions (namespaced to the operator's own namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: memkeys-operator-leader-election
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/part-of: memkeys
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: [leases]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: memkeys-operator-leader-election
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/part-of: memkeys
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: memkeys-operator-leader-election
+subjects:
+- kind: ServiceAccount
+  name: memkeys-operator
+  namespace: memkeys-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memkeys-operator
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: memkeys-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memkeys-operator
+        app.kubernetes.io/part-of: memkeys
+    spec:
+      serviceAccountName: memkeys-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: ghcr.io/memkeys/memkeys-operator:latest
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 65532
+          capabilities:
+            drop: [ALL]
+        ports:
+        - name: metrics
+          containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi

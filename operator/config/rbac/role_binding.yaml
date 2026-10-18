@@ -1,0 +1,16 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: memkeys-operator-rolebinding
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: memkeys-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: memkeys-operator
+    namespace: memkeys-system
