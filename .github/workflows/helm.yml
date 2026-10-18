@@ -86,7 +86,10 @@ jobs:
       - id: check
         name: Check for P0 Dockerfile
         run: |
-          if [ -n "$(find . -maxdepth 2 -name Dockerfile -not -path './.git/*' -print -quit)" ]; then
+          # Only the repo-root Dockerfile builds the memkeys-server image. Do not
+          # glob subdirectories — other components (e.g. operator/Dockerfile) have
+          # their own build context and workflow.
+          if [ -f Dockerfile ]; then
             echo "dockerfile=true" >> "$GITHUB_OUTPUT"
             echo "Dockerfile present — ct install will run."
           else
@@ -110,8 +113,9 @@ jobs:
 
       - name: Build memkeys-server image (P0 Dockerfile)
         run: |
-          DOCKERFILE="$(find . -maxdepth 2 -name Dockerfile -not -path './.git/*' -print -quit)"
-          docker build -f "$DOCKERFILE" -t "$IMAGE" .
+          # Pin the repo-root Dockerfile (server image). Globbing picked up
+          # operator/Dockerfile and failed with the wrong build context.
+          docker build -f Dockerfile -t "$IMAGE" .
 
       - name: Create kind cluster
         uses: helm/kind-action@v1.10.0
