@@ -1,0 +1,47 @@
+---
+# Leader-election permissions for the controller manager (--leader-elect).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: memkeys-operator-leader-election
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: memkeys-operator-leader-election
+  namespace: memkeys-system
+  labels:
+    app.kubernetes.io/name: memkeys-operator
+    app.kubernetes.io/part-of: memkeys
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: memkeys-operator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: memkeys-operator
+    namespace: memkeys-system

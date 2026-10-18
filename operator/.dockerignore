@@ -1,0 +1,8 @@
+bin/
+config/
+deploy/
+docs/
+*.md
+Makefile
+PROJECT
+cover.out

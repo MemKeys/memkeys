@@ -1,0 +1,40 @@
+name: Operator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'operator/**'
+      - '.github/workflows/operator.yml'
+  pull_request:
+    paths:
+      - 'operator/**'
+      - '.github/workflows/operator.yml'
+
+concurrency:
+  group: operator-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  operator:
+    name: build + vet + envtest e2e smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      - name: Verify generated manifests/DeepCopy are up to date
+        run: make verify
+
+      - name: Vet + build
+        run: make vet build
+
+      - name: Envtest e2e smoke (reconcile against a real apiserver)
+        run: make test

@@ -1,0 +1,42 @@
+# Sample MemKeysInstance resources — one per deployment profile. These mirror
+# the M10a Helm chart profiles (ISI-6084) so the operator and chart stay
+# coherent.
+#
+# Both reference a pre-provisioned Secret holding MEMKEYS_DATABASE_URL. Create
+# it first, e.g.:
+#   kubectl create secret generic memkeys-db \
+#     --from-literal=MEMKEYS_DATABASE_URL=postgres://user:pass@host:5432/memkeys
+---
+apiVersion: memkeys.io/v1alpha1
+kind: MemKeysInstance
+metadata:
+  name: memkeys-single-node
+spec:
+  # Default profile: one all-in-one server Deployment, no workers, no PDB.
+  profile: single-node
+  image:
+    repository: ghcr.io/memkeys/memkeys
+    tag: latest
+  database:
+    existingSecret: memkeys-db
+  otel:
+    deploymentEnv: dev
+---
+apiVersion: memkeys.io/v1alpha1
+kind: MemKeysInstance
+metadata:
+  name: memkeys-microservice
+spec:
+  # Microservice profile: server (2 replicas) + async-projection worker
+  # Deployment + a drain-safe PodDisruptionBudget.
+  profile: microservice
+  image:
+    repository: ghcr.io/memkeys/memkeys
+    tag: latest
+  database:
+    existingSecret: memkeys-db
+  otel:
+    deploymentEnv: prod
+    endpoint: otel-collector.observability.svc:4317
+  workers:
+    replicas: 2
