@@ -47,15 +47,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // M3: HTTP server.
+    // M3 (ISI-6137 B3): bind loopback by DEFAULT so an unauthenticated server is
+    // never network-reachable by accident. A non-loopback bind is permitted only
+    // when a bearer token gates admission (MEMKEYS_AUTH_TOKEN) or the operator
+    // explicitly accepts the risk (MEMKEYS_ALLOW_INSECURE=1); otherwise we refuse
+    // to start rather than expose the open admission surface the CR flagged.
     let http_port: u16 = std::env::var("MEMKEYS_HTTP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let http_host = std::env::var("MEMKEYS_HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let has_token = std::env::var("MEMKEYS_AUTH_TOKEN").is_ok_and(|t| !t.is_empty());
+    let is_loopback = matches!(http_host.as_str(), "127.0.0.1" | "::1" | "localhost");
+    let allow_insecure = std::env::var("MEMKEYS_ALLOW_INSECURE").is_ok_and(|v| v == "1");
+    if !is_loopback && !has_token && !allow_insecure {
+        return Err(format!(
+            "refusing to bind {http_host}:{http_port}: a non-loopback bind with no \
+             MEMKEYS_AUTH_TOKEN would expose an unauthenticated admission surface. Set \
+             MEMKEYS_AUTH_TOKEN, keep the loopback default (127.0.0.1), or set \
+             MEMKEYS_ALLOW_INSECURE=1 to override (NOT recommended)."
+        )
+        .into());
+    }
+    if !is_loopback && !has_token {
+        tracing::warn!(
+            target: "memkeys",
+            "memkeys.admission.open: bound {http_host}:{http_port} with NO auth token \
+             (MEMKEYS_ALLOW_INSECURE); tenant is self-asserted — cross-tenant \
+             impersonation is possible (ISI-6137 S1)."
+        );
+        eprintln!(
+            "WARNING: memkeys-server bound {http_host}:{http_port} with no auth token — \
+             open admission surface, self-asserted tenant (ISI-6137 S1)."
+        );
+    }
     let app_state = AppState::new(service.clone());
     let router = memkeys_server::http::router(app_state);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_port)).await?;
-    println!("memkeys-server: HTTP listening on :{http_port}");
+    let listener = tokio::net::TcpListener::bind((http_host.as_str(), http_port)).await?;
+    println!("memkeys-server: HTTP listening on {http_host}:{http_port}");
     let http_server = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
             tracing::error!(target: "memkeys", "HTTP server error: {e}");
