@@ -500,6 +500,13 @@ impl MemKeysService {
                 retrieve.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_KEYED, rows.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror. Keyed recall is exact
+                // (no top-k prune) → candidates == results.
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_RECALL,
+                    telemetry::MEMORY_STORE_KEYED,
+                    rows.len() as u64,
+                );
             }
             Err(e) => {
                 record_error(&mut store_span, format!("{e}"));
@@ -542,6 +549,27 @@ impl MemKeysService {
         retrieve.end();
         {
             let mem = mem_cx.span();
+            // ISI-6251 rev-2: per-span recall funnel + search-key structure on
+            // the outer `memory.recall` CLIENT span (Tempo visibility). Keyed
+            // recall is exact → candidates == results.
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.candidates_count",
+                result_count as i64,
+            ));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.results_count",
+                result_count as i64,
+            ));
+            // Search-key STRUCTURAL attrs only — entity-key KINDS + count, never
+            // the raw values (deny-list; `key_id` stays off the wire).
+            let mut kinds: Vec<&str> = query.keys.iter().map(|(k, _)| k.wire_name()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            mem.set_attribute(telemetry::attr("memory.recall.key_kind", kinds.join(",")));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.key_count",
+                query.keys.len() as i64,
+            ));
             mem.set_status(if result.is_ok() {
                 Status::Ok
             } else {
@@ -609,6 +637,12 @@ impl MemKeysService {
                 span.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_GRAPH, r.nodes.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror (graph traversal set).
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_SEARCH,
+                    telemetry::MEMORY_STORE_GRAPH,
+                    r.nodes.len() as u64,
+                );
             }
             Err(_) => span.set_status(Status::Error {
                 description: "graph traverse failed".into(),
@@ -915,6 +949,13 @@ impl MemKeysService {
                 span.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_SEMANTIC, hits.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror. `hits.len()` is the
+                // candidate set BEFORE top-k prune → candidates/results ratio.
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_SEARCH,
+                    telemetry::MEMORY_STORE_VECTOR,
+                    hits.len() as u64,
+                );
             }
             Err(_) => span.set_status(Status::Error {
                 description: "semantic search failed".into(),
@@ -954,6 +995,32 @@ impl MemKeysService {
         span.end();
         {
             let mem = mem_cx.span();
+            // ISI-6251 rev-2: per-span recall funnel on the `memory.search`
+            // CLIENT span. Candidate set == returned hits (prune happens inside
+            // `semantic_search_inner`'s zero-similarity drop); record returned.
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.candidates_count",
+                result_count as i64,
+            ));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.results_count",
+                result_count as i64,
+            ));
+            if let Some(score) = top_similarity {
+                mem.set_attribute(telemetry::attr("memory.recall.top_similarity", score));
+            }
+            // Search-key STRUCTURAL attrs only — entity-key KINDS + count from
+            // the scope, never the raw values (deny-list; `key_id` stays off).
+            if !req.scope.is_empty() {
+                let mut kinds: Vec<&str> = req.scope.iter().map(|(k, _)| k.wire_name()).collect();
+                kinds.sort_unstable();
+                kinds.dedup();
+                mem.set_attribute(telemetry::attr("memory.recall.key_kind", kinds.join(",")));
+                mem.set_attribute(telemetry::attr(
+                    "memory.recall.key_count",
+                    req.scope.len() as i64,
+                ));
+            }
             mem.set_status(if result.is_ok() {
                 Status::Ok
             } else {

@@ -113,3 +113,37 @@ here as a mapping only (not emitted) until the GenAI memory group stabilises.
 - `crates/memkeys-server/src/telemetry_setup.rs` — `memory.sut.*` resource attrs.
 - `crates/memkeys-server/src/service.rs` — dual-emit at the 6 operation boundaries.
 - `crates/memkeys-server/tests/otel_signals.rs` — topology + metric conformance.
+
+## Rev 2 — extended recall/search observability (ISI-6251)
+
+Board ask (ISI-6216 plan rev-2, gate `0ab1b4e9`): *facts found with a search, the
+search key applied, quantity recalled.* All additive; no native-stack change; the
+PII deny-list is a HARD boundary (entity-key VALUES never leave the process).
+
+### Found-vs-returned funnel
+- **Metric** `memory.recall.candidates.count` → Prometheus `memory_recall_candidates_count`
+  (`{result}`, labels `memory.operation` + `memory.store.kind` + `memory.sut.name` —
+  the SAME label set as `memory_recall_results_count`, so the **candidates/results
+  ratio** is a direct pruning/precision signal). Recorded at all three recall sites
+  (keyed `rows.len()`, graph `nodes.len()`, semantic `hits.len()`) alongside the
+  native `memkeys.retrieve.candidate_set.size`. **No new metric labels** — the
+  bounded label budget is unchanged.
+
+### Per-span recall detail (Tempo visibility)
+On the outer `memory.recall` / `memory.search` CLIENT span:
+- `memory.recall.candidates_count` (i64), `memory.recall.results_count` (i64)
+- `memory.recall.top_similarity` (f64) — semantic/vector read only.
+
+### Search-key observability — STRUCTURAL ONLY
+- `memory.recall.key_kind` — the `EntityKey` KIND(s) from the scope (`wire_name()`,
+  bounded enum; multi-kind scopes sorted + deduped + joined). **Span attr only, never
+  a metric label** (keeps the bounded metric budget).
+- `memory.recall.key_count` — `scope.len()`.
+- **`memory.recall.key_id` is intentionally NOT emitted and NOT registered** — raw
+  entity-key values breach the deny-list (ISI-6216 board comment `c2a0e066`). Asserted
+  absent in `telemetry.rs` (registry) and `otel_signals.rs` (live keyed-read span).
+
+### Upstream gap
+`candidates_count` / `key_kind` / `key_count` have no equivalent in memory-semconv
+v0.1.0 or the GenAI memory conventions yet → tracked as an upstream extension proposal
+(talk narrative: "the standard caught up to what we proposed").

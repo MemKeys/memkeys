@@ -276,6 +276,27 @@ async fn keyed_read_emits_the_catalog_trace() {
         value_str(attr(recall, "memory.sut.name").unwrap()),
         "memkeys"
     );
+    // ISI-6251 rev-2: found-vs-returned funnel + search-key STRUCTURE on the
+    // `memory.recall` span. Keyed read of one key returning one row.
+    assert_eq!(
+        value_str(attr(recall, "memory.recall.key_kind").unwrap()),
+        "entity.project"
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.key_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.candidates_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.results_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    // PII gate: the entity-key KIND is emitted, the raw VALUE (`proj-1`) is
+    // NOT — `memory.recall.key_id` must never appear (deny-list, ISI-6216).
+    assert!(attr(recall, "memory.recall.key_id").is_none());
 
     let retrieve = span(spans, "memkeys.retrieve");
     assert_eq!(retrieve.span_kind, SpanKind::Server);
@@ -356,6 +377,9 @@ async fn catalog_metrics_are_emitted_with_registry_attributes() {
         // the benchmark LGTM conformance step).
         "memory.operation.duration",
         "memory.recall.results.count",
+        // ISI-6251 rev-2: found-vs-returned funnel mirror. Renders to
+        // memory_recall_candidates_count through the Prometheus pipeline.
+        "memory.recall.candidates.count",
         "memory.items",
         "memory.bytes",
     ] {
