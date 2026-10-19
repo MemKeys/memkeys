@@ -1,0 +1,122 @@
+name: Helm Publish
+
+# Publishes charts/memkeys as an OCI artifact to oci://ghcr.io/memkeys/charts.
+#
+# The PR gate (lint / kubeconform / ct install) lives in helm.yml and is
+# unchanged — this workflow never runs on pull_request, so it can never gate a
+# PR. Publishing happens on:
+#   * push to main that touches the chart — republishes only when Chart.yaml's
+#     `version:` has been bumped (an existing version is never clobbered), and
+#   * git tags matching v* — the release ref always publishes the chart version
+#     recorded at that tag.
+#
+# The repo lives in the MemKeys org, so GITHUB_TOKEN with packages:write can
+# push to ghcr.io/memkeys/* natively — no PAT required. (First publish of a new
+# package is private by default; make ghcr.io/memkeys/charts/memkeys public once
+# via the GHCR package settings — same one-time toggle as the images, ISI-6304.)
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-publish.yml"
+    tags:
+      - "v*"
+
+concurrency:
+  # Serialize publishes per ref so two pushes can't race the registry.
+  group: helm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  OCI_REGISTRY: ghcr.io
+  OCI_REPO: oci://ghcr.io/memkeys/charts
+  CHART_DIR: charts/memkeys
+
+jobs:
+  publish:
+    name: package + push (OCI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Read chart version
+        id: chart
+        run: |
+          set -euo pipefail
+          version="$(helm show chart "$CHART_DIR" | awk '/^version:/ {print $2; exit}')"
+          if [ -z "$version" ]; then
+            echo "::error::could not read version from $CHART_DIR/Chart.yaml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $version"
+
+      - name: Log in to GHCR (helm registry)
+        run: |
+          helm registry login "$OCI_REGISTRY" \
+            -u "${{ github.actor }}" \
+            --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Skip if this version is already published
+        id: guard
+        run: |
+          set -euo pipefail
+          # On a tag ref we always publish the pinned version. On a main push we
+          # only publish when Chart.yaml carries a version not yet in the
+          # registry, so a chart change that forgot to bump the version (or a
+          # re-run of a merged commit) never clobbers a released artifact.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag ref — publishing version ${{ steps.chart.outputs.version }}"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if helm show chart "$OCI_REPO/memkeys" \
+               --version "${{ steps.chart.outputs.version }}" >/dev/null 2>&1; then
+            echo "version ${{ steps.chart.outputs.version }} already published — skipping push"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version ${{ steps.chart.outputs.version }} not in registry — will publish"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package chart
+        if: steps.guard.outputs.publish == 'true'
+        run: helm package "$CHART_DIR" --destination "$RUNNER_TEMP"
+
+      - name: Push chart to GHCR
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          helm push \
+            "$RUNNER_TEMP/memkeys-${{ steps.chart.outputs.version }}.tgz" \
+            "$OCI_REPO"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Helm OCI publish"
+            echo ""
+            echo "| field | value |"
+            echo "|-------|-------|"
+            echo "| chart version | \`${{ steps.chart.outputs.version }}\` |"
+            echo "| ref | \`${{ github.ref }}\` |"
+            echo "| published | \`${{ steps.guard.outputs.publish }}\` |"
+            echo "| oci ref | \`${{ env.OCI_REPO }}/memkeys\` |"
+            if [ "${{ steps.guard.outputs.publish }}" = "true" ]; then
+              echo ""
+              echo '```'
+              echo "helm pull ${{ env.OCI_REPO }}/memkeys --version ${{ steps.chart.outputs.version }}"
+              echo "helm install memkeys ${{ env.OCI_REPO }}/memkeys --version ${{ steps.chart.outputs.version }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
