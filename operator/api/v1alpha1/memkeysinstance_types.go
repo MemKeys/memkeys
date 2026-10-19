@@ -94,6 +94,44 @@ type PodDisruptionBudgetSpec struct {
 	MinAvailable int32 `json:"minAvailable,omitempty"`
 }
 
+// RunTokenSecretSpec references a pre-provisioned Secret holding the
+// run-token issuer secret (MEMKEYS_RUN_TOKEN_SECRET). The issuer secret signs
+// the bearer run tokens the /memory/* transport verifies per request — it is
+// not stored inline in the MemKeysInstance spec.
+type RunTokenSecretSpec struct {
+	// Name of the Secret holding the issuer secret.
+	Name string `json:"name"`
+	// Key within the Secret holding the issuer secret.
+	// +kubebuilder:default="MEMKEYS_RUN_TOKEN_SECRET"
+	Key string `json:"key,omitempty"`
+}
+
+// MemoryTransportSpec configures exposure of the /memory/* HTTP transport
+// (ISI-6233). The server binds it on its OWN listener (MEMKEYS_MEMORY_HTTP_PORT,
+// default 3000), distinct from the health surface on servicePort. Exposing it
+// off loopback requires a run-token verifier — the server refuses a
+// non-loopback bind without one — so an enabled transport with neither a
+// runTokenSecret nor allowInsecure is rejected fail-closed (Degraded, no pods
+// rolled out), mirroring charts/memkeys's fail-fast gate.
+type MemoryTransportSpec struct {
+	// Enabled turns the memory transport exposure on/off. Nil → enabled.
+	// Disable to render the health-only surface.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Port is the port the memory transport listens on (MEMKEYS_MEMORY_HTTP_PORT)
+	// and the Service exposes. Must differ from servicePort.
+	// +kubebuilder:default=3000
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
+	// RunTokenSecret references the Secret holding the run-token issuer
+	// secret. Required unless allowInsecure is set (dev only).
+	RunTokenSecret *RunTokenSecretSpec `json:"runTokenSecret,omitempty"`
+	// AllowInsecure binds the transport off loopback with NO run-token
+	// verifier (the server warns; tenant is self-asserted — ISI-6137 S1).
+	// Dev-only; prefer runTokenSecret.
+	AllowInsecure bool `json:"allowInsecure,omitempty"`
+}
+
 // MemKeysInstanceSpec defines the desired state of a MemKeys instance.
 type MemKeysInstanceSpec struct {
 	// Profile selects which workloads are reconciled.
@@ -121,11 +159,16 @@ type MemKeysInstanceSpec struct {
 	// PodDisruptionBudget configures the server PDB.
 	PodDisruptionBudget PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
 
-	// ServicePort is the port the Service exposes and the container listens on.
+	// ServicePort is the port the Service exposes and the container listens on
+	// for the HEALTH surface (/healthz, /readyz). The /memory/* transport has
+	// its own listener — see memoryTransport.
 	// +kubebuilder:default=8080
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	ServicePort int32 `json:"servicePort,omitempty"`
+
+	// MemoryTransport configures exposure of the /memory/* HTTP transport.
+	MemoryTransport MemoryTransportSpec `json:"memoryTransport,omitempty"`
 
 	// Resources are the server container resource requirements.
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`

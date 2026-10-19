@@ -62,19 +62,29 @@ jobs:
                   -schema-location default \
                   -schema-location "$CRD"
           }
-          echo "::group::defaults (+ db url)"
-          validate --set database.url="postgres://u:p@h:5432/db"
-          echo "::endgroup::"
-          echo "::group::HTTPRoute enabled (Gateway API CRD)"
+          echo "::group::defaults (+ db url, memory transport via run-token secret)"
           validate --set database.url="postgres://u:p@h:5432/db" \
+            --set memoryTransport.runTokenSecret.value=ci-render-issuer
+          echo "::endgroup::"
+          echo "::group::HTTPRoute enabled (Gateway API CRD, backendRef → memory port)"
+          validate --set database.url="postgres://u:p@h:5432/db" \
+            --set memoryTransport.runTokenSecret.value=ci-render-issuer \
             --set httpRoute.enabled=true \
             --set 'httpRoute.parentRefs[0].name=gw' \
             --set 'httpRoute.hostnames[0]=memkeys.example.com'
           echo "::endgroup::"
+          echo "::group::memory transport disabled (health-only surface)"
+          validate --set database.url="postgres://u:p@h:5432/db" \
+            --set memoryTransport.enabled=false
+          echo "::endgroup::"
           echo "::group::microservice profile (server + workers + PDB)"
           validate --set database.url="postgres://u:p@h:5432/db" \
+            --set memoryTransport.allowInsecure=true \
             --set profile=microservice
           echo "::endgroup::"
+
+      - name: Memory transport render assertions
+        run: charts/memkeys/ci/render-assertions.sh
 
   detect:
     name: detect image build

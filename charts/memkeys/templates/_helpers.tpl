@@ -152,6 +152,52 @@ ServiceAccount name
 {{- end }}
 
 {{/*
+Whether the /memory/* transport is exposed (containerPort + Service port +
+0.0.0.0 bind). Defaults to true when unset. Emits "true"/"false".
+*/}}
+{{- define "memkeys.memoryTransportEnabled" -}}
+{{- if kindIs "bool" .Values.memoryTransport.enabled -}}
+{{- .Values.memoryTransport.enabled | ternary "true" "false" -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail-fast validation for the memory transport, mirroring the server's own bind
+gate (crates/memkeys-server/src/main.rs): a non-loopback bind requires a
+run-token verifier (MEMKEYS_RUN_TOKEN_SECRET) or an explicit insecure opt-in,
+and the transport port must not collide with the health port. Rendered from
+deployment.yaml (always rendered), so every `helm template`/`helm install`
+runs it. Emits nothing on success.
+*/}}
+{{- define "memkeys.memoryTransportValidate" -}}
+{{- if eq (include "memkeys.memoryTransportEnabled" .) "true" -}}
+{{- $mt := .Values.memoryTransport -}}
+{{- if eq (int $mt.port) (int .Values.service.port) -}}
+{{- fail (printf "memkeys: memoryTransport.port (%d) must differ from service.port (%d) — the health and memory listeners are distinct and would collide inside the process" (int $mt.port) (int .Values.service.port)) -}}
+{{- end -}}
+{{- if eq $mt.portName .Values.service.portName -}}
+{{- fail (printf "memkeys: memoryTransport.portName (%q) must differ from service.portName (%q) — Service port names must be unique" $mt.portName .Values.service.portName) -}}
+{{- end -}}
+{{- if not (or $mt.runTokenSecret.existingSecret $mt.runTokenSecret.value $mt.allowInsecure) -}}
+{{- fail (cat "memkeys: memoryTransport.enabled=true exposes the /memory/* transport off loopback and requires a run-token issuer secret (the server refuses a non-loopback bind without one). Set memoryTransport.runTokenSecret.existingSecret (or .value for a chart-rendered Secret), or set memoryTransport.allowInsecure=true for dev-only clusters (NOT recommended). Alternatively set memoryTransport.enabled=false to render the health-only surface.") -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the run-token issuer secret (MEMKEYS_RUN_TOKEN_SECRET).
+*/}}
+{{- define "memkeys.runTokenSecretName" -}}
+{{- if .Values.memoryTransport.runTokenSecret.existingSecret -}}
+{{- .Values.memoryTransport.runTokenSecret.existingSecret -}}
+{{- else -}}
+{{- printf "%s-run-token" (include "memkeys.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Name of the Secret that holds MEMKEYS_DATABASE_URL.
 */}}
 {{- define "memkeys.databaseSecretName" -}}

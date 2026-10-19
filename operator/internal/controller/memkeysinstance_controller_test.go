@@ -36,6 +36,12 @@ func createInstance(t *testing.T, ns string, mutate func(*memkeysv1alpha1.MemKey
 		ObjectMeta: metav1.ObjectMeta{Name: "sample", Namespace: ns},
 		Spec: memkeysv1alpha1.MemKeysInstanceSpec{
 			Database: memkeysv1alpha1.DatabaseSpec{URL: "postgres://u:p@db:5432/memkeys"},
+			// The memory transport is exposed by default (ISI-6233) and its
+			// gate is fail-closed, so the realistic default test spec wires
+			// a run-token secret; the unauthenticated case has its own test.
+			MemoryTransport: memkeysv1alpha1.MemoryTransportSpec{
+				RunTokenSecret: &memkeysv1alpha1.RunTokenSecretSpec{Name: "run-token"},
+			},
 		},
 	}
 	mutate(mki)
@@ -341,8 +347,9 @@ func TestServicePortWiredToHTTPPortEnv(t *testing.T) {
 		t.Fatal("server Deployment not created")
 	}
 	container := srv.Spec.Template.Spec.Containers[0]
-	if len(container.Ports) != 1 || container.Ports[0].ContainerPort != 9090 {
-		t.Errorf("containerPort = %+v, want 9090", container.Ports)
+	// Health + memory listeners (the transport is enabled by default).
+	if len(container.Ports) != 2 {
+		t.Errorf("containerPorts = %+v, want health 9090 + memory 3000", container.Ports)
 	}
 	httpPort := ""
 	for _, e := range container.Env {
@@ -360,6 +367,192 @@ func TestServicePortWiredToHTTPPortEnv(t *testing.T) {
 	}
 	if got := svc.Spec.Ports[0].Port; got != 9090 {
 		t.Errorf("Service port = %d, want 9090", got)
+	}
+}
+
+// TestMemoryTransportExposedViaService is the ISI-6233 acceptance: the
+// /memory/* transport must be routable via the Service — its own container
+// port, its own Service port, and the env that makes the server bind off
+// loopback with a run-token verifier.
+func TestMemoryTransportExposedViaService(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.MemoryTransport.Port = 3111
+		m.Spec.MemoryTransport.RunTokenSecret = &memkeysv1alpha1.RunTokenSecretSpec{
+			Name: "my-run-token", Key: "ISSUER",
+		}
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	srv, ok := getDeployment(t, mki.Name, ns)
+	if !ok {
+		t.Fatal("server Deployment not created")
+	}
+	container := srv.Spec.Template.Spec.Containers[0]
+	var memoryPort *corev1.ContainerPort
+	for i := range container.Ports {
+		if container.Ports[i].Name == "memory" {
+			memoryPort = &container.Ports[i]
+		}
+	}
+	if memoryPort == nil || memoryPort.ContainerPort != 3111 {
+		t.Errorf("memory containerPort = %+v, want named port memory:3111", container.Ports)
+	}
+
+	env := map[string]*corev1.EnvVar{}
+	for i := range container.Env {
+		e := container.Env[i]
+		env[e.Name] = &e
+	}
+	if v := env["MEMKEYS_MEMORY_HTTP_PORT"]; v == nil || v.Value != "3111" {
+		t.Errorf("MEMKEYS_MEMORY_HTTP_PORT = %+v, want 3111", env["MEMKEYS_MEMORY_HTTP_PORT"])
+	}
+	if v := env["MEMKEYS_HTTP_HOST"]; v == nil || v.Value != "0.0.0.0" {
+		t.Errorf("MEMKEYS_HTTP_HOST = %+v, want 0.0.0.0 (loopback default is unreachable off-pod)", env["MEMKEYS_HTTP_HOST"])
+	}
+	if v := env["MEMKEYS_ALLOW_INSECURE"]; v != nil {
+		t.Errorf("MEMKEYS_ALLOW_INSECURE must not be set with a runTokenSecret, got %+v", v)
+	}
+	sec := env["MEMKEYS_RUN_TOKEN_SECRET"]
+	if sec == nil || sec.ValueFrom == nil || sec.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("MEMKEYS_RUN_TOKEN_SECRET secretKeyRef not wired: %+v", sec)
+	}
+	if ref := sec.ValueFrom.SecretKeyRef; ref.Name != "my-run-token" || ref.Key != "ISSUER" {
+		t.Errorf("runToken secretKeyRef = %s/%s, want my-run-token/ISSUER", ref.Name, ref.Key)
+	}
+
+	// The Service must front the memory listener — this is the routability
+	// assertion: a client targeting the Service's memory port reaches /memory/*.
+	var svc corev1.Service
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name, Namespace: ns}, &svc); err != nil {
+		t.Fatalf("Service not created: %v", err)
+	}
+	var svcMemory *corev1.ServicePort
+	for i := range svc.Spec.Ports {
+		if svc.Spec.Ports[i].Name == "memory" {
+			svcMemory = &svc.Spec.Ports[i]
+		}
+	}
+	if svcMemory == nil {
+		t.Fatalf("Service has no memory port: %+v", svc.Spec.Ports)
+	}
+	if svcMemory.Port != 3111 || svcMemory.TargetPort.String() != "memory" {
+		t.Errorf("Service memory port = %+v, want port 3111 targeting container port memory", svcMemory)
+	}
+	// Health stays routable for probes on its own port.
+	if svc.Spec.Ports[0].Name != "http" || svc.Spec.Ports[0].Port != 8080 {
+		t.Errorf("Service health port = %+v, want http:8080", svc.Spec.Ports[0])
+	}
+}
+
+func TestMemoryTransportUnauthenticatedIsDegraded(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.MemoryTransport.RunTokenSecret = nil // enabled, no creds
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	// Fail closed: no Deployment/Service rolled out — the server would refuse
+	// the non-loopback bind and crash-loop otherwise.
+	if _, ok := getDeployment(t, mki.Name, ns); ok {
+		t.Error("server Deployment should not be created without a memory transport credential")
+	}
+	var svc corev1.Service
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name, Namespace: ns}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("Service should not be created without a memory transport credential, got err=%v", err)
+	}
+	out := getInstance(t, mki.Name, ns)
+	if condStatus(out, memkeysv1alpha1.ConditionDegraded) != metav1.ConditionTrue {
+		t.Errorf("Degraded = %s, want True", condStatus(out, memkeysv1alpha1.ConditionDegraded))
+	}
+	if c := meta.FindStatusCondition(out.Status.Conditions, memkeysv1alpha1.ConditionDegraded); c != nil && c.Reason != "MemoryTransportUnauthenticated" {
+		t.Errorf("Degraded reason = %s, want MemoryTransportUnauthenticated", c.Reason)
+	}
+}
+
+func TestMemoryTransportPortCollisionIsDegraded(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.MemoryTransport.Port = 8080 // same as the health servicePort
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	if _, ok := getDeployment(t, mki.Name, ns); ok {
+		t.Error("server Deployment should not be created with a health/memory port collision")
+	}
+	out := getInstance(t, mki.Name, ns)
+	if condStatus(out, memkeysv1alpha1.ConditionDegraded) != metav1.ConditionTrue {
+		t.Errorf("Degraded = %s, want True", condStatus(out, memkeysv1alpha1.ConditionDegraded))
+	}
+	if c := meta.FindStatusCondition(out.Status.Conditions, memkeysv1alpha1.ConditionDegraded); c != nil && c.Reason != "MemoryTransportPortCollision" {
+		t.Errorf("Degraded reason = %s, want MemoryTransportPortCollision", c.Reason)
+	}
+}
+
+func TestMemoryTransportDisabled(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		disabled := false
+		m.Spec.MemoryTransport.Enabled = &disabled
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	srv, ok := getDeployment(t, mki.Name, ns)
+	if !ok {
+		t.Fatal("server Deployment not created")
+	}
+	container := srv.Spec.Template.Spec.Containers[0]
+	if len(container.Ports) != 1 || container.Ports[0].Name != "http" {
+		t.Errorf("containerPorts = %+v, want only the health port", container.Ports)
+	}
+	for _, e := range container.Env {
+		if e.Name == "MEMKEYS_HTTP_HOST" || e.Name == "MEMKEYS_MEMORY_HTTP_PORT" ||
+			e.Name == "MEMKEYS_RUN_TOKEN_SECRET" || e.Name == "MEMKEYS_ALLOW_INSECURE" {
+			t.Errorf("memory transport env %s must not be set when disabled", e.Name)
+		}
+	}
+
+	var svc corev1.Service
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: mki.Name, Namespace: ns}, &svc); err != nil {
+		t.Fatalf("Service not created: %v", err)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Name != "http" {
+		t.Errorf("Service ports = %+v, want only the health port", svc.Spec.Ports)
+	}
+}
+
+func TestMemoryTransportInsecureOptIn(t *testing.T) {
+	ns := newNamespace(t)
+	r := newReconciler()
+	mki := createInstance(t, ns, func(m *memkeysv1alpha1.MemKeysInstance) {
+		m.Spec.MemoryTransport.RunTokenSecret = nil
+		m.Spec.MemoryTransport.AllowInsecure = true
+	})
+	reconcile(t, r, mki.Name, ns)
+
+	srv, ok := getDeployment(t, mki.Name, ns)
+	if !ok {
+		t.Fatal("server Deployment not created")
+	}
+	container := srv.Spec.Template.Spec.Containers[0]
+	var insecure, token string
+	for _, e := range container.Env {
+		switch e.Name {
+		case "MEMKEYS_ALLOW_INSECURE":
+			insecure = e.Value
+		case "MEMKEYS_RUN_TOKEN_SECRET":
+			token = "set"
+		}
+	}
+	if insecure != "1" {
+		t.Errorf("MEMKEYS_ALLOW_INSECURE = %q, want 1", insecure)
+	}
+	if token != "" {
+		t.Error("MEMKEYS_RUN_TOKEN_SECRET must not be set in insecure mode")
 	}
 }
 

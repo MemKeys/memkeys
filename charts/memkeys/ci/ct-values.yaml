@@ -17,6 +17,15 @@ database:
 otel:
   deploymentEnv: "dev"
 
+# The memory transport is exposed by default (ISI-6233) and the chart fails
+# fast without a credential. The kind cluster is a closed dev cluster with no
+# run-token issuer provisioned, so the install job uses the explicit dev-only
+# insecure opt-in (MEMKEYS_ALLOW_INSECURE=1). Real installs should set
+# memoryTransport.runTokenSecret.existingSecret instead — see
+# charts/memkeys/README.md.
+memoryTransport:
+  allowInsecure: true
+
 # NOTE: the current M1 image is a migrate-and-exit bootstrap with no HTTP
 # transport, so the HTTP probes cannot pass and a Deployment pod cannot stay
 # Ready. The install job is gated on the P0 Dockerfile (ISI-6097) existing;

@@ -116,6 +116,46 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
+              memoryTransport:
+                description: MemoryTransport configures exposure of the /memory/*
+                  HTTP transport.
+                properties:
+                  allowInsecure:
+                    description: |-
+                      AllowInsecure binds the transport off loopback with NO run-token
+                      verifier (the server warns; tenant is self-asserted — ISI-6137 S1).
+                      Dev-only; prefer runTokenSecret.
+                    type: boolean
+                  enabled:
+                    description: |-
+                      Enabled turns the memory transport exposure on/off. Nil → enabled.
+                      Disable to render the health-only surface.
+                    type: boolean
+                  port:
+                    default: 3000
+                    description: |-
+                      Port is the port the memory transport listens on (MEMKEYS_MEMORY_HTTP_PORT)
+                      and the Service exposes. Must differ from servicePort.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  runTokenSecret:
+                    description: |-
+                      RunTokenSecret references the Secret holding the run-token issuer
+                      secret. Required unless allowInsecure is set (dev only).
+                    properties:
+                      key:
+                        default: MEMKEYS_RUN_TOKEN_SECRET
+                        description: Key within the Secret holding the issuer secret.
+                        type: string
+                      name:
+                        description: Name of the Secret holding the issuer secret.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
               otel:
                 description: OTel configures OpenTelemetry export.
                 properties:
@@ -228,8 +268,10 @@ spec:
                 type: object
               servicePort:
                 default: 8080
-                description: ServicePort is the port the Service exposes and the container
-                  listens on.
+                description: |-
+                  ServicePort is the port the Service exposes and the container listens on
+                  for the HEALTH surface (/healthz, /readyz). The /memory/* transport has
+                  its own listener — see memoryTransport.
                 format: int32
                 maximum: 65535
                 minimum: 1

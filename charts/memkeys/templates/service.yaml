@@ -11,6 +11,14 @@ spec:
       targetPort: {{ .Values.service.portName }}
       protocol: TCP
       name: {{ .Values.service.portName }}
+    {{- if eq (include "memkeys.memoryTransportEnabled" .) "true" }}
+    # The /memory/* transport: a distinct listener from the health port above.
+    # This is the port clients (and the HTTPRoute backendRef) target.
+    - port: {{ .Values.memoryTransport.port }}
+      targetPort: {{ .Values.memoryTransport.portName }}
+      protocol: TCP
+      name: {{ .Values.memoryTransport.portName }}
+    {{- end }}
   selector:
     {{- include "memkeys.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: server

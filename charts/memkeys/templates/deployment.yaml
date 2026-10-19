@@ -4,6 +4,7 @@ metadata:
   name: {{ include "memkeys.fullname" . }}
   labels:
     {{- include "memkeys.labels" . | nindent 4 }}
+{{- include "memkeys.memoryTransportValidate" . }}
 spec:
   replicas: {{ include "memkeys.serverReplicas" . }}
   selector:
@@ -53,12 +54,36 @@ spec:
             - name: {{ .Values.service.portName }}
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            {{- if eq (include "memkeys.memoryTransportEnabled" .) "true" }}
+            - name: {{ .Values.memoryTransport.portName }}
+              containerPort: {{ .Values.memoryTransport.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: MEMKEYS_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "memkeys.databaseSecretName" . }}
                   key: {{ .Values.database.existingSecretKey }}
+            {{- if eq (include "memkeys.memoryTransportEnabled" .) "true" }}
+            # Memory transport exposure: own listener on its own port, bound
+            # off-loopback. The server refuses this bind without a run-token
+            # verifier (or an explicit insecure opt-in) — validated above.
+            - name: MEMKEYS_MEMORY_HTTP_PORT
+              value: {{ .Values.memoryTransport.port | quote }}
+            - name: MEMKEYS_HTTP_HOST
+              value: "0.0.0.0"
+            {{- if or .Values.memoryTransport.runTokenSecret.existingSecret .Values.memoryTransport.runTokenSecret.value }}
+            - name: MEMKEYS_RUN_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memkeys.runTokenSecretName" . }}
+                  key: {{ .Values.memoryTransport.runTokenSecret.key }}
+            {{- else if .Values.memoryTransport.allowInsecure }}
+            - name: MEMKEYS_ALLOW_INSECURE
+              value: "1"
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

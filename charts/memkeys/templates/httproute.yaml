@@ -26,6 +26,12 @@ spec:
       {{- end }}
       backendRefs:
         - name: {{ include "memkeys.fullname" $ }}
+          {{- if eq (include "memkeys.memoryTransportEnabled" $) "true" }}
+          # Route to the /memory/* transport listener, not the health port
+          # (health stays probe-only).
+          port: {{ $.Values.memoryTransport.port }}
+          {{- else }}
           port: {{ $.Values.service.port }}
+          {{- end }}
     {{- end }}
 {{- end }}

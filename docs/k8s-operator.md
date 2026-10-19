@@ -67,6 +67,9 @@ spec:
     tag: "0.1.0"
   database:
     url: postgres://memkeys:memkeys@postgres:5432/memkeys
+  memoryTransport:
+    runTokenSecret:
+      name: memkeys-run-token
   otel:
     deploymentEnv: dev
 ```
@@ -88,6 +91,9 @@ spec:
   database:
     existingSecret: memkeys-db
     existingSecretKey: MEMKEYS_DATABASE_URL
+  memoryTransport:
+    runTokenSecret:
+      name: memkeys-run-token
   otel:
     endpoint: otel-collector.observability:4317
     deploymentEnv: prod
@@ -111,6 +117,10 @@ Ready-to-apply samples: [`operator/config/samples/`](../operator/config/samples/
 | `workers.replicas` / `command` / `args` / `resources` | `1` | worker tuning; the worker role itself is selected by the `MEMKEYS_ROLE=worker` env (projection-only: no memory transport) |
 | `podDisruptionBudget.enabled` / `minAvailable` | follows profile / `1` | only rendered when server replicas > 1; `minAvailable` is clamped to `replicas-1` (drain-deadlock guard) |
 | `servicePort` | `8080` | Service + container port + `MEMKEYS_HTTP_PORT` (health listener) |
+| `memoryTransport.enabled` | `true` | expose the `/memory/*` transport: own container/Service `memory` port + `MEMKEYS_HTTP_HOST=0.0.0.0`; `false` renders the health-only surface |
+| `memoryTransport.port` | `3000` | `MEMKEYS_MEMORY_HTTP_PORT` + Service `memory` port; must differ from `servicePort` |
+| `memoryTransport.runTokenSecret.name` / `.key` | — / `MEMKEYS_RUN_TOKEN_SECRET` | pre-provisioned Secret holding the run-token issuer secret; required unless `allowInsecure` |
+| `memoryTransport.allowInsecure` | `false` | dev-only: bind off-loopback with NO verifier (tenant self-asserted — ISI-6137 S1) |
 | `resources` | chart defaults | server container requests/limits |
 
 Exactly one of `database.url` / `database.existingSecret` must be set, else the
@@ -118,6 +128,21 @@ instance is marked `Degraded` and no pods are rolled out (fail-closed). Switchin
 from an inline `url` to an `existingSecret` prunes the previously rendered
 `<name>-db` Secret (unless `existingSecret` names that same Secret, in which
 case it is user-managed and left alone).
+
+### Memory transport exposure (ISI-6233)
+
+The server runs two distinct listeners: the health surface (`servicePort`, probes
+only) and the `/memory/*` transport (`memoryTransport.port`, default 3000). The
+operator exposes the transport by default — a second container/Service `memory`
+port plus `MEMKEYS_HTTP_HOST=0.0.0.0` — because a health-only deploy leaves the
+product API unreachable off-pod. The gate is fail-closed, mirroring the server's
+own bind refusal: an enabled transport with **neither** `runTokenSecret` (a
+pre-provisioned Secret holding the run-token issuer secret) **nor**
+`allowInsecure: true` is marked `Degraded` with reason
+`MemoryTransportUnauthenticated` and nothing is rolled out — the server would
+refuse the non-loopback bind and crash-loop. A `memoryTransport.port` equal to
+`servicePort` degrades with `MemoryTransportPortCollision`. Set
+`memoryTransport.enabled=false` to render the health-only surface instead.
 
 ## Status conditions
 

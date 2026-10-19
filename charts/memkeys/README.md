@@ -9,8 +9,11 @@ workers. For a Kubernetes-free container/VM quickstart, skip to
 ## TL;DR
 
 ```sh
+kubectl create secret generic memkeys-run-token \
+  --from-literal=MEMKEYS_RUN_TOKEN_SECRET=<issuer-secret>
 helm install memkeys charts/memkeys \
-  --set database.url="postgres://user:pass@host:5432/memkeys"
+  --set database.url="postgres://user:pass@host:5432/memkeys" \
+  --set memoryTransport.runTokenSecret.existingSecret=memkeys-run-token
 ```
 
 ## Deployment profiles
@@ -41,10 +44,13 @@ profile with `--set workers.enabled=true|false` (same for
 `podDisruptionBudget.enabled`).
 
 The server `Service` selects `app.kubernetes.io/component=server`, so it never
-routes to worker pods. The Service fronts the **health surface** (the
-`/healthz`/`/readyz` listener); `service.port` is pinned to the container's
-`MEMKEYS_HTTP_PORT` so the Service port, container port, and probe listener
-always agree.
+routes to worker pods. The Service fronts **both** listeners: the **health
+surface** (the `/healthz`/`/readyz` listener, `service.port`, probe-only) and
+the **`/memory/*` transport** (`memoryTransport.port`, default 3000 — the port
+clients target). `service.port` is pinned to the container's `MEMKEYS_HTTP_PORT`
+so the Service port, container port, and probe listener always agree; the
+transport has its own `MEMKEYS_MEMORY_HTTP_PORT` listener. See
+[Memory transport](#memory-transport-memory).
 
 **Replicas & the PDB.** `replicaCount` defaults per profile: **1** for
 single-node, **2** for microservice (HA). The `PodDisruptionBudget` renders
@@ -68,6 +74,42 @@ selection labels/annotations with `operator.labels` and `operator.annotations`
 (labels go on every resource; annotations go on the workloads). No operator
 ships with this chart yet — these are forward-looking extension points.
 
+## Memory transport (/memory/*)
+
+`memkeys-server` runs **two distinct listeners**: the health surface
+(`/healthz`/`/readyz`) on `MEMKEYS_HTTP_PORT` (`service.port`) and the actual
+product API, the `/memory/*` transport, on `MEMKEYS_MEMORY_HTTP_PORT`
+(`memoryTransport.port`, default 3000). Sharing one port is impossible — the
+second bind would collide — so the chart exposes the transport as its own
+container/Service port and binds it `0.0.0.0` (`MEMKEYS_HTTP_HOST`), because
+the server's loopback default is unreachable from other pods.
+
+Exposing an unauthenticated admission surface off loopback is a cross-tenant
+impersonation hole (ISI-6137 S1), and the server **refuses** a non-loopback
+bind without a run-token verifier. The chart mirrors that gate and **fails
+`helm template`/`helm install` fast** when `memoryTransport.enabled=true`
+(the default) and none of these is set:
+
+| Value | Effect |
+|---|---|
+| `memoryTransport.runTokenSecret.existingSecret` | reference a pre-provisioned Secret holding the run-token issuer secret (key `MEMKEYS_RUN_TOKEN_SECRET`, override with `.key`) — **preferred** |
+| `memoryTransport.runTokenSecret.value` | inline issuer secret → the chart renders Secret `<release>-run-token` (dev convenience; ends up in Helm release storage) |
+| `memoryTransport.allowInsecure=true` | dev-only: bind `0.0.0.0` with NO verifier (server warns; tenant is self-asserted) |
+| `memoryTransport.enabled=false` | render the health-only surface (previous M10a behaviour) |
+
+Other constraints, also validated fail-fast: `memoryTransport.port` must
+differ from `service.port` (listener collision) and `memoryTransport.portName`
+must differ from `service.portName`.
+
+When `httpRoute.enabled=true`, the `HTTPRoute` `backendRefs` port targets the
+**memory transport** (`memoryTransport.port`) — the health port stays
+probe-only. Clients authenticate with bearer run tokens signed by the issuer
+secret.
+
+**Upgrading from 0.2.0.** The memory transport exposure is new and on by
+default; a bare `helm upgrade` now fails fast until you provide a credential
+(above) or set `memoryTransport.enabled=false`.
+
 ## Single-container quickstart (no Kubernetes)
 
 For a single VM or laptop, [`deploy/docker-compose.yaml`](../../deploy/docker-compose.yaml)
@@ -90,9 +132,9 @@ image instead of building locally.
 | `Deployment` (server) | the memkeys-server workload (non-root, read-only rootfs, dropped caps) |
 | `Deployment` (worker) | async-projection workers — **microservice profile only** |
 | `PodDisruptionBudget` | server availability during voluntary disruptions — **microservice profile only** |
-| `Service` (ClusterIP) | in-cluster access on `service.port` (default 8080), selects the server component |
+| `Service` (ClusterIP) | in-cluster access on `service.port` (health, default 8080) **and** `memoryTransport.port` (the `/memory/*` transport, default 3000); selects the server component |
 | `ConfigMap` | non-secret config: `MEMKEYS_DEPLOYMENT_ENV`, OTLP endpoint, service namespace, sampler ratio |
-| `Secret` | `MEMKEYS_DATABASE_URL` (only when `database.url` is set and no `existingSecret`) |
+| `Secret` | `MEMKEYS_DATABASE_URL` (only when `database.url` is set and no `existingSecret`); `MEMKEYS_RUN_TOKEN_SECRET` (only when `memoryTransport.runTokenSecret.value` is set) |
 | `ServiceAccount` | dedicated identity (token automount off by default) |
 | `HTTPRoute` | optional Gateway API ingress (disabled by default — **not** legacy Ingress) |
 
