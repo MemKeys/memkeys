@@ -265,6 +265,16 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memory.sut.name",
     "memory.embedder.model",
     "memory.query.length",
+    // ISI-6251 rev-2 (found-vs-returned funnel + search-key structure). Span
+    // attrs on the `memory.recall`/`memory.search` CLIENT span. Values are
+    // counts, a bounded score, or entity-key KINDS only — the deny-list still
+    // holds: `memory.recall.key_id` is intentionally NOT registered (raw key
+    // values stay off the wire; see ISI-6216 board comment c2a0e066).
+    "memory.recall.candidates_count",
+    "memory.recall.results_count",
+    "memory.recall.top_similarity",
+    "memory.recall.key_kind",
+    "memory.recall.key_count",
     "status",
     // Pinned stable db.* group (semconv-pins.yaml; db.query.text is DISABLED).
     "db.system.name",
@@ -418,6 +428,10 @@ pub struct Instruments {
     // conformance step (acceptance criteria).
     memory_operation_duration: opentelemetry::metrics::Histogram<f64>,
     memory_recall_results: opentelemetry::metrics::Histogram<u64>,
+    /// ISI-6251 rev-2: candidate-set size BEFORE top-k pruning, mirroring the
+    /// native `candidate_set_size` with the memory-semconv label set so the
+    /// candidates/results ratio (pruning/precision) is directly comparable.
+    memory_recall_candidates: opentelemetry::metrics::Histogram<u64>,
     memory_recall_top_similarity: opentelemetry::metrics::Histogram<f64>,
     memory_items: opentelemetry::metrics::Counter<u64>,
     memory_bytes: opentelemetry::metrics::Counter<u64>,
@@ -525,6 +539,15 @@ impl Instruments {
                 .with_description(
                     "memory-semconv v0.1.0: result/candidate-set size returned by \
                      a read op. Renders to memory_recall_results_count.",
+                )
+                .build(),
+            memory_recall_candidates: meter
+                .u64_histogram("memory.recall.candidates.count")
+                .with_unit("{result}")
+                .with_description(
+                    "ISI-6251 rev-2 funnel: candidate-set size BEFORE top-k \
+                     pruning for a read op. candidates/results = pruning ratio. \
+                     Renders to memory_recall_candidates_count.",
                 )
                 .build(),
             memory_recall_top_similarity: meter
@@ -706,6 +729,21 @@ impl Instruments {
         );
     }
 
+    /// `memory_recall_candidates_count` (ISI-6251 rev-2) — candidate-set size
+    /// BEFORE top-k pruning. Same label set as `memory_recall_results` so the
+    /// candidates/results ratio is a precision/pruning signal (NO new metric
+    /// labels — the bounded budget is unchanged).
+    pub fn memory_recall_candidates(&self, op: &'static str, store_kind: &'static str, count: u64) {
+        self.memory_recall_candidates.record(
+            count,
+            &[
+                attr("memory.operation", op),
+                attr("memory.store.kind", store_kind),
+                attr("memory.sut.name", MEMORY_SUT_NAME),
+            ],
+        );
+    }
+
     /// `memory_recall_top_similarity` — top similarity/fusion score of a
     /// semantic read (only recorded when the read returned ≥1 hit).
     pub fn memory_recall_top_similarity(&self, store_kind: &'static str, score: f64) {
@@ -793,12 +831,22 @@ mod tests {
             "memory.sut.name",
             "memory.embedder.model",
             "memory.query.length",
+            // ISI-6251 rev-2: recall funnel + search-key structural attrs.
+            "memory.recall.candidates_count",
+            "memory.recall.results_count",
+            "memory.recall.top_similarity",
+            "memory.recall.key_kind",
+            "memory.recall.key_count",
             "status",
         ] {
             assert!(ALLOWED_ATTR_KEYS.contains(&k), "{k} not registered");
         }
         // Content-bearing keys must NEVER be registered (PII gate).
         assert!(!ALLOWED_ATTR_KEYS.contains(&"memory.query.text"));
+        // ISI-6251 rev-2 PII gate: raw entity-key VALUES stay off the wire —
+        // `memory.recall.key_id` is intentionally NOT registered (deny-list,
+        // ISI-6216 board comment c2a0e066). Kind + count only.
+        assert!(!ALLOWED_ATTR_KEYS.contains(&"memory.recall.key_id"));
         // Span-name mapping is total over the op constants.
         assert_eq!(memory_span_name(MEMORY_OP_ADD), MEMORY_SPAN_ADD);
         assert_eq!(memory_span_name(MEMORY_OP_SEARCH), MEMORY_SPAN_SEARCH);
