@@ -14,9 +14,15 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# tls-rustls-ring-native-roots: rustls+ring with the OS trust store
+# (rustls-native-certs) instead of the bundled webpki-roots crate. This keeps
+# the webpki-roots 0.26 shim — flagged by RUSTSEC-2026-0381 and unpatched on the
+# 0.26 line — out of the tree without a major sqlx upgrade. Our DSNs use the
+# default sslmode=prefer (opportunistic TLS, no cert verification), so the root
+# store is never consulted at runtime; verify-ca/verify-full would use OS roots.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
-    "tls-rustls",
+    "tls-rustls-ring-native-roots",
     "postgres",
     "chrono",
     "uuid",
