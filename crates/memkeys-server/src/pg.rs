@@ -81,7 +81,10 @@ mod pgvector_tests {
     #[test]
     fn errors_with_remediation_when_unavailable() {
         let msg = ensure_pgvector_available(false).unwrap_err().to_string();
-        assert!(msg.contains("pgvector"), "message should name pgvector: {msg}");
+        assert!(
+            msg.contains("pgvector"),
+            "message should name pgvector: {msg}"
+        );
         assert!(
             msg.contains("pgvector/pgvector"),
             "message should name the remediation image: {msg}"
