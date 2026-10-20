@@ -14,3 +14,12 @@ description = "Known false positives: branding asset filename list in make_packa
 paths = [
   '''branding/make_package\.py''',
 ]
+
+# The canary/dogfood tenant floor is the PUBLIC Paperclip company UUID — it
+# appears verbatim in every issue, wake payload, and the docs/ config examples
+# (e.g. docs/agent-mcp-transport.md). It is a tenant identifier, not a secret,
+# but the generic-api-key entropy rule flags the UUID next to the "TENANT"
+# keyword. Allowlist the literal so documentation can show the real value.
+regexes = [
+  '''615e9564-65df-4465-9b19-a5afb73446c6''',
+]
