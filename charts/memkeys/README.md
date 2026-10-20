@@ -147,6 +147,21 @@ The server requires `MEMKEYS_DATABASE_URL` (same `postgres://…` shape as CI's
 - `--set database.existingSecret=my-secret` (key `MEMKEYS_DATABASE_URL`, override with
   `database.existingSecretKey`) — reference a pre-provisioned Secret.
 
+### ⚠ Postgres requirements — pgvector is required
+
+The target Postgres **must have the [pgvector](https://github.com/pgvector/pgvector)
+extension available**. A boot migration runs `CREATE EXTENSION vector`, so a stock
+`postgres:*` image fails at startup. The server now preflights this and exits with a
+clear message, but it still cannot start without pgvector.
+
+- **Self-hosted Postgres:** use an image with pgvector preinstalled, e.g.
+  `pgvector/pgvector:pg16` (also `pg17`/`pg18`), or install the `pgvector` package
+  into your Postgres (`CREATE EXTENSION vector` must succeed).
+- **Managed Postgres:** enable pgvector (AWS RDS/Aurora, Azure, Cloud SQL, Neon, and
+  Supabase all ship it — enable the extension on the instance).
+
+Supported Postgres major versions: 14–18 (matching pgvector's support window).
+
 ## Observability
 
 Set `otel.endpoint` to an OTLP/gRPC collector to enable exporters for all

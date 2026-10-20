@@ -25,6 +25,17 @@ impl PgStore {
     /// string (e.g. `postgres://user:pass@host/db`).
     pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
+        // Preflight pgvector BEFORE any migration runs: migration 0003 does
+        // `CREATE EXTENSION vector`, which on a stock Postgres image aborts
+        // mid-migration with a raw sqlx error and can leave `_sqlx_migrations`
+        // half-applied, so a naive retry hits a dirty state (ISI-6319). Failing
+        // up front turns that into a clear remediation message and keeps the
+        // migration ledger clean for a retry once pgvector is installed.
+        let available: Option<(bool,)> =
+            sqlx::query_as("SELECT true FROM pg_available_extensions WHERE name = 'vector'")
+                .fetch_optional(&pool)
+                .await?;
+        ensure_pgvector_available(available.is_some())?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
     }
@@ -36,6 +47,45 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+/// Fail fast when the `vector` extension (pgvector) is not available on the
+/// server. `available` is whether `pg_available_extensions` lists `vector`
+/// (installable), not whether it is already created. The message names the
+/// requirement and the remediation (ISI-6319) so a stock-Postgres deploy sees
+/// an actionable error instead of a raw mid-migration sqlx failure.
+fn ensure_pgvector_available(available: bool) -> Result<(), sqlx::Error> {
+    if available {
+        return Ok(());
+    }
+    Err(sqlx::Error::Configuration(
+        "the Postgres 'vector' extension (pgvector) is not available on this server, but a \
+         boot migration requires it (CREATE EXTENSION vector). Use a Postgres image with \
+         pgvector preinstalled — e.g. pgvector/pgvector:pg16 (also pg17/pg18) — or install \
+         the pgvector package into your Postgres. See charts/memkeys/README.md (\"Postgres \
+         requirements\")."
+            .into(),
+    ))
+}
+
+#[cfg(test)]
+mod pgvector_tests {
+    use super::ensure_pgvector_available;
+
+    #[test]
+    fn ok_when_available() {
+        assert!(ensure_pgvector_available(true).is_ok());
+    }
+
+    #[test]
+    fn errors_with_remediation_when_unavailable() {
+        let msg = ensure_pgvector_available(false).unwrap_err().to_string();
+        assert!(msg.contains("pgvector"), "message should name pgvector: {msg}");
+        assert!(
+            msg.contains("pgvector/pgvector"),
+            "message should name the remediation image: {msg}"
+        );
     }
 }
 

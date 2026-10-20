@@ -7,6 +7,11 @@
 #   kubectl create secret generic memkeys-db \
 #     --from-literal=MEMKEYS_DATABASE_URL=postgres://user:pass@host:5432/memkeys
 #
+# The target Postgres MUST have the pgvector extension available: a boot
+# migration runs `CREATE EXTENSION vector` (ISI-6319). A stock postgres:* image
+# fails at startup — use a pgvector-enabled image (e.g. pgvector/pgvector:pg16)
+# or a managed Postgres with pgvector enabled. See charts/memkeys/README.md.
+#
 # The /memory/* transport is exposed by default (ISI-6233) and requires a
 # run-token issuer secret — the server refuses a non-loopback bind without one.
 # Create it and reference it via spec.memoryTransport.runTokenSecret, e.g.:
