@@ -23,7 +23,13 @@ pub struct PgStore {
 impl PgStore {
     /// Connect and apply pending migrations. `url` is a Postgres connection
     /// string (e.g. `postgres://user:pass@host/db`).
+    ///
+    /// Only Postgres is supported. sqlx parses any URL as Postgres, so a
+    /// non-Postgres scheme (e.g. `sqlite://`) would otherwise hang ~30s on pool
+    /// acquisition and fail with a misleading `PoolTimedOut` (ISI-6318). We
+    /// reject the scheme up front with a clear configuration error instead.
     pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
+        validate_postgres_scheme(url)?;
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
@@ -36,6 +42,51 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+/// Fail fast when `MEMKEYS_DATABASE_URL` is not a Postgres URL. Accepts the two
+/// schemes sqlx honors for Postgres (`postgres://`, `postgresql://`), matched
+/// case-insensitively per RFC 3986.
+fn validate_postgres_scheme(url: &str) -> Result<(), sqlx::Error> {
+    let scheme = url.split("://").next().unwrap_or("");
+    if scheme.eq_ignore_ascii_case("postgres") || scheme.eq_ignore_ascii_case("postgresql") {
+        return Ok(());
+    }
+    Err(sqlx::Error::Configuration(
+        format!(
+            "unsupported MEMKEYS_DATABASE_URL scheme {scheme:?}: only Postgres is supported \
+             (expected postgres://… or postgresql://…)"
+        )
+        .into(),
+    ))
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::validate_postgres_scheme;
+
+    #[test]
+    fn accepts_postgres_schemes() {
+        assert!(validate_postgres_scheme("postgres://user:pass@host/db").is_ok());
+        assert!(validate_postgres_scheme("postgresql://host/db").is_ok());
+        assert!(validate_postgres_scheme("POSTGRES://host/db").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_postgres_schemes() {
+        let err = validate_postgres_scheme("sqlite:///tmp/mk.db").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sqlite"),
+            "message should name the bad scheme: {msg}"
+        );
+        assert!(
+            msg.contains("Postgres"),
+            "message should say Postgres is required: {msg}"
+        );
+        assert!(validate_postgres_scheme("mysql://host/db").is_err());
+        assert!(validate_postgres_scheme("not-a-url").is_err());
     }
 }
 
