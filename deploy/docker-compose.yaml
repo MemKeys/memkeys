@@ -12,7 +12,10 @@
 # use a prebuilt image (e.g. ghcr.io/memkeys/memkeys:<tag>) instead of building.
 services:
   postgres:
-    image: postgres:18
+    # pgvector is REQUIRED: a boot migration does `CREATE EXTENSION vector`
+    # (ISI-6319). Stock `postgres:*` images do NOT ship pgvector and the server
+    # aborts at migration time; use the pgvector/pgvector image.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: memkeys
       POSTGRES_PASSWORD: memkeys
