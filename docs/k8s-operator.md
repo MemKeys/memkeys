@@ -50,6 +50,13 @@ for your registry/tag.
 
 ## Create an instance
 
+> **⚠ Postgres must have pgvector.** The Postgres referenced by `database.url` /
+> `database.existingSecret` must have the [pgvector](https://github.com/pgvector/pgvector)
+> extension available — a boot migration runs `CREATE EXTENSION vector` (ISI-6319).
+> A stock `postgres:*` image fails at startup (the server preflights this and exits
+> with a clear message). Use a pgvector-enabled image (e.g. `pgvector/pgvector:pg16`,
+> also `pg17`/`pg18`) or a managed Postgres with pgvector enabled.
+
 ### `single-node` (default)
 
 One all-in-one server Deployment + Service. Supply the Postgres URL inline for
