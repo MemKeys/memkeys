@@ -130,33 +130,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let reconciler = memkeys_server::Reconciler::new(tiers);
 
+    // ISI-6337: MCP-only launch mode — the hardened per-session agent transport.
+    // `MEMKEYS_ROLE=mcp` runs ONLY the stdio MCP server against the shared
+    // Postgres: no health/HTTP binds (so concurrent agent sessions never collide
+    // on a port), no boot reconcile, no maintenance/worker loop (the primary
+    // all-in-one pod owns projection), and NOTHING but JSON-RPC is written to
+    // stdout (stdout is the protocol channel). The symmetric sibling of
+    // `MEMKEYS_ROLE=worker`; see docs/agent-mcp-transport.md + ISI-6328 cutover.
+    let role = ServerRole::from_env();
+    let role_worker = role == ServerRole::Worker;
+    let role_mcp = role == ServerRole::Mcp;
+
     // ISI-6132: the health listener starts before the (potentially long)
     // catch-up scan so kubelet probes can reach the pod immediately after
-    // migrations; readiness is a live DB ping, not the scan state.
-    let listener = health::bind(health::http_port()).await?;
-    let health_port = listener.local_addr()?.port();
-    // ISI-6320: name this the HEALTH/OPS listener explicitly. It serves only
-    // `/healthz` + `/readyz` on 0.0.0.0:<health_port> (default 8080) — it is NOT
-    // the memory API (that binds :3000 below). The old `http.listen port=8080`
-    // event read as if the memory API lived on 8080 and cost operators real
-    // probing time; keep the two surfaces unambiguously labelled.
-    tracing::info!(
-        target: "memkeys",
-        port = health_port,
-        endpoints = "/healthz,/readyz",
-        "memkeys.server.health.listen"
-    );
-    tokio::spawn(health::serve_pool(listener, graph.pool().clone()));
-    println!("memkeys-server: health/ops listening on 0.0.0.0:{health_port} (/healthz, /readyz) — not the memory API");
+    // migrations; readiness is a live DB ping, not the scan state. Skipped in
+    // MCP-only mode: there is no network surface, and every byte on stdout must
+    // be JSON-RPC.
+    if !role_mcp {
+        let listener = health::bind(health::http_port()).await?;
+        let health_port = listener.local_addr()?.port();
+        // ISI-6320: name this the HEALTH/OPS listener explicitly. It serves only
+        // `/healthz` + `/readyz` on 0.0.0.0:<health_port> (default 8080) — it is NOT
+        // the memory API (that binds :3000 below). The old `http.listen port=8080`
+        // event read as if the memory API lived on 8080 and cost operators real
+        // probing time; keep the two surfaces unambiguously labelled.
+        tracing::info!(
+            target: "memkeys",
+            port = health_port,
+            endpoints = "/healthz,/readyz",
+            "memkeys.server.health.listen"
+        );
+        tokio::spawn(health::serve_pool(listener, graph.pool().clone()));
+        println!("memkeys-server: health/ops listening on 0.0.0.0:{health_port} (/healthz, /readyz) — not the memory API");
 
-    println!("memkeys-server: migrations applied; FactStore + graph projection ready");
+        println!("memkeys-server: migrations applied; FactStore + graph projection ready");
+    }
 
     // Initial convergence pass: the reconciler rebuilds every wired tier's
     // projection from the FactStore (holes + stale model-stamp rebuilds). It is
     // collect-and-continue — a tier's transient failure is logged, never
     // `?`-aborts the boot (ISI-6192 B2 class: one stuck tier must not wedge the
-    // whole server start). The steady-state tick below retries.
-    match reconciler.reconcile_all(graph.pool()).await {
+    // whole server start). The steady-state tick below retries. Skipped in
+    // MCP-only mode (ISI-6337): the primary all-in-one pod owns reconciliation,
+    // and a per-session MCP process must neither run a boot scan nor print to
+    // stdout.
+    match if role_mcp {
+        Ok(Vec::new())
+    } else {
+        reconciler.reconcile_all(graph.pool()).await
+    } {
         Ok(reports) => {
             for report in reports {
                 let n = report.total_reconciled();
@@ -176,14 +198,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // M10 hardening (ISI-6231 NB1): `MEMKEYS_ROLE=worker` selects the
-    // projection-only role the microservice profile's worker Deployment runs —
-    // health surface + boot convergence + the steady-state maintenance tick,
-    // with the memory transport (HTTP + stdio MCP and its admission gates)
-    // skipped so a worker is not a second server. Unset or any other value
-    // keeps the all-in-one behaviour.
-    let role_worker = std::env::var("MEMKEYS_ROLE").is_ok_and(|v| v.eq_ignore_ascii_case("worker"));
-
+    // M10 hardening (ISI-6231 NB1): `MEMKEYS_ROLE=worker` (parsed into `role`
+    // above) selects the projection-only role the microservice profile's worker
+    // Deployment runs — health surface + boot convergence + the steady-state
+    // maintenance tick, with the memory transport (HTTP + stdio MCP and its
+    // admission gates) skipped so a worker is not a second server. Unset or any
+    // other value keeps the all-in-one behaviour.
     let mut http_server: Option<tokio::task::JoinHandle<()>> = None;
     let mut mcp_task: Option<tokio::task::JoinHandle<()>> = None;
     if role_worker {
@@ -194,14 +214,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         // ISI-6148: the run-token issuer secret (the deployment prerequisite). When
-        // present the HTTP transport verifies every bearer per request and derives
-        // the tenant floor server-side — closing the ISI-6137 S1 cross-tenant gap.
-        // Absent = open loopback dev mode (tenant self-asserted); the bind gate
-        // below refuses to expose that surface off loopback.
+        // present the transports verify every bearer / the launch run-token and
+        // derive the tenant floor server-side — closing the ISI-6137 S1
+        // cross-tenant gap. Absent = open loopback dev mode (tenant self-asserted);
+        // the HTTP bind gate below refuses to expose that surface off loopback.
         let run_token_secret = std::env::var("MEMKEYS_RUN_TOKEN_SECRET")
             .ok()
             .filter(|s| !s.is_empty());
         let admission = Arc::new(AdmissionControl::with_defaults());
+
+        // M3 (ISI-6148 §2.1): bind a SINGLE stdio principal at launch from the run
+        // token — the stdio pipe is the trust boundary, so the principal is fixed
+        // for the process and every tool call inherits it (the window is re-checked
+        // per call for F12). With the issuer secret + a presented `MEMKEYS_RUN_TOKEN`
+        // we verify it once; otherwise we bind a loopback dev principal (same open
+        // posture the HTTP bind gate governs). BOTH the MCP-only role and the
+        // all-in-one role share this principal, so it is computed before the split.
+        let now = chrono::Utc::now().timestamp();
+        let stdio_verifier: Arc<dyn TokenVerifier> = match (
+            run_token_secret.as_ref(),
+            std::env::var("MEMKEYS_RUN_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+        ) {
+            (Some(secret), Some(token)) => {
+                let principal = JwtVerifier::new(secret.clone())
+                    .verify(&token, now)
+                    .map_err(|e| format!("stdio launch run-token rejected: {}", e.detail))?;
+                Arc::new(StaticVerifier::new(principal))
+            }
+            _ => {
+                let tenant =
+                    std::env::var("MEMKEYS_STDIO_TENANT").unwrap_or_else(|_| "default".to_string());
+                tracing::warn!(
+                    target: "memkeys",
+                    "memkeys.stdio.dev_principal: no MEMKEYS_RUN_TOKEN(+_SECRET); binding an \
+                     UNVERIFIED stdio principal for tenant {tenant} (dev/loopback; ISI-6137 S1)."
+                );
+                Arc::new(StaticVerifier::new(Principal {
+                    tenant_id: tenant,
+                    agent_id: "stdio-dev".to_string(),
+                    run_id: None,
+                    expires_at: i64::MAX,
+                    trace_id: None,
+                }))
+            }
+        };
+
+        // ISI-6337: MCP-only role — run the stdio JSON-RPC server INLINE and
+        // return when stdin closes (EOF ends the agent session). No HTTP/health
+        // bind ⇒ concurrent sessions never collide on a port; no maintenance loop
+        // (we return before it is spawned) ⇒ no double worker stack; stdout
+        // carries only JSON-RPC. The shared all-in-one pod owns projection +
+        // maintenance. Returning here drops `otel` at the end of main's scope, so
+        // the M4 flush still runs.
+        if role_mcp {
+            tracing::info!(
+                target: "memkeys",
+                "memkeys.role.mcp: stdio-only transport; HTTP + health + maintenance skipped"
+            );
+            memkeys_server::mcp::run_stdio(service.clone(), stdio_verifier, admission.clone())
+                .await;
+            return Ok(());
+        }
+
+        // All-in-one: additionally expose the /memory/* HTTP transport. The
+        // per-request verifier derives the tenant floor server-side (ISI-6137 S1).
         let http_verifier: Option<Arc<dyn TokenVerifier>> = run_token_secret
             .as_ref()
             .map(|s| Arc::new(JwtVerifier::new(s.clone())) as Arc<dyn TokenVerifier>);
@@ -266,44 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }));
 
-        // M3 (ISI-6148 §2.1): bind a SINGLE stdio principal at launch from the run
-        // token — the stdio pipe is the trust boundary, so the principal is fixed
-        // for the process and every tool call inherits it (the window is re-checked
-        // per call for F12). With the issuer secret + a presented `MEMKEYS_RUN_TOKEN`
-        // we verify it once; otherwise we bind a loopback dev principal (same open
-        // posture the HTTP bind gate governs).
-        let now = chrono::Utc::now().timestamp();
-        let stdio_verifier: Arc<dyn TokenVerifier> = match (
-            run_token_secret.as_ref(),
-            std::env::var("MEMKEYS_RUN_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty()),
-        ) {
-            (Some(secret), Some(token)) => {
-                let principal = JwtVerifier::new(secret.clone())
-                    .verify(&token, now)
-                    .map_err(|e| format!("stdio launch run-token rejected: {}", e.detail))?;
-                Arc::new(StaticVerifier::new(principal))
-            }
-            _ => {
-                let tenant =
-                    std::env::var("MEMKEYS_STDIO_TENANT").unwrap_or_else(|_| "default".to_string());
-                tracing::warn!(
-                    target: "memkeys",
-                    "memkeys.stdio.dev_principal: no MEMKEYS_RUN_TOKEN(+_SECRET); binding an \
-                     UNVERIFIED stdio principal for tenant {tenant} (dev/loopback; ISI-6137 S1)."
-                );
-                Arc::new(StaticVerifier::new(Principal {
-                    tenant_id: tenant,
-                    agent_id: "stdio-dev".to_string(),
-                    run_id: None,
-                    expires_at: i64::MAX,
-                    trace_id: None,
-                }))
-            }
-        };
-
-        // M3: MCP stdio server (spawned as a concurrent task).
+        // M3: MCP stdio server (spawned as a concurrent task alongside HTTP).
         let mcp_service = service.clone();
         let mcp_admission = admission.clone();
         mcp_task = Some(tokio::spawn(async move {
@@ -379,4 +420,57 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn shutdown_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
+}
+
+/// Which surfaces this process runs, selected by `MEMKEYS_ROLE` (ISI-6337).
+///
+/// - [`All`](ServerRole::All) (default): health/ops + `/memory/*` HTTP + stdio
+///   MCP + the projection/LLM worker stack. The one-pod deployment.
+/// - [`Worker`](ServerRole::Worker): projection-only (M10b microservice
+///   profile) — health + workers, no memory transport.
+/// - [`Mcp`](ServerRole::Mcp): stdio MCP ONLY — no binds, no boot reconcile, no
+///   maintenance loop; the hardened per-session agent transport for the
+///   ISI-6328 cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerRole {
+    All,
+    Worker,
+    Mcp,
+}
+
+impl ServerRole {
+    fn from_env() -> Self {
+        Self::parse(std::env::var("MEMKEYS_ROLE").ok().as_deref())
+    }
+
+    /// Map a raw `MEMKEYS_ROLE` value to a role. Unset or any unrecognised value
+    /// keeps the all-in-one behaviour (back-compat with pre-ISI-6337 deploys).
+    fn parse(v: Option<&str>) -> Self {
+        match v {
+            Some(v) if v.eq_ignore_ascii_case("worker") => ServerRole::Worker,
+            Some(v) if v.eq_ignore_ascii_case("mcp") => ServerRole::Mcp,
+            _ => ServerRole::All,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerRole;
+
+    #[test]
+    fn role_parse_maps_known_values_case_insensitively() {
+        assert_eq!(ServerRole::parse(Some("worker")), ServerRole::Worker);
+        assert_eq!(ServerRole::parse(Some("WORKER")), ServerRole::Worker);
+        assert_eq!(ServerRole::parse(Some("mcp")), ServerRole::Mcp);
+        assert_eq!(ServerRole::parse(Some("Mcp")), ServerRole::Mcp);
+    }
+
+    #[test]
+    fn role_parse_defaults_to_all() {
+        assert_eq!(ServerRole::parse(None), ServerRole::All);
+        assert_eq!(ServerRole::parse(Some("")), ServerRole::All);
+        assert_eq!(ServerRole::parse(Some("all")), ServerRole::All);
+        assert_eq!(ServerRole::parse(Some("something-else")), ServerRole::All);
+    }
 }
