@@ -40,6 +40,11 @@ until stdin closes — **nothing else**:
   on a port (no alt-port juggling);
 - **no maintenance/worker loop and no boot reconcile** → no double worker stack;
   the primary all-in-one pod remains the sole owner of projection + maintenance;
+- **a small Postgres pool** → each MCP-only process serves ONE sequential stdio
+  session, so set `MEMKEYS_PG_MAX_CONNECTIONS=2`; a fleet of N agents at the
+  default pool of 8 would open `N × 8` connections and blow past Postgres'
+  default `max_connections` (100). This caps each session's footprint on the
+  shared Postgres;
 - **stdout carries only JSON-RPC** — all the all-in-one startup `println!`s are
   gated off, and tracing/OTel logs never target stdout, so the protocol stream
   stays clean (a latent hazard in the exec-a-full-server recipe).
@@ -98,7 +103,7 @@ MCP server process (the `exec` is essential — no wrapper left holding the pipe
         "-n", "memkeys",
         "exec", "-i", "deploy/memkeys-server", "--",
         "sh", "-lc",
-        "TOKEN=$(memkeys-token mint --secret-env MEMKEYS_RUN_TOKEN_SECRET --tenant \"$MEMKEYS_CANARY_TENANT\" --sub \"$MEMKEYS_AGENT_ID\" --ttl 3600); exec env MEMKEYS_ROLE=mcp MEMKEYS_RUN_TOKEN=\"$TOKEN\" memkeys-server"
+        "TOKEN=$(memkeys-token mint --secret-env MEMKEYS_RUN_TOKEN_SECRET --tenant \"$MEMKEYS_CANARY_TENANT\" --sub \"$MEMKEYS_AGENT_ID\" --ttl 3600); exec env MEMKEYS_ROLE=mcp MEMKEYS_PG_MAX_CONNECTIONS=2 MEMKEYS_RUN_TOKEN=\"$TOKEN\" memkeys-server"
       ],
       "env": {
         "KUBECONFIG": "/home/hrexed/.config/capmox/k8squad-test.kubeconfig",
@@ -115,7 +120,10 @@ Notes:
   `MEMKEYS_DATABASE_URL`, `MEMKEYS_SEMANTIC=1`, and the embedder env are what the
   server reads. `MEMKEYS_RUN_TOKEN_SECRET` + `MEMKEYS_DATABASE_URL` + the
   embedder env already live in the pod (inherited by the `exec`'d process); only
-  `MEMKEYS_ROLE` and the freshly minted `MEMKEYS_RUN_TOKEN` are set per session.
+  `MEMKEYS_ROLE`, `MEMKEYS_PG_MAX_CONNECTIONS`, and the freshly minted
+  `MEMKEYS_RUN_TOKEN` are set per session.
+- `MEMKEYS_PG_MAX_CONNECTIONS=2` caps each MCP-only session's Postgres pool (the
+  default is 8) so a fleet of sessions cannot exhaust `max_connections`.
 - `MEMKEYS_SEMANTIC=1` must be set on the **pod** (it already is on k8squad-test,
   per ISI-6327) so the inherited env enables `memory_search`.
 - `memkeys-token mint` is the in-pod minting helper (see §4); if it is not yet
