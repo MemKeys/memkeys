@@ -134,12 +134,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // catch-up scan so kubelet probes can reach the pod immediately after
     // migrations; readiness is a live DB ping, not the scan state.
     let listener = health::bind(health::http_port()).await?;
+    let health_port = listener.local_addr()?.port();
+    // ISI-6320: name this the HEALTH/OPS listener explicitly. It serves only
+    // `/healthz` + `/readyz` on 0.0.0.0:<health_port> (default 8080) — it is NOT
+    // the memory API (that binds :3000 below). The old `http.listen port=8080`
+    // event read as if the memory API lived on 8080 and cost operators real
+    // probing time; keep the two surfaces unambiguously labelled.
     tracing::info!(
         target: "memkeys",
-        port = listener.local_addr()?.port(),
-        "memkeys.server.http.listen"
+        port = health_port,
+        endpoints = "/healthz,/readyz",
+        "memkeys.server.health.listen"
     );
     tokio::spawn(health::serve_pool(listener, graph.pool().clone()));
+    println!("memkeys-server: health/ops listening on 0.0.0.0:{health_port} (/healthz, /readyz) — not the memory API");
 
     println!("memkeys-server: migrations applied; FactStore + graph projection ready");
 
@@ -241,7 +249,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app_state = AppState::new(service.clone(), http_verifier, admission.clone());
         let router = memkeys_server::http::router(app_state);
         let listener = tokio::net::TcpListener::bind((http_host.as_str(), http_port)).await?;
-        println!("memkeys-server: HTTP listening on {http_host}:{http_port}");
+        // ISI-6320: this is the MEMORY API surface (`/memory/facts`,
+        // `/memory/search`, …), distinct from the health/ops listener logged
+        // above. Label it as such so the two bind lines are never confused.
+        tracing::info!(
+            target: "memkeys",
+            host = %http_host,
+            port = http_port,
+            endpoints = "/memory/*",
+            "memkeys.server.memory.listen"
+        );
+        println!("memkeys-server: memory API listening on {http_host}:{http_port} (/memory/*)");
         http_server = Some(tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
                 tracing::error!(target: "memkeys", "HTTP server error: {e}");
