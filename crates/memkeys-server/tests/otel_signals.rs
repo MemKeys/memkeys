@@ -124,8 +124,32 @@ async fn write_path_emits_the_catalog_trace() {
             "memkeys.temporalize",
             "memkeys.commit",
             "memkeys.fact.ingest",
+            // memory-semconv v0.1.0 dual-emit (ISI-6216): the shared-contract
+            // `memory.add` CLIENT span wraps the native write trace.
+            "memory.add",
         ],
-        "write-path span set + order must match the signal catalog"
+        "write-path span set + order must match the signal catalog + memory-semconv"
+    );
+
+    // memory-semconv v0.1.0: `memory.add` is the CLIENT root; the native
+    // `memkeys.fact.ingest` SERVER span nests beneath it (two-source rule).
+    let memory_add = span(&spans, "memory.add");
+    assert_eq!(memory_add.span_kind, SpanKind::Client);
+    assert_eq!(
+        memory_add.parent_span_id,
+        opentelemetry::trace::SpanId::INVALID
+    );
+    assert_eq!(
+        value_str(attr(memory_add, "memory.operation").unwrap()),
+        "add"
+    );
+    assert_eq!(
+        value_str(attr(memory_add, "memory.store.kind").unwrap()),
+        "postgres"
+    );
+    assert_eq!(
+        value_str(attr(memory_add, "memory.sut.name").unwrap()),
+        "memkeys"
     );
 
     let ingest = span(&spans, "memkeys.fact.ingest");
@@ -135,7 +159,11 @@ async fn write_path_emits_the_catalog_trace() {
         value_str(attr(ingest, "memkeys.entity.kind").unwrap()),
         "run"
     );
-    assert_eq!(ingest.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    assert_eq!(ingest.parent_span_id, memory_add.span_context.span_id());
+    assert_eq!(
+        ingest.span_context.trace_id(),
+        memory_add.span_context.trace_id()
+    );
 
     // One trace: every stage is a child of the ingest span.
     let trace_id = ingest.span_context.trace_id();
@@ -224,10 +252,51 @@ async fn keyed_read_emits_the_catalog_trace() {
     let spans = exporter.get_finished_spans().expect("spans");
     let names = spans_names(&spans);
     assert!(
-        names.ends_with(&["memkeys.store.query", "memkeys.retrieve"]),
-        "keyed-read span set must end with the catalog pair, got {names:?}"
+        // memory-semconv v0.1.0 dual-emit (ISI-6216): the read trace now ends
+        // with the shared-contract `memory.recall` CLIENT span wrapping the
+        // native catalog pair.
+        names.ends_with(&["memkeys.store.query", "memkeys.retrieve", "memory.recall"]),
+        "keyed-read span set must end with the catalog pair + memory.recall, got {names:?}"
     );
-    let spans = &spans[spans.len() - 2..];
+    let spans = &spans[spans.len() - 3..];
+
+    // memory-semconv v0.1.0: `memory.recall` is the CLIENT root of the read;
+    // `memkeys.retrieve` nests beneath it.
+    let recall = span(spans, "memory.recall");
+    assert_eq!(recall.span_kind, SpanKind::Client);
+    assert_eq!(
+        value_str(attr(recall, "memory.operation").unwrap()),
+        "recall"
+    );
+    assert_eq!(
+        value_str(attr(recall, "memory.store.kind").unwrap()),
+        "keyed"
+    );
+    assert_eq!(
+        value_str(attr(recall, "memory.sut.name").unwrap()),
+        "memkeys"
+    );
+    // ISI-6251 rev-2: found-vs-returned funnel + search-key STRUCTURE on the
+    // `memory.recall` span. Keyed read of one key returning one row.
+    assert_eq!(
+        value_str(attr(recall, "memory.recall.key_kind").unwrap()),
+        "entity.project"
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.key_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.candidates_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    assert_eq!(
+        attr(recall, "memory.recall.results_count"),
+        Some(&opentelemetry::Value::I64(1))
+    );
+    // PII gate: the entity-key KIND is emitted, the raw VALUE (`proj-1`) is
+    // NOT — `memory.recall.key_id` must never appear (deny-list, ISI-6216).
+    assert!(attr(recall, "memory.recall.key_id").is_none());
 
     let retrieve = span(spans, "memkeys.retrieve");
     assert_eq!(retrieve.span_kind, SpanKind::Server);
@@ -239,6 +308,7 @@ async fn keyed_read_emits_the_catalog_trace() {
         value_str(attr(retrieve, "memkeys.tenant.id").unwrap()),
         "t-1"
     );
+    assert_eq!(retrieve.parent_span_id, recall.span_context.span_id());
 
     let store = span(spans, "memkeys.store.query");
     assert_eq!(store.span_kind, SpanKind::Client);
@@ -300,6 +370,18 @@ async fn catalog_metrics_are_emitted_with_registry_attributes() {
         "memkeys.write.duration",
         "memkeys.retrieve.duration",
         "memkeys.retrieve.candidate_set.size",
+        // memory-semconv v0.1.0 shared contract (ISI-6216). These instrument
+        // names render to memory_operation_duration_seconds /
+        // memory_recall_results_count / memory_items_total / memory_bytes_total
+        // through the OTLP→collector→Prometheus pipeline (exact-match gated in
+        // the benchmark LGTM conformance step).
+        "memory.operation.duration",
+        "memory.recall.results.count",
+        // ISI-6251 rev-2: found-vs-returned funnel mirror. Renders to
+        // memory_recall_candidates_count through the Prometheus pipeline.
+        "memory.recall.candidates.count",
+        "memory.items",
+        "memory.bytes",
     ] {
         assert!(
             names.contains(expected),
@@ -307,7 +389,7 @@ async fn catalog_metrics_are_emitted_with_registry_attributes() {
         );
     }
 
-    // Units follow the catalog ({operation}, s, {candidate}).
+    // Units follow the catalog ({operation}, s, {candidate}) + memory-semconv.
     let units: Vec<(String, String)> = rm
         .scope_metrics
         .iter()
@@ -320,6 +402,12 @@ async fn catalog_metrics_are_emitted_with_registry_attributes() {
         "memkeys.retrieve.candidate_set.size".into(),
         "{candidate}".into()
     )));
+    // `s` → `_seconds` suffix (the only memory-semconv metric that keeps a real
+    // unit); the counters use curly-brace annotation units so Prometheus does
+    // not append a unit suffix before `_total`.
+    assert!(units.contains(&("memory.operation.duration".into(), "s".into())));
+    assert!(units.contains(&("memory.items".into(), "{item}".into())));
+    assert!(units.contains(&("memory.bytes".into(), "{byte}".into())));
 
     provider.shutdown().unwrap();
 }

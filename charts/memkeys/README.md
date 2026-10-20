@@ -16,6 +16,27 @@ helm install memkeys charts/memkeys \
   --set memoryTransport.runTokenSecret.existingSecret=memkeys-run-token
 ```
 
+## Install from GHCR (OCI)
+
+The chart is published as an OCI artifact on every version bump to `main` and on
+every `v*` tag (see [`helm-publish.yml`](../../.github/workflows/helm-publish.yml)).
+Pull or install it straight from the registry — no `helm repo add` needed:
+
+```sh
+# Inspect / pull a specific version
+helm show chart oci://ghcr.io/memkeys/charts/memkeys --version 0.3.0
+helm pull oci://ghcr.io/memkeys/charts/memkeys --version 0.3.0
+
+# Install straight from the registry
+helm install memkeys oci://ghcr.io/memkeys/charts/memkeys --version 0.3.0 \
+  --set database.url="postgres://user:pass@host:5432/memkeys" \
+  --set memoryTransport.runTokenSecret.existingSecret=memkeys-run-token
+```
+
+The package is public, so pulls are anonymous. Omit `--version` to take the
+latest published chart. Installing from a local checkout (`charts/memkeys`)
+remains supported and is what the TL;DR above uses.
+
 ## Deployment profiles
 
 The `profile` value selects which workloads render. An invalid value fails

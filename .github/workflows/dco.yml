@@ -36,6 +36,16 @@ jobs:
             for i in $(seq 0 $((count - 1))); do
               commit="$(jq -r ".[$i]" <<<"$resp")"
               sha="$(jq -r '.sha' <<<"$commit")"
+
+              # Skip merge commits (2+ parents): they combine already-signed-off
+              # work and introduce no new authored content, so DCO does not apply.
+              # Matches the DCO GitHub App default and lets UI "Update branch"
+              # merges of main into a PR pass without a sign-off trailer.
+              parents="$(jq '.parents | length' <<<"$commit")"
+              if [ "$parents" -gt 1 ]; then
+                continue
+              fi
+
               author_name="$(jq -r '.commit.author.name' <<<"$commit")"
               author_email="$(jq -r '.commit.author.email' <<<"$commit")"
               message="$(jq -r '.commit.message' <<<"$commit")"

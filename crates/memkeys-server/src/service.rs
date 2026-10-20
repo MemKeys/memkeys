@@ -198,21 +198,35 @@ impl MemKeysService {
         caller: &CallerContext,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<IngestReceipt, IngestError> {
-        let ingest_span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): the shared-contract `memory.add`
+        // CLIENT span is the outer span the agent→memkeys call nests beneath
+        // (under the shim's own `memory.add` when reached via mcp-memory-server).
+        // The native `memkeys.fact.ingest` SERVER span is started as its child.
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_ADD,
+            telemetry::MEMORY_STORE_POSTGRES,
+            None,
+            None,
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let ingest_span = telemetry::start_child_span(
             "memkeys.fact.ingest",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller.tenant_id.clone()),
                 telemetry::attr("memkeys.entity.kind", anchor_kind(envelope)),
             ],
+            &mem_cx,
         );
 
         // Explicit parent context (not thread-local attach) so the stage
         // spans parent correctly across `.await` boundaries without making
         // the pipeline future `!Send`.
-        let cx = opentelemetry::Context::current_with_span(ingest_span);
+        let cx = mem_cx.with_span(ingest_span);
 
+        let t0 = Instant::now();
         let outcome = self.run_pipeline(envelope, caller, now, &cx).await;
+        let seconds = t0.elapsed().as_secs_f64();
         // Attach the ingest span around the sync outcome handling so the
         // bridge log record auto-carries this trace id (no awaits follow).
         let _active = cx.clone().attach();
@@ -236,7 +250,42 @@ impl MemKeysService {
                     .write_operation(anchor_kind(envelope), telemetry::OUTCOME_ERROR);
             }
         }
+        // Shared-contract metrics (dual-emit). `status` is the coarse
+        // success/error the contract carries; the native per-stage breakdown
+        // stays on `memkeys.*`. On a committed write, bump the corpus counters
+        // with a byte COUNT of the fact body — a length, never the content.
+        let status = if outcome.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_ADD,
+            telemetry::MEMORY_STORE_POSTGRES,
+            status,
+            seconds,
+        );
+        if outcome.is_ok() {
+            let bytes = envelope.fact.body.to_string().len() as u64;
+            self.instruments.memory_items_added(
+                telemetry::MEMORY_STORE_POSTGRES,
+                &telemetry::memory_embedder_model(),
+                1,
+                bytes,
+            );
+        }
         ingest.end();
+        {
+            let mem = mem_cx.span();
+            mem.set_status(if outcome.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.add failed".into(),
+                }
+            });
+            mem.end();
+        }
         outcome
     }
 
@@ -414,16 +463,27 @@ impl MemKeysService {
             });
         }
 
-        let retrieve_span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): keyed fetch-by-keys is an exact-key
+        // recall → outer `memory.recall` CLIENT span; the native
+        // `memkeys.retrieve` SERVER span nests under it.
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_RECALL,
+            telemetry::MEMORY_STORE_KEYED,
+            None,
+            None,
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let retrieve_span = telemetry::start_child_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
                 telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_KEYED),
             ],
+            &mem_cx,
         );
         let t = Instant::now();
-        let cx = opentelemetry::Context::current_with_span(retrieve_span);
+        let cx = mem_cx.with_span(retrieve_span);
         let mut store_span = telemetry::start_child_span(
             "memkeys.store.query",
             SpanKind::Client,
@@ -432,12 +492,21 @@ impl MemKeysService {
         );
         let retrieve = cx.span();
         let result = self.store.fetch_by_keys(caller_tenant, query).await;
+        let mut result_count: u64 = 0;
         match &result {
             Ok(rows) => {
+                result_count = rows.len() as u64;
                 store_span.set_status(Status::Ok);
                 retrieve.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_KEYED, rows.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror. Keyed recall is exact
+                // (no top-k prune) → candidates == results.
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_RECALL,
+                    telemetry::MEMORY_STORE_KEYED,
+                    rows.len() as u64,
+                );
             }
             Err(e) => {
                 record_error(&mut store_span, format!("{e}"));
@@ -458,7 +527,58 @@ impl MemKeysService {
         };
         self.instruments
             .retrieve_duration(telemetry::RETRIEVAL_OP_KEYED, outcome, secs);
+        // Shared-contract metrics (dual-emit).
+        let status = if result.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_RECALL,
+            telemetry::MEMORY_STORE_KEYED,
+            status,
+            secs,
+        );
+        if result.is_ok() {
+            self.instruments.memory_recall_results(
+                telemetry::MEMORY_OP_RECALL,
+                telemetry::MEMORY_STORE_KEYED,
+                result_count,
+            );
+        }
         retrieve.end();
+        {
+            let mem = mem_cx.span();
+            // ISI-6251 rev-2: per-span recall funnel + search-key structure on
+            // the outer `memory.recall` CLIENT span (Tempo visibility). Keyed
+            // recall is exact → candidates == results.
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.candidates_count",
+                result_count as i64,
+            ));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.results_count",
+                result_count as i64,
+            ));
+            // Search-key STRUCTURAL attrs only — entity-key KINDS + count, never
+            // the raw values (deny-list; `key_id` stays off the wire).
+            let mut kinds: Vec<&str> = query.keys.iter().map(|(k, _)| k.wire_name()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            mem.set_attribute(telemetry::attr("memory.recall.key_kind", kinds.join(",")));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.key_count",
+                query.keys.len() as i64,
+            ));
+            mem.set_status(if result.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.recall failed".into(),
+                }
+            });
+            mem.end();
+        }
         result
     }
 }
@@ -484,18 +604,30 @@ impl MemKeysService {
         let mut req = req.clone();
         req.tenant = caller_tenant.to_string();
 
-        let mut span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): a graph traversal is a `memory.search`
+        // over the graph tier.
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            None,
+            None,
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let mut span = telemetry::start_child_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
                 telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
             ],
+            &mem_cx,
         );
         let t = std::time::Instant::now();
         let result = graph.traverse(&req).await;
+        let mut result_count: u64 = 0;
         match &result {
             Ok(r) => {
+                result_count = r.nodes.len() as u64;
                 if r.truncated {
                     span.set_attribute(telemetry::attr(
                         "memkeys.graph.truncate.reason",
@@ -505,22 +637,55 @@ impl MemKeysService {
                 span.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_GRAPH, r.nodes.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror (graph traversal set).
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_SEARCH,
+                    telemetry::MEMORY_STORE_GRAPH,
+                    r.nodes.len() as u64,
+                );
             }
             Err(_) => span.set_status(Status::Error {
                 description: "graph traverse failed".into(),
             }),
         }
+        let secs = t.elapsed().as_secs_f64();
         let outcome = if result.is_ok() {
             telemetry::OUTCOME_SUCCESS
         } else {
             telemetry::OUTCOME_ERROR
         };
-        self.instruments.retrieve_duration(
-            telemetry::RETRIEVAL_OP_GRAPH,
-            outcome,
-            t.elapsed().as_secs_f64(),
+        self.instruments
+            .retrieve_duration(telemetry::RETRIEVAL_OP_GRAPH, outcome, secs);
+        let status = if result.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            status,
+            secs,
         );
+        if result.is_ok() {
+            self.instruments.memory_recall_results(
+                telemetry::MEMORY_OP_SEARCH,
+                telemetry::MEMORY_STORE_GRAPH,
+                result_count,
+            );
+        }
         span.end();
+        {
+            let mem = mem_cx.span();
+            mem.set_status(if result.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.search failed".into(),
+                }
+            });
+            mem.end();
+        }
         result
     }
 
@@ -533,13 +698,23 @@ impl MemKeysService {
         let mut req = req.clone();
         req.tenant = caller_tenant.to_string();
 
-        let mut span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): a supersession lookup is a graph read
+        // → `memory.search` over the graph tier.
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            None,
+            None,
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let mut span = telemetry::start_child_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
                 telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
             ],
+            &mem_cx,
         );
         let t = std::time::Instant::now();
         let result = graph.supersedes(&req).await;
@@ -549,17 +724,37 @@ impl MemKeysService {
                 description: "graph supersedes failed".into(),
             }),
         }
+        let secs = t.elapsed().as_secs_f64();
         let outcome = if result.is_ok() {
             telemetry::OUTCOME_SUCCESS
         } else {
             telemetry::OUTCOME_ERROR
         };
-        self.instruments.retrieve_duration(
-            telemetry::RETRIEVAL_OP_GRAPH,
-            outcome,
-            t.elapsed().as_secs_f64(),
+        self.instruments
+            .retrieve_duration(telemetry::RETRIEVAL_OP_GRAPH, outcome, secs);
+        let status = if result.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            status,
+            secs,
         );
         span.end();
+        {
+            let mem = mem_cx.span();
+            mem.set_status(if result.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.search failed".into(),
+                }
+            });
+            mem.end();
+        }
         result
     }
 
@@ -572,13 +767,23 @@ impl MemKeysService {
         let mut req = req.clone();
         req.tenant = caller_tenant.to_string();
 
-        let mut span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): a links lookup is a graph read →
+        // `memory.search` over the graph tier.
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            None,
+            None,
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let mut span = telemetry::start_child_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
                 telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_GRAPH),
             ],
+            &mem_cx,
         );
         let t = std::time::Instant::now();
         let result = graph.links(&req).await;
@@ -588,17 +793,37 @@ impl MemKeysService {
                 description: "graph links failed".into(),
             }),
         }
+        let secs = t.elapsed().as_secs_f64();
         let outcome = if result.is_ok() {
             telemetry::OUTCOME_SUCCESS
         } else {
             telemetry::OUTCOME_ERROR
         };
-        self.instruments.retrieve_duration(
-            telemetry::RETRIEVAL_OP_GRAPH,
-            outcome,
-            t.elapsed().as_secs_f64(),
+        self.instruments
+            .retrieve_duration(telemetry::RETRIEVAL_OP_GRAPH, outcome, secs);
+        let status = if result.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_GRAPH,
+            status,
+            secs,
         );
         span.end();
+        {
+            let mem = mem_cx.span();
+            mem.set_status(if result.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.search failed".into(),
+                }
+            });
+            mem.end();
+        }
         result
     }
 }
@@ -687,39 +912,124 @@ impl MemKeysService {
         };
         let k = req.k.clamp(1, SearchRequest::MAX_K);
 
-        let mut span = telemetry::start_span(
+        // memory-semconv v0.1.0 (ISI-6216): semantic retrieval is `memory.search`
+        // over the vector tier. The outer CLIENT span carries the embedder-model
+        // label and the PII-safe `memory.query.length` proxy (a length — never
+        // the query text, which stays on the deny-list).
+        let embedder_model = telemetry::memory_embedder_model();
+        let mem_span = telemetry::start_memory_op_span(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_VECTOR,
+            Some(&embedder_model),
+            Some(req.query.len()),
+        );
+        let mem_cx = opentelemetry::Context::current_with_span(mem_span);
+        let mut span = telemetry::start_child_span(
             "memkeys.retrieve",
             SpanKind::Server,
             vec![
                 telemetry::attr("memkeys.tenant.id", caller_tenant.to_string()),
                 telemetry::attr("memkeys.retrieval.op", telemetry::RETRIEVAL_OP_SEMANTIC),
             ],
+            &mem_cx,
         );
         let t = Instant::now();
         let result = self
             .semantic_search_inner(caller_tenant, req, k, embedder.as_ref(), vector.as_ref())
             .await;
+        let mut result_count: u64 = 0;
+        let mut top_similarity: Option<f64> = None;
         match &result {
             Ok(hits) => {
+                result_count = hits.len() as u64;
+                top_similarity = hits
+                    .iter()
+                    .map(|h| h.score)
+                    .fold(None, |acc, s| Some(acc.map_or(s, |a: f64| a.max(s))));
                 span.set_status(Status::Ok);
                 self.instruments
                     .candidate_set_size(telemetry::RETRIEVAL_OP_SEMANTIC, hits.len() as u64);
+                // ISI-6251 rev-2: semconv funnel mirror. `hits.len()` is the
+                // candidate set BEFORE top-k prune → candidates/results ratio.
+                self.instruments.memory_recall_candidates(
+                    telemetry::MEMORY_OP_SEARCH,
+                    telemetry::MEMORY_STORE_VECTOR,
+                    hits.len() as u64,
+                );
             }
             Err(_) => span.set_status(Status::Error {
                 description: "semantic search failed".into(),
             }),
         }
+        let secs = t.elapsed().as_secs_f64();
         let outcome = if result.is_ok() {
             telemetry::OUTCOME_SUCCESS
         } else {
             telemetry::OUTCOME_ERROR
         };
-        self.instruments.retrieve_duration(
-            telemetry::RETRIEVAL_OP_SEMANTIC,
-            outcome,
-            t.elapsed().as_secs_f64(),
+        self.instruments
+            .retrieve_duration(telemetry::RETRIEVAL_OP_SEMANTIC, outcome, secs);
+        // Shared-contract metrics (dual-emit).
+        let status = if result.is_ok() {
+            telemetry::MEMORY_STATUS_SUCCESS
+        } else {
+            telemetry::MEMORY_STATUS_ERROR
+        };
+        self.instruments.memory_operation_duration(
+            telemetry::MEMORY_OP_SEARCH,
+            telemetry::MEMORY_STORE_VECTOR,
+            status,
+            secs,
         );
+        if result.is_ok() {
+            self.instruments.memory_recall_results(
+                telemetry::MEMORY_OP_SEARCH,
+                telemetry::MEMORY_STORE_VECTOR,
+                result_count,
+            );
+            if let Some(score) = top_similarity {
+                self.instruments
+                    .memory_recall_top_similarity(telemetry::MEMORY_STORE_VECTOR, score);
+            }
+        }
         span.end();
+        {
+            let mem = mem_cx.span();
+            // ISI-6251 rev-2: per-span recall funnel on the `memory.search`
+            // CLIENT span. Candidate set == returned hits (prune happens inside
+            // `semantic_search_inner`'s zero-similarity drop); record returned.
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.candidates_count",
+                result_count as i64,
+            ));
+            mem.set_attribute(telemetry::attr(
+                "memory.recall.results_count",
+                result_count as i64,
+            ));
+            if let Some(score) = top_similarity {
+                mem.set_attribute(telemetry::attr("memory.recall.top_similarity", score));
+            }
+            // Search-key STRUCTURAL attrs only — entity-key KINDS + count from
+            // the scope, never the raw values (deny-list; `key_id` stays off).
+            if !req.scope.is_empty() {
+                let mut kinds: Vec<&str> = req.scope.iter().map(|(k, _)| k.wire_name()).collect();
+                kinds.sort_unstable();
+                kinds.dedup();
+                mem.set_attribute(telemetry::attr("memory.recall.key_kind", kinds.join(",")));
+                mem.set_attribute(telemetry::attr(
+                    "memory.recall.key_count",
+                    req.scope.len() as i64,
+                ));
+            }
+            mem.set_status(if result.is_ok() {
+                Status::Ok
+            } else {
+                Status::Error {
+                    description: "memory.search failed".into(),
+                }
+            });
+            mem.end();
+        }
         result
     }
 

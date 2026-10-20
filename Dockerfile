@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # Multi-stage build: rust builder -> minimal runtime, non-root.
-# PR CI builds this image with buildx (load only, no push).
-# GHCR push to ghcr.io/memkeys/memkeys runs on main/tags only (later phase).
+# PR CI builds this image with buildx (load only, no push) via docker.yml.
+# Multi-arch push to ghcr.io/memkeys/memkeys-server runs on main/tags only
+# (release.yml, ISI-6304). arm64 is built under QEMU emulation for v1 because
+# cargo compiles inside the image; the gha build cache keeps it tractable.
+# Later optimization: cargo cross-compilation to drop the arm64 emulation.
 
 # --- builder -------------------------------------------------------------
 FROM rust:1-trixie AS builder

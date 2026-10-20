@@ -1,0 +1,47 @@
+# git-cliff configuration — Conventional Commits changelog for MemKeys.
+# Consumed by .github/workflows/release.yml on `v*` tags (ISI-6306).
+# The repo already uses Conventional Commit subjects (feat/fix/docs/chore/ci…
+# with optional scopes), so this groups the current tag's commits by type.
+
+[changelog]
+header = ""
+# Per-release body. `release.yml` runs with `--latest`, so `releases` holds
+# only the commits for the tag being published.
+body = """
+{% if version %}## {{ version | trim_start_matches(pat="v") }}{% if timestamp %} — {{ timestamp | date(format="%Y-%m-%d") }}{% endif %}
+{% else %}## Unreleased
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}{% if commit.id %} ({{ commit.id | truncate(length=7, end="") }}){% endif %}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+# Group by Conventional Commit type.
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Tests" },
+  { message = "^ci", group = "CI/CD" },
+  { message = "^build", group = "Build" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "Chores" },
+  { message = "^Merge", skip = true },
+  { message = ".*", group = "Other" },
+]
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "newest"

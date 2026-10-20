@@ -1,0 +1,127 @@
+name: Release
+
+# ISI-6306 (ISI-6288 A3) — on a `v*` tag, cut a GitHub Release with an
+# auto-generated changelog and the SBOM(s) attached as release assets.
+#
+# This is deliberately self-contained and credential-free: it only needs the
+# built-in GITHUB_TOKEN with `contents: write`. It does NOT push images — that
+# is the GHCR publish path (ISI-6302), which is gated on registry credentials
+# (ISI-6301). SBOMs here are generated from locally-built (load-only) images,
+# so the software bill of materials matches the published image without needing
+# a registry login. When ISI-6302 lands its own `v*`-tag push workflow, the two
+# can be consolidated into a single tag pipeline (build+push → SBOM → release).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: SBOMs (server + operator)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build server image (load only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: memkeys-server:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build operator image (load only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: operator
+          load: true
+          tags: memkeys-operator:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: SBOM — server (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: memkeys-server:${{ github.ref_name }}
+          format: spdx-json
+          output-file: sbom-memkeys-server.spdx.json
+
+      - name: SBOM — server (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: memkeys-server:${{ github.ref_name }}
+          format: cyclonedx-json
+          output-file: sbom-memkeys-server.cdx.json
+
+      - name: SBOM — operator (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: memkeys-operator:${{ github.ref_name }}
+          format: spdx-json
+          output-file: sbom-memkeys-operator.spdx.json
+
+      - name: SBOM — operator (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: memkeys-operator:${{ github.ref_name }}
+          format: cyclonedx-json
+          output-file: sbom-memkeys-operator.cdx.json
+
+      - name: Upload SBOMs as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms
+          path: sbom-*.json
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release (changelog + SBOM assets)
+    needs: sbom
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs full history + tags
+
+      - name: Generate changelog for this tag (git-cliff)
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms
+          path: sboms
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.content }}
+          # GitHub's own auto-notes supplement the git-cliff body (contributors,
+          # full-changelog compare link) and act as a fallback if the body is empty.
+          generate_release_notes: true
+          # Pre-release for -rc/-alpha/-beta tags; full release otherwise.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: sboms/*.json
+          fail_on_unmatched_files: true

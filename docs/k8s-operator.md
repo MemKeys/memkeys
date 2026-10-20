@@ -151,6 +151,13 @@ refuse the non-loopback bind and crash-loop. A `memoryTransport.port` equal to
 `servicePort` degrades with `MemoryTransportPortCollision`. Set
 `memoryTransport.enabled=false` to render the health-only surface instead.
 
+On boot each listener logs its own line so the two surfaces are never confused
+(ISI-6320): the health/ops surface logs `memkeys.server.health.listen`
+(`health/ops listening on 0.0.0.0:8080 (/healthz, /readyz)`) and the memory API
+logs `memkeys.server.memory.listen` (`memory API listening on 0.0.0.0:3000
+(/memory/*)`). Probe the memory API on `memoryTransport.port` (3000), never on
+`servicePort` (8080) — 8080 answers `/healthz` and returns 404 for `/memory/*`.
+
 ## Status conditions
 
 `status.conditions` follow the standard `metav1.Condition` semantics and reflect
