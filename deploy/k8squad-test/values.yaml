@@ -45,13 +45,18 @@ extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
 
-# Expose /memory/* through the kgateway Gateway (exercises the HTTPRoute path).
-# backendRef targets the memory port (3000) automatically.
+# Expose /memory/* through a dedicated kgateway Gateway (exercises the HTTPRoute
+# path). backendRef targets the memory port (3000) automatically.
+#
+# NOTE: the shared `ksquad` Gateway (k8squad-system) rejects cross-namespace routes
+# (listener allowedRoutes from: Same -> NotAllowedByListeners), so the deploy uses a
+# dedicated `memkeys-gw` Gateway in the memkeys namespace (MetalLB VIP 10.0.0.220),
+# provisioned under ISI-6334. parentRefs below must match that gateway, not ksquad.
 httpRoute:
   enabled: true
   parentRefs:
-    - name: ksquad
-      namespace: k8squad-system
+    - name: memkeys-gw
+      namespace: memkeys
       sectionName: http
   hostnames:
     - memkeys.k8squad-test.internal

@@ -9,10 +9,11 @@
 # and PgStore::connect() preflights pg_available_extensions (ISI-6319). Stock
 # Postgres would fail that preflight.
 #
-# Storage: local-path, NOT the cluster-default nfs-csi. The nfs-csi provisioner on
-# k8squad-test is currently broken (rpc.statd not running on nodes + the TrueNAS
-# export 10.0.0.178:/mnt/truenas/pvc is missing) — tracked separately for ProxOps.
-# local-path is single-node-appropriate for this test profile.
+# Storage: local-path, which is single-node-appropriate for this test profile.
+# (The cluster-default nfs-csi SC now works against the real TrueNAS at
+# 10.0.0.145:/mnt/truenas/pvc, reclaimPolicy=Retain — an earlier diagnosis blamed
+# 10.0.0.178, which turned out to be a different NAS; fixed under ISI-6327. Migrating
+# this PVC to nfs-csi for durable storage is a Ph2 option, not needed for Ph1.)
 #
 # Prereq secret (created out-of-band, holds generated creds):
 #   kubectl -n memkeys create secret generic memkeys-pg \
