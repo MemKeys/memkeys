@@ -304,8 +304,15 @@ fn build_logger_provider(endpoint: &str, resource: Resource) -> Result<SdkLogger
 }
 
 /// Install the global tracing subscriber: the OTel logs bridge (when enabled)
-/// under a stdout fmt layer. The bridge is the catalog's log transport; the
+/// under a **stderr** fmt layer. The bridge is the catalog's log transport; the
 /// fmt layer is a local console view, never the prod pipeline.
+///
+/// The fmt layer writes to stderr, NOT stdout (ISI-6337 CR B1): in
+/// `MEMKEYS_ROLE=mcp` stdout IS the JSON-RPC protocol channel, so a single
+/// tracing line on stdout corrupts response framing. stderr is the conventional
+/// server-log sink and never collides with the protocol; routing there
+/// unconditionally also cleans the latent stdout pollution of the all-in-one
+/// stdio MCP surface.
 fn install_tracing_subscriber(logger_provider: Option<&SdkLoggerProvider>) {
     use tracing_subscriber::layer::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -329,13 +336,13 @@ fn install_tracing_subscriber(logger_provider: Option<&SdkLoggerProvider>) {
             let _ = tracing_subscriber::registry()
                 .with(filter)
                 .with(bridge)
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
                 .try_init();
         }
         None => {
             let _ = tracing_subscriber::registry()
                 .with(filter)
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
                 .try_init();
         }
     }
