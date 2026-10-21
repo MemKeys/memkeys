@@ -198,6 +198,55 @@ Name of the Secret holding the run-token issuer secret (MEMKEYS_RUN_TOKEN_SECRET
 {{- end }}
 
 {{/*
+Whether the Inspector UI frontend (Deployment + Service) renders. Disabled by
+default. Emits "true"/"false".
+*/}}
+{{- define "memkeys.frontendEnabled" -}}
+{{- if kindIs "bool" .Values.frontend.enabled -}}
+{{- .Values.frontend.enabled | ternary "true" "false" -}}
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
+Fully qualified name of the Inspector UI frontend workload.
+*/}}
+{{- define "memkeys.frontendFullname" -}}
+{{- printf "%s-inspector" (include "memkeys.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+Frontend selector labels — release identity plus component=inspector, so the
+frontend Deployment and its Service never select the server or worker pods.
+*/}}
+{{- define "memkeys.frontendSelectorLabels" -}}
+{{ include "memkeys.selectorLabels" . }}
+app.kubernetes.io/component: inspector
+{{- end }}
+
+{{/*
+Inspector UI image reference, defaulting the tag to the chart appVersion.
+*/}}
+{{- define "memkeys.frontendImage" -}}
+{{- $tag := default .Chart.AppVersion .Values.frontend.image.tag -}}
+{{- printf "%s:%s" .Values.frontend.image.repository $tag -}}
+{{- end }}
+
+{{/*
+Upstream the nginx image reverse-proxies /memory to (option (a)). An explicit
+frontend.memoryApiUpstream wins; otherwise defaults to the in-cluster server
+Service on the memory transport port.
+*/}}
+{{- define "memkeys.frontendMemoryUpstream" -}}
+{{- if .Values.frontend.memoryApiUpstream -}}
+{{- .Values.frontend.memoryApiUpstream -}}
+{{- else -}}
+{{- printf "%s:%d" (include "memkeys.fullname" .) (int .Values.memoryTransport.port) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Name of the Secret that holds MEMKEYS_DATABASE_URL.
 */}}
 {{- define "memkeys.databaseSecretName" -}}

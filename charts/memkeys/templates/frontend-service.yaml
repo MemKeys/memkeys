@@ -1,0 +1,18 @@
+{{- if eq (include "memkeys.frontendEnabled" .) "true" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memkeys.frontendFullname" . }}
+  labels:
+    {{- include "memkeys.labels" . | nindent 4 }}
+    app.kubernetes.io/component: inspector
+spec:
+  type: {{ .Values.frontend.service.type }}
+  ports:
+    - port: {{ .Values.frontend.service.port }}
+      targetPort: {{ .Values.frontend.service.portName }}
+      protocol: TCP
+      name: {{ .Values.frontend.service.portName }}
+  selector:
+    {{- include "memkeys.frontendSelectorLabels" . | nindent 4 }}
+{{- end }}

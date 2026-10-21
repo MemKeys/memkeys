@@ -6,7 +6,7 @@ description: |
   derived, rebuildable projections over a keyed/temporal source of truth.
 type: application
 # Chart version — bump on every chart change (SemVer).
-version: 0.3.0
+version: 0.4.0
 # The memkeys-server image version this chart defaults to.
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
@@ -36,3 +36,5 @@ annotations:
       description: replicaCount defaults per profile (single-node 1, microservice 2) and the PodDisruptionBudget renders only when effective server replicas > 1, so a singleton + PDB can no longer deadlock kubectl drain.
     - kind: added
       description: Memory transport exposure (ISI-6233) — a second container/Service port for the /memory/* listener (MEMKEYS_MEMORY_HTTP_PORT, default 3000) with MEMKEYS_HTTP_HOST=0.0.0.0; the HTTPRoute backendRef now targets the memory port. The chart fails fast when the transport is enabled without a run-token issuer secret (mirroring the server's non-loopback bind gate); set memoryTransport.runTokenSecret.existingSecret (or .value), memoryTransport.allowInsecure=true (dev only), or memoryTransport.enabled=false.
+    - kind: added
+      description: Optional Inspector UI frontend (ISI-6395 B2) — frontend.enabled (default off) renders a Deployment + Service serving the read-only Inspector SPA (ghcr.io/memkeys/memkeys-inspector). HTTPRoute rules gain a per-rule backend selector (server|frontend) so the UI and the token-gated /memory/* API can share one external origin behind the memkeys-gw Gateway: / -> UI, /memory/* -> memory port (unchanged).

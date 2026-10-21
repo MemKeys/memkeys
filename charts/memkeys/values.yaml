@@ -107,6 +107,64 @@ memoryTransport:
   # warns; tenant is self-asserted). Never use in a shared cluster.
   allowInsecure: false
 
+# --- Inspector UI (frontend) ------------------------------------------------
+# Optional, read-only Inspector SPA (ISI-6083 / ISI-6395 B2). Disabled by
+# default. When enabled the chart renders a Deployment + Service serving the
+# static SPA from the nginx image (ghcr.io/memkeys/memkeys-inspector, ISI-6406).
+# No new auth surface: the UI is read-through and calls the same token-gated
+# /memory/* API as any other client.
+#
+# Same-origin wiring: the SPA calls the API at the relative path /memory, so the
+# UI and the memory API must share one external origin. Two ways to wire it
+# behind the Gateway:
+#   (a) Route ALL paths to this frontend Service; the nginx image itself
+#       reverse-proxies /memory -> frontend.memoryApiUpstream.
+#   (b) Split at the HTTPRoute (recommended, lower-risk): / -> frontend Service,
+#       /memory/* -> the memkeys server memory port (unchanged, token-gated).
+#       See the httpRoute.rules example below.
+frontend:
+  enabled: false
+  image:
+    repository: ghcr.io/memkeys/memkeys-inspector
+    pullPolicy: IfNotPresent
+    # Image tag. Defaults to the chart appVersion when empty. Pin per-env.
+    tag: ""
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    # Port the Service exposes. The image's nginx listens on container port 80.
+    port: 80
+    portName: http
+  # Upstream the nginx image reverse-proxies /memory to (option (a)). Empty →
+  # the in-cluster memkeys Service on memoryTransport.port. Unused under the
+  # HTTPRoute split (option (b)) but kept correct so single-Service exposure
+  # also works.
+  memoryApiUpstream: ""
+  # The nginx image is NOT distroless-nonroot: its entrypoint renders the server
+  # config and nginx writes temp/cache under /var, so it needs a writable
+  # rootfs and the image's default user. Hence its own (looser) security
+  # context, distinct from the hardened server context above.
+  podSecurityContext: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - NET_BIND_SERVICE
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # --- Gateway API ingress (HTTPRoute, not legacy Ingress) --------------------
 # Disabled by default; enable and point at a parentRef Gateway to expose the
 # service outside the cluster.
@@ -120,12 +178,31 @@ httpRoute:
   hostnames: []
   #  - memkeys.example.com
   annotations: {}
-  # Match rules. Defaults to all paths on the service port.
+  # Match rules. Each rule may set `backend:` to pick the destination Service:
+  #   server   (default) — the memkeys memory port (token-gated /memory/*), or
+  #                        service.port when memoryTransport.enabled=false.
+  #   frontend           — the Inspector UI Service (requires frontend.enabled).
+  # Defaults to all paths on the server backend (unchanged pre-0.4.0 behaviour).
   rules:
     - matches:
         - path:
             type: PathPrefix
             value: /
+  # Same-origin split — serve the Inspector UI + memory API on ONE host behind
+  # the memkeys-gw VIP (ISI-6395 B2). Longest-prefix match wins, so /memory/*
+  # routes to the token-gated API and everything else to the UI. Requires
+  # frontend.enabled=true:
+  #  rules:
+  #    - matches:
+  #        - path:
+  #            type: PathPrefix
+  #            value: /memory
+  #      backend: server
+  #    - matches:
+  #        - path:
+  #            type: PathPrefix
+  #            value: /
+  #      backend: frontend
 
 # --- Database wiring --------------------------------------------------------
 # The server reads MEMKEYS_DATABASE_URL (required). Mirrors the TEST_DATABASE_URL

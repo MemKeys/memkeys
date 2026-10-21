@@ -20,11 +20,23 @@ spec:
   {{- end }}
   rules:
     {{- range .Values.httpRoute.rules }}
+    {{- $backend := .backend | default "server" }}
+    {{- if and (eq $backend "frontend") (ne (include "memkeys.frontendEnabled" $) "true") }}
+    {{- fail "memkeys: an httpRoute rule sets backend=frontend but frontend.enabled is false — enable the Inspector UI (frontend.enabled=true) or drop the rule" }}
+    {{- end }}
+    {{- if not (has $backend (list "server" "frontend")) }}
+    {{- fail (printf "memkeys: httpRoute rule backend %q is invalid (want \"server\" or \"frontend\")" $backend) }}
+    {{- end }}
     - {{- with .matches }}
       matches:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       backendRefs:
+        {{- if eq $backend "frontend" }}
+        # Route to the Inspector UI (nginx SPA) Service.
+        - name: {{ include "memkeys.frontendFullname" $ }}
+          port: {{ $.Values.frontend.service.port }}
+        {{- else }}
         - name: {{ include "memkeys.fullname" $ }}
           {{- if eq (include "memkeys.memoryTransportEnabled" $) "true" }}
           # Route to the /memory/* transport listener, not the health port
@@ -33,5 +45,6 @@ spec:
           {{- else }}
           port: {{ $.Values.service.port }}
           {{- end }}
+        {{- end }}
     {{- end }}
 {{- end }}
