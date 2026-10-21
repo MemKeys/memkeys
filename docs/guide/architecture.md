@@ -17,16 +17,27 @@ The system is three storage layers and four retrieval operations, all on top of 
 [keyed-first invariant](./what-is-memkeys.md#the-keyed-first-invariant): the keyed /
 temporal store is the source of truth, and graph and vector are derived views.
 
-```
-   client (dumb)                  memkeys-server (does the modeling)              single Postgres
- ┌──────────────┐  raw fact     ┌────────────────────────────────────┐   ┌────────────────────────────┐
- │ store a fact  │ ─ envelope ─▶ │ normalize → key → temporalize       │─▶ │ facts table (source of truth│
- │ (agent/       │               │   └─ commit  ─────────────────────── │   │  append-only, bitemporal)   │
- │  gateway)     │               │                                      │   └──────────────┬─────────────┘
- └──────────────┘               │ async, off the hot path:              │                  │ replay
-                                 │  ├─ project graph edges               │─▶ graph tables   │ (rebuildable)
-                                 │  └─ embed fact.body (if semantic on)  │─▶ vector (pgvector)
-                                 └────────────────────────────────────┘
+```mermaid
+flowchart LR
+    client["store a fact<br/>(agent / gateway)<br/><i>dumb client</i>"]
+    subgraph server["memkeys-server — does the modeling"]
+        direction TB
+        pipe["normalize → key →<br/>temporalize → commit"]
+        async["async, off the hot path:<br/>• project graph edges<br/>• embed fact.body <i>(if semantic on)</i>"]
+        pipe -. async .-> async
+    end
+    subgraph pg["single Postgres"]
+        direction TB
+        facts["<b>facts table</b><br/>source of truth<br/>append-only, bitemporal"]
+        graphtbl["graph tables"]
+        vector["vector (pgvector)"]
+    end
+    client -->|raw fact envelope| pipe
+    pipe --> facts
+    async --> graphtbl
+    async --> vector
+    facts -->|"replay (rebuildable)"| graphtbl
+    facts -->|"replay (rebuildable)"| vector
 ```
 
 ## The fact envelope
@@ -132,13 +143,16 @@ genuinely single-node: one connection string, one backup, one thing to operate.
 
 A write runs four **synchronous** stages, then hands off to **async** projection:
 
-```
-ingest ─▶ [1 normalize] ─▶ [2 key] ─▶ [3 temporalize] ─▶ [4 commit] ─▶ ack
-                                                              │
-                                        async, off the hot path (rebuildable):
-                                        ├─ project graph edges
-                                        ├─ embed fact.body            (if semantic on)
-                                        └─ scope rollup → digest tier (if digest on)
+```mermaid
+flowchart LR
+    ingest([ingest]) --> n["1 · normalize"] --> k["2 · key"] --> t["3 · temporalize"] --> c["4 · commit"] --> ack([ack])
+    c -. "async, off the hot path<br/>(rebuildable)" .-> async
+    subgraph async["async projection"]
+        direction TB
+        g["project graph edges"]
+        e["embed fact.body <i>(if semantic on)</i>"]
+        d["scope rollup → digest tier <i>(if digest on)</i>"]
+    end
 ```
 
 1. **Normalize** — validate the envelope, canonicalize `fact.type`, stamp
