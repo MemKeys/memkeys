@@ -11,6 +11,7 @@ name: GHCR Publish
 #
 #   ghcr.io/memkeys/memkeys-server    (root Dockerfile)
 #   ghcr.io/memkeys/memkeys-operator  (operator/Dockerfile)
+#   ghcr.io/memkeys/memkeys-inspector (frontend/Dockerfile, ISI-6406)
 #
 # The PR build-only gates stay in docker.yml (load + grype) and operator.yml
 # (vet/test) — this workflow NEVER runs on pull_request, so the PR path is
@@ -53,6 +54,11 @@ jobs:
             dockerfile: operator/Dockerfile
             title: MemKeys Operator
             description: "Kubernetes operator for the MemKeysInstance CRD (memkeys.io)."
+          - image: memkeys-inspector
+            context: frontend
+            dockerfile: frontend/Dockerfile
+            title: MemKeys Inspector UI
+            description: "MemKeys Inspector SPA served by nginx, reverse-proxying /memory to the memory API (ISI-6406)."
     steps:
       - uses: actions/checkout@v4
 
