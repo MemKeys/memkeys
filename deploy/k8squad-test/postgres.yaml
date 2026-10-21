@@ -1,0 +1,101 @@
+# Bundled Postgres + pgvector for the MemKeys single-node profile on k8squad-test.
+#
+# The MemKeys Helm chart (oci://ghcr.io/memkeys/charts/memkeys) does NOT bundle a
+# database — it consumes an external MEMKEYS_DATABASE_URL. For the single-node
+# dogfood deploy (ISI-6327) we stand up one pgvector Postgres here and point the
+# chart at it via database.existingSecret.
+#
+# pgvector/pgvector:pg18 is required: migration 0003 runs `CREATE EXTENSION vector`
+# and PgStore::connect() preflights pg_available_extensions (ISI-6319). Stock
+# Postgres would fail that preflight.
+#
+# Storage: local-path, which is single-node-appropriate for this test profile.
+# (The cluster-default nfs-csi SC now works against the real TrueNAS at
+# 10.0.0.145:/mnt/truenas/pvc, reclaimPolicy=Retain — an earlier diagnosis blamed
+# 10.0.0.178, which turned out to be a different NAS; fixed under ISI-6327. Migrating
+# this PVC to nfs-csi for durable storage is a Ph2 option, not needed for Ph1.)
+#
+# Prereq secret (created out-of-band, holds generated creds):
+#   kubectl -n memkeys create secret generic memkeys-pg \
+#     --from-literal=POSTGRES_DB=memkeys \
+#     --from-literal=POSTGRES_USER=memkeys \
+#     --from-literal=POSTGRES_PASSWORD=<generated>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memkeys-postgres
+  namespace: memkeys
+  labels:
+    app: memkeys-postgres
+spec:
+  clusterIP: None
+  selector:
+    app: memkeys-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: memkeys-postgres
+  namespace: memkeys
+  labels:
+    app: memkeys-postgres
+spec:
+  replicas: 1
+  serviceName: memkeys-postgres
+  selector:
+    matchLabels:
+      app: memkeys-postgres
+  template:
+    metadata:
+      labels:
+        app: memkeys-postgres
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg18
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          envFrom:
+            - secretRef:
+                name: memkeys-pg
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "memkeys", "-d", "memkeys"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "memkeys", "-d", "memkeys"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 2Gi

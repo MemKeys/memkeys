@@ -1,0 +1,62 @@
+# MemKeys single-node values for the k8squad-test dogfood deploy (ISI-6327).
+# Install with the published OCI chart, pinned:
+#   helm upgrade --install memkeys oci://ghcr.io/memkeys/charts/memkeys \
+#     --version 0.3.0 -n memkeys -f deploy/k8squad-test/values.yaml
+#
+# Prereqs (created out-of-band / by deploy/k8squad-test/postgres.yaml):
+#   - secret memkeys-db        : MEMKEYS_DATABASE_URL -> the bundled pgvector PG
+#   - secret memkeys-run-token : MEMKEYS_RUN_TOKEN_SECRET (memory-transport issuer)
+#   - StatefulSet memkeys-postgres (pgvector/pgvector:pg18) on local-path
+
+profile: single-node
+
+image:
+  # The chart default repo (ghcr.io/memkeys/memkeys) does not exist; the
+  # published server image is ghcr.io/memkeys/memkeys-server (ISI-6304).
+  repository: ghcr.io/memkeys/memkeys-server
+  # Pinned to the most recent published main build for reproducibility.
+  tag: sha-8bbb7b3
+  pullPolicy: IfNotPresent
+
+# Point the server at the bundled pgvector Postgres via the pre-provisioned secret.
+database:
+  existingSecret: memkeys-db
+  existingSecretKey: MEMKEYS_DATABASE_URL
+
+# /memory/* transport on :3000, gated by the run-token issuer secret.
+memoryTransport:
+  enabled: true
+  port: 3000
+  runTokenSecret:
+    existingSecret: memkeys-run-token
+    key: MEMKEYS_RUN_TOKEN_SECRET
+
+# Export OTLP/gRPC to the cluster collector.
+otel:
+  endpoint: http://otel-gateway-collector.observability.svc:4317
+  deploymentEnv: dev
+  serviceNamespace: memkeys
+
+# Enable the semantic read/write path (op-4 /memory/search). With no
+# MEMKEYS_EMBED_URL the server uses the built-in deterministic HashEmbedder — no
+# external embedding service required for the Ph1 smoke. Ph2 (production dogfood)
+# should point MEMKEYS_EMBED_URL at a real embedding model for recall quality.
+extraEnv:
+  - name: MEMKEYS_SEMANTIC
+    value: "1"
+
+# Expose /memory/* through a dedicated kgateway Gateway (exercises the HTTPRoute
+# path). backendRef targets the memory port (3000) automatically.
+#
+# NOTE: the shared `ksquad` Gateway (k8squad-system) rejects cross-namespace routes
+# (listener allowedRoutes from: Same -> NotAllowedByListeners), so the deploy uses a
+# dedicated `memkeys-gw` Gateway in the memkeys namespace (MetalLB VIP 10.0.0.220),
+# provisioned under ISI-6334. parentRefs below must match that gateway, not ksquad.
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: memkeys-gw
+      namespace: memkeys
+      sectionName: http
+  hostnames:
+    - memkeys.k8squad-test.internal
