@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" fill="none" role="img" aria-label="Step 2: connect an agent over the MCP 4-op contract.">
+  <title>Connect an agent</title>
+  <defs><linearGradient id="s2g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#17356F"/><stop offset="1" stop-color="#3E6FD9"/></linearGradient></defs>
+  <!-- agent node (left) -->
+  <circle cx="22" cy="48" r="12" stroke="url(#s2g)" stroke-width="4" fill="none"/>
+  <!-- memkeys node = keyhole (right) -->
+  <circle cx="74" cy="48" r="13" stroke="url(#s2g)" stroke-width="4" fill="none"/>
+  <circle cx="74" cy="44" r="3.4" fill="#F7C948"/>
+  <path d="M72.6 47 L75.4 47 L74.6 56 L73.4 56 Z" fill="#F7C948"/>
+  <!-- link / plug between -->
+  <line x1="34" y1="48" x2="61" y2="48" stroke="#F7C948" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 7"/>
+  <circle cx="47.5" cy="48" r="4" fill="#F7C948"/>
+</svg>

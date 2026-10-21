@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>MemKeys — keyed memory for agents (design mockup)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#17356F; --ink-2:#3E6FD9; --accent:#F7C948;
+    --ground:#0B1830; --ground-2:#13294F; --line-dark:#2A4A86;
+    --paper:#F7F4EC; --reverse:#EAF1FF; --muted:#4A618C; --muted-d:#8AA6D8;
+    --r-s:10px; --r-m:16px; --r-l:24px;
+    --maxw:1120px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;font-family:'IBM Plex Sans',system-ui,sans-serif;color:var(--ink);background:#fff;-webkit-font-smoothing:antialiased;line-height:1.55}
+  .mono{font-family:'IBM Plex Mono',ui-monospace,monospace}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+  a{color:inherit}
+  .btn{display:inline-flex;align-items:center;gap:8px;font-weight:600;text-decoration:none;border-radius:var(--r-s);padding:13px 22px;font-size:15px;transition:transform .08s ease}
+  .btn:active{transform:translateY(1px)}
+  .btn-primary{background:var(--accent);color:#0B1830}
+  .btn-ghost{border:1.5px solid var(--muted-d);color:var(--reverse)}
+  .btn-ink{border:1.5px solid var(--ink);color:var(--ink)}
+
+  /* ---------- NAV ---------- */
+  header{background:var(--ground)}
+  nav{display:flex;align-items:center;justify-content:space-between;height:68px}
+  nav .lockup{height:30px}
+  nav .links{display:flex;gap:28px;align-items:center}
+  nav .links a{color:var(--muted-d);text-decoration:none;font-weight:500;font-size:15px}
+  nav .links a:hover{color:var(--reverse)}
+
+  /* ---------- HERO ---------- */
+  .hero{background:var(--ground);color:var(--reverse);overflow:hidden}
+  .hero .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center;padding:72px 0 96px}
+  .eyebrow{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600;margin:0 0 18px}
+  .hero h1{font-size:60px;line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;font-weight:700}
+  .hero h1 .k{color:var(--accent)}
+  .hero p.lede{font-size:19px;color:#C7D4EC;max-width:30ch;margin:0 0 32px}
+  .cta-row{display:flex;gap:14px;flex-wrap:wrap}
+  .hero-art{width:100%;height:auto}
+  .trust{margin-top:34px;display:flex;gap:22px;align-items:center;color:var(--muted-d);font-size:13px}
+  .trust .mono{color:#C7D4EC}
+
+  /* ---------- SECTION SHELL ---------- */
+  section.band{padding:88px 0}
+  .kicker{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-2);font-weight:600;margin:0 0 12px}
+  h2{font-size:38px;line-height:1.1;letter-spacing:-.015em;margin:0 0 16px;font-weight:700}
+  .section-lede{font-size:18px;color:var(--muted);max-width:60ch;margin:0 0 8px}
+
+  /* ---------- ARCHITECTURE ---------- */
+  .arch{background:var(--paper)}
+  .arch .figure{margin-top:40px;background:#fff;border:1px solid #E6DEC9;border-radius:var(--r-l);padding:20px;box-shadow:0 1px 0 #fff inset, 0 24px 48px -32px rgba(23,53,111,.35)}
+  .arch .figure img{width:100%;height:auto;display:block}
+  .arch .cap{display:flex;gap:18px;flex-wrap:wrap;margin-top:28px}
+  .arch .cap div{flex:1 1 200px;border-left:3px solid var(--accent);padding:4px 0 4px 16px}
+  .arch .cap b{display:block;font-size:15px}
+  .arch .cap span{font-size:14px;color:var(--muted)}
+
+  /* ---------- HOW TO USE ---------- */
+  .how{background:#fff}
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;margin-top:48px}
+  .step{border:1px solid #E3E8F2;border-radius:var(--r-m);padding:28px;position:relative;transition:border-color .15s, transform .15s}
+  .step:hover{border-color:var(--ink-2);transform:translateY(-3px)}
+  .step .num{position:absolute;top:22px;right:24px;font-size:13px;font-weight:600;color:var(--muted-d)}
+  .step img{width:64px;height:64px;margin-bottom:18px}
+  .step h3{font-size:20px;margin:0 0 8px}
+  .step p{font-size:15px;color:var(--muted);margin:0 0 16px}
+  .step code{font-family:'IBM Plex Mono',monospace;background:var(--paper);border:1px solid #E6DEC9;border-radius:6px;padding:2px 7px;font-size:13px;color:var(--ink)}
+  .step a.deep{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:14px;color:var(--ink-2);text-decoration:none}
+  .step a.deep:hover{text-decoration:underline}
+
+  /* ---------- FINAL CTA ---------- */
+  .final{background:var(--ground);color:var(--reverse);text-align:center;padding:84px 0}
+  .final h2{font-size:40px;margin:0 0 14px}
+  .final p{color:#C7D4EC;font-size:18px;margin:0 0 30px}
+
+  /* ---------- FOOTER ---------- */
+  footer{background:#071124;color:var(--muted-d);padding:48px 0 40px;font-size:14px}
+  .foot{display:flex;justify-content:space-between;gap:32px;flex-wrap:wrap;align-items:flex-start}
+  .foot .lockup{height:26px;margin-bottom:14px}
+  .foot .cols{display:flex;gap:56px;flex-wrap:wrap}
+  .foot h4{color:var(--reverse);font-size:13px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 12px}
+  .foot a{display:block;color:var(--muted-d);text-decoration:none;margin-bottom:9px}
+  .foot a:hover{color:var(--reverse)}
+  .foot .legal{margin-top:36px;border-top:1px solid #142746;padding-top:20px;font-size:13px}
+
+  /* ---------- RESPONSIVE ---------- */
+  @media (max-width:860px){
+    .hero .grid{grid-template-columns:1fr;gap:12px;padding:48px 0 64px}
+    .hero h1{font-size:42px}
+    .hero-art{max-width:460px}
+    nav .links{display:none}
+    .steps{grid-template-columns:1fr}
+    h2{font-size:30px}
+    section.band{padding:60px 0}
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<header>
+  <div class="wrap">
+    <nav>
+      <img class="lockup" src="../branding/_unpacked/memkeys-branding/lockups/memkeys-lockup-horizontal-reverse.svg" alt="MemKeys"/>
+      <div class="links">
+        <a href="#architecture">How it works</a>
+        <a href="#how">Get started</a>
+        <a href="#">Docs</a>
+        <a href="https://github.com/memkeys">GitHub</a>
+        <a class="btn btn-primary" style="padding:9px 16px;font-size:14px" href="#how">Get started</a>
+      </div>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="wrap">
+    <div class="grid">
+      <div>
+        <p class="eyebrow">Keyed memory for agents</p>
+        <h1>Every fact has an&nbsp;<span class="k">address</span>.</h1>
+        <p class="lede">MemKeys stores each fact by the keys that describe it — and a validity window — so your agents retrieve it exactly, not by vector guesswork.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="#how">Get started →</a>
+          <a class="btn btn-ghost" href="https://github.com/memkeys">View on GitHub</a>
+        </div>
+        <div class="trust">
+          <span>Open contract</span><span>·</span>
+          <span>Pluggable backends</span><span>·</span>
+          <span class="mono">MCP · REST</span>
+        </div>
+      </div>
+      <div>
+        <img class="hero-art" src="assets/hero-visual.svg" alt="A query travels along an address and resolves to one keyed fact."/>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section class="band arch" id="architecture">
+  <div class="wrap">
+    <p class="kicker">How it works</p>
+    <h2>Keyed first. Graph and vector are derived views.</h2>
+    <p class="section-lede">Agents store facts by attribute into one keyed core. The graph and the vector index are views computed on top of those facts — not separate stores you keep in sync.</p>
+    <div class="figure">
+      <img src="assets/architecture.svg" alt="Agents store facts keyed by attribute into one keyed core; graph and vector are derived views on top."/>
+    </div>
+    <div class="cap">
+      <div><b>Keyed core</b><span>Facts addressed by project, issue, run, agent — each with a validity window.</span></div>
+      <div><b>Graph view</b><span>Traverse relationships between keyed facts in a single hop.</span></div>
+      <div><b>Vector view</b><span>Semantic search for when you don't yet know the key.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW TO USE -->
+<section class="band how" id="how">
+  <div class="wrap">
+    <p class="kicker">Get started</p>
+    <h2>Three steps to agent memory that sticks.</h2>
+    <p class="section-lede">Run the server, point an agent at it, and watch the memory graph fill in.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="num">01</span>
+        <img src="assets/how-step-1-run.svg" alt=""/>
+        <h3>Run it</h3>
+        <p>Start MemKeys as a container or a Helm chart. One Postgres, no extra services.</p>
+        <p><code>docker run ghcr.io/memkeys/memkeys-server</code></p>
+        <a class="deep" href="#">Quickstart →</a>
+      </div>
+      <div class="step">
+        <span class="num">02</span>
+        <img src="assets/how-step-2-connect.svg" alt=""/>
+        <h3>Connect an agent</h3>
+        <p>Add the MCP endpoint to your agent. Four operations: store, fetch, search, traverse.</p>
+        <p><code>claude mcp add memkeys</code></p>
+        <a class="deep" href="#">Connect an agent →</a>
+      </div>
+      <div class="step">
+        <span class="num">03</span>
+        <img src="assets/how-step-3-browse.svg" alt=""/>
+        <h3>Browse memory</h3>
+        <p>Open the Inspector to explore the keyed graph, follow edges, and see what was true when.</p>
+        <p><code>open /memory</code></p>
+        <a class="deep" href="#">Explore the Inspector →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FINAL CTA -->
+<section class="final">
+  <div class="wrap">
+    <h2>Memory your agents can actually find again.</h2>
+    <p>Open source. Self-hosted. Keyed from the ground up.</p>
+    <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap">
+      <a class="btn btn-primary" href="#how">Get started →</a>
+      <a class="btn btn-ghost" href="https://github.com/memkeys">Star on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div style="max-width:300px">
+        <img class="lockup" src="../branding/_unpacked/memkeys-branding/lockups/memkeys-lockup-horizontal-reverse.svg" alt="MemKeys"/>
+        <p style="margin:0">Attribute-based memory server for AI agents — facts keyed by attribute, with temporal validity. Graph + vector as derived views.</p>
+      </div>
+      <div class="cols">
+        <div>
+          <h4>Product</h4>
+          <a href="#architecture">How it works</a>
+          <a href="#how">Get started</a>
+          <a href="#">Docs</a>
+          <a href="#">Inspector UI</a>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <a href="https://github.com/memkeys">GitHub</a>
+          <a href="#">Releases</a>
+          <a href="#">License (Apache-2.0)</a>
+          <a href="#">Brand assets</a>
+        </div>
+      </div>
+    </div>
+    <div class="legal">© 2026 MemKeys · Open contract, pluggable backends · <span class="mono">Every fact has an address.</span></div>
+  </div>
+</footer>
+
+</body>
+</html>

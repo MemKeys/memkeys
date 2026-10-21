@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 560" width="720" height="560" fill="none" role="img" aria-label="A query travels along an address and resolves to one keyed fact inside the MemKeys mark.">
+  <title>MemKeys hero — every fact has an address</title>
+  <defs>
+    <linearGradient id="hring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3E6FD9"/>
+      <stop offset="1" stop-color="#17356F"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#F7C948" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#F7C948" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="hArrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#F7C948"/>
+    </marker>
+    <style>
+      text{font-family:'IBM Plex Mono','SF Mono',ui-monospace,monospace}
+    </style>
+  </defs>
+
+  <!-- transparent background: sits on #0B1830 hero section -->
+
+  <!-- faint attribute lattice in the back -->
+  <g stroke="#1C3A6E" stroke-width="1.5" opacity="0.7">
+    <line x1="80" y1="120" x2="200" y2="200"/>
+    <line x1="200" y1="200" x2="120" y2="300"/>
+    <line x1="200" y1="200" x2="300" y2="150"/>
+    <line x1="560" y1="420" x2="640" y2="340"/>
+    <line x1="560" y1="420" x2="500" y2="480"/>
+  </g>
+  <g fill="#1C3A6E" opacity="0.8">
+    <circle cx="80" cy="120" r="5"/><circle cx="120" cy="300" r="5"/>
+    <circle cx="300" cy="150" r="5"/><circle cx="640" cy="340" r="5"/>
+    <circle cx="500" cy="480" r="5"/>
+  </g>
+
+  <!-- the address line: an @path query resolving into the mark -->
+  <text x="40" y="70" font-size="15" fill="#8AA6D8">fetch</text>
+  <text x="92" y="70" font-size="15" fill="#F7C948">@project:memkeys</text>
+  <text x="40" y="94" font-size="15" fill="#8AA6D8">     </text>
+  <text x="92" y="94" font-size="15" fill="#F7C948">· issue:6319 · agent:arch</text>
+
+  <path d="M120 110 C 180 170, 220 230, 300 262" stroke="#F7C948" stroke-width="2.5" fill="none" stroke-dasharray="3 6" stroke-linecap="round" marker-end="url(#hArrow)"/>
+
+  <!-- the mark, large, as the resolving target -->
+  <g transform="translate(300,180) scale(3.6)">
+    <circle cx="32" cy="32" r="34" fill="url(#glow)"/>
+    <path d="M50.5 43.2 A24 24 0 1 1 52.6 22.1" stroke="url(#hring)" stroke-width="4.2" fill="none" stroke-linecap="round"/>
+    <path d="M50.5 43.2 C 61.5 45.5, 60.5 56.8, 45.5 53.2" stroke="url(#hring)" stroke-width="4.2" fill="none" stroke-linecap="round"/>
+    <circle cx="32" cy="26.5" r="4.4" fill="#F7C948"/>
+    <path d="M30.2 29.9 L33.8 29.9 L32.8 37 L31.2 37 Z" fill="#F7C948"/>
+  </g>
+
+  <!-- resolved fact card -->
+  <g transform="translate(330,430)">
+    <rect x="0" y="0" width="330" height="92" rx="14" fill="#13294F" stroke="#2A4A86" stroke-width="1.5"/>
+    <circle cx="26" cy="30" r="8" fill="#F7C948"/>
+    <path d="M22.6 35.3 L29.4 35.3 L27.6 48 L24.4 48 Z" fill="#F7C948"/>
+    <text x="46" y="29" font-size="13" fill="#EAF1FF" font-weight="700">"use pgvector/pgvector:pg18"</text>
+    <text x="46" y="47" font-size="11" fill="#8AA6D8">1 exact match · valid 2026-10-20 → now</text>
+    <rect x="18" y="64" width="294" height="7" rx="3.5" fill="#09142A"/>
+    <rect x="18" y="64" width="190" height="7" rx="3.5" fill="#F7C948" opacity="0.85"/>
+  </g>
+
+  <path d="M476 410 L496 428" stroke="#F7C948" stroke-width="2.5" fill="none" stroke-dasharray="3 6" stroke-linecap="round" marker-end="url(#hArrow)"/>
+</svg>

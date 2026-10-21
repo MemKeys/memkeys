@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" fill="none" role="img" aria-label="Step 1: run MemKeys as a container or Helm chart.">
+  <title>Run it</title>
+  <defs><linearGradient id="s1g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#17356F"/><stop offset="1" stop-color="#3E6FD9"/></linearGradient></defs>
+  <!-- container / server box -->
+  <rect x="14" y="20" width="68" height="56" rx="10" stroke="url(#s1g)" stroke-width="4" fill="none"/>
+  <line x1="14" y1="36" x2="82" y2="36" stroke="url(#s1g)" stroke-width="4"/>
+  <circle cx="24" cy="28" r="2.6" fill="#17356F"/>
+  <circle cx="33" cy="28" r="2.6" fill="#17356F"/>
+  <!-- prompt + run caret (keyed accent) -->
+  <path d="M26 50 L34 57 L26 64" stroke="#F7C948" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="40" y1="64" x2="62" y2="64" stroke="#17356F" stroke-width="4" stroke-linecap="round"/>
+</svg>
