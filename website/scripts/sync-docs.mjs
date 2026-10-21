@@ -89,19 +89,30 @@ async function main() {
   for (const file of files) {
     const rel = path.relative(SRC_DOCS, file); // e.g. adr/ADR-0001-....md
     const raw = await fs.readFile(file, 'utf8');
-    const title = deriveTitle(raw, rel);
-    const body = stripFirstH1(raw, title);
-    const frontmatter = [
-      '---',
-      `title: ${yamlQuote(title)}`,
-      `editUrl: ${EDIT_BASE}/${rel}`,
-      '---',
-      '',
-    ].join('\n');
-
     const dest = path.join(OUT_DOCS, rel);
     await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.writeFile(dest, frontmatter + body, 'utf8');
+
+    let out;
+    if (raw.startsWith('---\n') || raw.startsWith('---\r\n')) {
+      // Already authored with Starlight frontmatter (e.g. docs/guide/ from the
+      // content milestone M1 · ISI-6397) — pass it through verbatim so we never
+      // double-inject a frontmatter block.
+      out = raw;
+    } else {
+      // Plain engineering Markdown — inject the minimal frontmatter Starlight
+      // needs, deriving the title from the first H1.
+      const title = deriveTitle(raw, rel);
+      const body = stripFirstH1(raw, title);
+      out = [
+        '---',
+        `title: ${yamlQuote(title)}`,
+        `editUrl: ${EDIT_BASE}/${rel}`,
+        '---',
+        '',
+      ].join('\n') + body;
+    }
+
+    await fs.writeFile(dest, out, 'utf8');
     count += 1;
   }
 
