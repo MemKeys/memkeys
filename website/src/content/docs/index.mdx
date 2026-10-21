@@ -1,0 +1,51 @@
+---
+title: MemKeys
+description: The attribute-based memory server for agents — facts keyed by attributes, temporal validity, graph + vector as derived views.
+template: splash
+editUrl: false
+hero:
+  tagline: Keyed-first memory for agents. Facts are keyed by attributes with temporal validity; graph and vector are derived, rebuildable views.
+  image:
+    file: ../../assets/hero-mark.svg
+    alt: The MemKeys mark — a gradient @ with a golden keyhole center.
+  actions:
+    # NB: Starlight does not prefix the Pages base onto hero action links, so
+    # the base (/memkeys) is included explicitly. Keep in sync with BASE in
+    # astro.config.mjs if a custom domain lands (ISI-5919).
+    - text: Read the docs
+      link: /memkeys/architecture/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/MemKeys/memkeys
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+{/*
+  Landing scaffold (M3 · ISI-6398). This branded splash page proves the
+  Astro + Starlight scaffold, brand kit, and build. The visual/UX pass is
+  M4a (ISI-6399, Graphic Designer) and copy is M4b (ISI-6400, Content Writer);
+  final wiring happens in the assemble milestone M5 (ISI-6402).
+*/}
+
+<CardGrid stagger>
+  <Card title="Keyed-first" icon="setting">
+    Attribute keys bound the candidate set before any vector or graph work. The
+    keyed, temporal store is the single source of truth.
+  </Card>
+  <Card title="Temporal" icon="seti:clock">
+    Facts carry validity windows. Truth changes over time — MemKeys is
+    bitemporal, so superseded facts close automatically and history is queryable.
+  </Card>
+  <Card title="Derived views" icon="puzzle">
+    Graph and vector are rebuildable projections over the keyed store, never a
+    second source of truth.
+  </Card>
+  <Card title="Open & pluggable" icon="open-book">
+    An open contract with pluggable backends. Portable, contributor-friendly,
+    and versioned alongside the code.
+  </Card>
+</CardGrid>
