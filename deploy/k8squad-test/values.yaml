@@ -15,7 +15,7 @@ image:
   # published server image is ghcr.io/memkeys/memkeys-server (ISI-6304).
   repository: ghcr.io/memkeys/memkeys-server
   # Pinned to the most recent published main build for reproducibility.
-  tag: sha-8bbb7b3
+  tag: sha-44e0f21
   pullPolicy: IfNotPresent
 
 # Point the server at the bundled pgvector Postgres via the pre-provisioned secret.
@@ -70,5 +70,7 @@ httpRoute:
     - name: memkeys-gw
       namespace: memkeys
       sectionName: http
-  hostnames:
-    - memkeys.k8squad-test.internal
+  # No hostname pin: the dedicated memkeys-gw VIP has no LAN DNS for
+  # *.internal yet, so the route matches any Host — http://10.0.0.220/ works
+  # from any LAN browser with zero DNS setup. Re-pin a hostname when TLS
+  # lands (e.g. memkeys.k8squad-test.internal).
