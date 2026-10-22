@@ -26,12 +26,13 @@
 //! the write and traverse handlers respectively.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     extract::{Query, Request, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{header, header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -53,6 +54,8 @@ use crate::telemetry::{self, TRANSPORT_HTTP};
 use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, TraceContextExt};
 use opentelemetry::Context;
+use tower::Layer;
+use tower_http::services::ServeDir;
 
 /// Shared server state injected into every handler via axum `State`.
 #[derive(Clone)]
@@ -65,6 +68,13 @@ pub struct AppState {
     /// Self-protection gates (concurrency shedding, F14 size caps, F15 probe
     /// throttle), shared across both transports.
     pub admission: Arc<AdmissionControl>,
+    /// Directory of the built Inspector SPA (ISI-6476, parent ISI-6395:
+    /// "website without nginx"). When present the memory-transport listener
+    /// also serves the SPA at `/` with a history-API fallback. Static UI is
+    /// NOT admitted through the auth middleware — it is read-through and
+    /// calls the same token-gated `/memory/*` API as any other client.
+    /// `None` (or a missing dir) = UI not bundled; `/memory/*` unaffected.
+    pub ui_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -77,19 +87,98 @@ impl AppState {
             service,
             verifier,
             admission,
+            ui_dir: None,
         }
+    }
+
+    /// Bundle the Inspector SPA from `dir` (no-ops when the dir is absent at
+    /// request time, so a misconfigured deploy serves `/memory/*` normally).
+    pub fn with_ui_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.ui_dir = dir;
+        self
     }
 }
 
-/// Build the `/memory/*` axum `Router`.
+/// Build the `/memory/*` axum `Router`, optionally serving the Inspector SPA.
+///
+/// `/memory/*` keeps the full admission stack (verifier + self-protection).
+/// When `state.ui_dir` exists the SPA is attached as the router fallback:
+/// `/` and any non-API path serve `index.html` (history-API fallback, nginx
+/// parity), `/assets/*` serve content-hashed statics with an immutable
+/// cache header. The UI router is deliberately outside `admit` — it adds no
+/// auth surface; the SPA talks to the token-gated API like any client.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/memory/facts", post(ingest))
         .route("/memory/facts", get(fetch))
         .route("/memory/graph/traverse", post(traverse))
         .route("/memory/search", post(search))
-        .layer(middleware::from_fn_with_state(state.clone(), admit))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(state.clone(), admit))
+        .with_state(state.clone());
+
+    match state.ui_dir.as_ref().filter(|d| d.is_dir()) {
+        Some(dir) => {
+            let ui = Router::new()
+                .route("/", get(index_html))
+                .nest_service(
+                    "/assets",
+                    tower_http::set_header::SetResponseHeaderLayer::overriding(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static(CACHE_ASSETS_IMMUTABLE),
+                    )
+                    // nest_service strips the /assets prefix; the Vite
+                    // bundle serves content-hashed files from dist/assets/.
+                    .layer(ServeDir::new(dir.join("assets"))),
+                )
+                .fallback(spa_fallback)
+                .with_state(state);
+            api.fallback_service(ui)
+        }
+        None => api,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inspector UI (nginx-free, ISI-6476 / ISI-6395)
+// ---------------------------------------------------------------------------
+
+/// Vite content-hashes `/assets/*`, so any change ships a new filename —
+/// those can be cached aggressively (nginx parity).
+const CACHE_ASSETS_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+/// `index.html` must always revalidate so deploys roll out on the next load.
+const CACHE_INDEX_NO_CACHE: &str = "no-cache";
+
+async fn index_html(State(state): State<AppState>) -> Response {
+    serve_index(&state).await
+}
+
+/// History-API fallback: the SPA is a single page, so any path that is not a
+/// real file or a `/memory/*` route serves `index.html`.
+async fn spa_fallback(State(state): State<AppState>) -> Response {
+    serve_index(&state).await
+}
+
+async fn serve_index(state: &AppState) -> Response {
+    let Some(dir) = state.ui_dir.as_deref() else {
+        return (StatusCode::NOT_FOUND, "UI not bundled").into_response();
+    };
+    match tokio::fs::read(dir.join("index.html")).await {
+        Ok(body) => (
+            [
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(CACHE_INDEX_NO_CACHE),
+                ),
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/html; charset=utf-8"),
+                ),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "UI index.html missing").into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -875,5 +964,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- ISI-6476: nginx-free Inspector UI on the memory-transport listener --
+
+    fn ui_router(dir: &std::path::Path) -> Router {
+        use crate::memstore::MemStore;
+        let service = Arc::new(MemKeysService::new(Arc::new(MemStore::new())));
+        let state = AppState::new(
+            service,
+            None, // open loopback dev mode: tenant self-asserted
+            Arc::new(AdmissionControl::with_defaults()),
+        )
+        .with_ui_dir(Some(dir.to_path_buf()));
+        router(state)
+    }
+
+    /// Scratch SPA: index.html with a marker, one hashed asset.
+    fn write_ui_fixture(dir: &std::path::Path) {
+        use std::fs;
+        fs::create_dir_all(dir.join("assets")).expect("mkdir assets");
+        fs::write(dir.join("index.html"), "<html>memkeys-ui-fixture</html>").expect("write index");
+        fs::write(dir.join("assets").join("app-abc123.js"), "console.log(1)").expect("write asset");
+    }
+
+    fn ui_fixture_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("memkeys-ui-test-{tag}-{}", uuid::Uuid::new_v4()));
+        write_ui_fixture(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn ui_root_serves_index_html_without_auth() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let dir = ui_fixture_dir("root");
+        let app = ui_router(&dir);
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("cache-control")
+            .is_some_and(|v| v == "no-cache"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("memkeys-ui-fixture"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ui_history_fallback_serves_index_for_deep_links() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let dir = ui_fixture_dir("spa");
+        let app = ui_router(&dir);
+        // A client-side route that is not a real file must serve index.html.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/facts/some-deep-link")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("memkeys-ui-fixture"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ui_assets_are_immutable_cached() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let dir = ui_fixture_dir("assets");
+        let app = ui_router(&dir);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/assets/app-abc123.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("cache-control")
+            .is_some_and(|v| { v.to_str().unwrap_or("").contains("immutable") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ui_serving_does_not_bypass_memory_auth() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let dir = ui_fixture_dir("auth");
+        let app = ui_router(&dir);
+        // The SPA itself is served freely, but the API behind it is not: a
+        // /memory/facts call without the (dev-mode) tenant header must still
+        // be rejected — bundling the UI opens no API surface.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

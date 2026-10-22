@@ -7,6 +7,19 @@
 # cargo compiles inside the image; the gha build cache keeps it tractable.
 # Later optimization: cargo cross-compilation to drop the arm64 emulation.
 
+# --- ui --------------------------------------------------------------------
+# Inspector SPA (ISI-6476, parent ISI-6395 "website without nginx"): build
+# the Vite bundle once and ship it INSIDE the server image. The server serves
+# it at / on the memory-transport listener (MEMKEYS_UI_DIR below), so no
+# nginx sidecar is needed. The server binary reads the dir at runtime — no
+# compile-time coupling: `cargo build` in the builder stage is unaffected.
+FROM node:20-slim AS uibuild
+WORKDIR /ui
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run build
+
 # --- builder -------------------------------------------------------------
 FROM rust:1-trixie AS builder
 WORKDIR /build
@@ -30,6 +43,10 @@ RUN apt-get update \
  && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin memkeys
 
 COPY --from=builder /build/target/release/memkeys-server /usr/local/bin/memkeys-server
+
+# Inspector SPA bundled nginx-free (see uibuild stage above).
+COPY --from=uibuild /ui/dist /usr/share/memkeys/ui
+ENV MEMKEYS_UI_DIR=/usr/share/memkeys/ui
 
 USER memkeys
 

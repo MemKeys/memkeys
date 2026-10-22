@@ -108,20 +108,30 @@ memoryTransport:
   allowInsecure: false
 
 # --- Inspector UI (frontend) ------------------------------------------------
-# Optional, read-only Inspector SPA (ISI-6083 / ISI-6395 B2). Disabled by
-# default. When enabled the chart renders a Deployment + Service serving the
-# static SPA from the nginx image (ghcr.io/memkeys/memkeys-inspector, ISI-6406).
-# No new auth surface: the UI is read-through and calls the same token-gated
-# /memory/* API as any other client.
+# Optional, read-only Inspector SPA (ISI-6083 / ISI-6395 B2).
+#
+# Preferred since ISI-6476 — no extra Deployment at all: the server image
+# bundles the SPA (root Dockerfile uibuild stage) and serves it at / on the
+# memory-transport port (`MEMKEYS_UI_DIR=/usr/share/memkeys/ui`). The default
+# httpRoute rules below already send all paths to the server backend, so
+# simply enabling httpRoute + memoryTransport exposes the UI and the API on
+# one origin — nginx-free (the board ruling on ISI-6395).
+#
+# The nginx sidecar below (ghcr.io/memkeys/memkeys-inspector, ISI-6406) is
+# retained for the split-routing variant where the UI needs its own
+# Deployment/Service. No new auth surface either way: the UI is read-through
+# and calls the same token-gated /memory/* API as any other client.
 #
 # Same-origin wiring: the SPA calls the API at the relative path /memory, so the
 # UI and the memory API must share one external origin. Two ways to wire it
 # behind the Gateway:
 #   (a) Route ALL paths to this frontend Service; the nginx image itself
 #       reverse-proxies /memory -> frontend.memoryApiUpstream.
-#   (b) Split at the HTTPRoute (recommended, lower-risk): / -> frontend Service,
+#   (b) Split at the HTTPRoute (lower-risk): / -> frontend Service,
 #       /memory/* -> the memkeys server memory port (unchanged, token-gated).
-#       See the httpRoute.rules example below.
+#       Requires frontend.enabled=true; see the httpRoute.rules example below.
+#   (c) Server-bundled (default, no frontend Deployment): route all paths to
+#       the server memory port — the server serves both the SPA and the API.
 frontend:
   enabled: false
   image:
