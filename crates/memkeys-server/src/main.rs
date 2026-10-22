@@ -12,13 +12,18 @@
 //!     kubelet can reach the pod immediately after migrations.
 //!   - M3 memory transport: an axum HTTP server on `MEMKEYS_MEMORY_HTTP_PORT`
 //!     (default 3000) serving `/memory/*`, plus an MCP stdio server (JSON-RPC
-//!     2.0 over stdin/stdout, WS-5 tools). A distinct port from the health
+//!     2.0 over stdin/stdout, WS-5 tools). When a built Inspector SPA is
+//!     present (`MEMKEYS_UI_DIR`, default `frontend/dist`; bundled into the
+//!     image by the root Dockerfile) the same listener serves the UI at `/`
+//!     with a history-API fallback — nginx-free (ISI-6476, parent ISI-6395).
+//!     A distinct port from the health
 //!     surface so a Helm-set `MEMKEYS_HTTP_PORT` cannot collide with it.
 //!   - Admission control (ISI-6148): per-request `JwtVerifier` on HTTP + a
 //!     launch-bound `StaticVerifier` principal on stdio (§2.1), plus the
 //!     `AdmissionControl` self-protection gates. The run-token issuer secret
 //!     is provisioned via `MEMKEYS_RUN_TOKEN_SECRET`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -324,7 +329,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              open admission surface, self-asserted tenant (ISI-6137 S1)."
         );
         }
-        let app_state = AppState::new(service.clone(), http_verifier, admission.clone());
+        // ISI-6476 (parent ISI-6395: "website without nginx"): serve the
+        // built Inspector SPA from the server itself on the memory-transport
+        // listener — no nginx sidecar image. `MEMKEYS_UI_DIR` overrides; the
+        // repo-relative `frontend/dist` default keeps `cargo run` dev flows
+        // working. A missing dir = UI not bundled; `/memory/*` is unaffected.
+        let ui_dir = std::env::var("MEMKEYS_UI_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from("frontend/dist")))
+            .filter(|d| d.is_dir());
+        if ui_dir.is_some() {
+            tracing::info!(
+                target: "memkeys",
+                "memkeys.ui.bundled: Inspector SPA served at / (nginx-free)"
+            );
+            println!("memkeys-server: Inspector UI bundled — serving at / on the memory transport (nginx-free)");
+        }
+        let app_state =
+            AppState::new(service.clone(), http_verifier, admission.clone()).with_ui_dir(ui_dir);
         let router = memkeys_server::http::router(app_state);
         let listener = tokio::net::TcpListener::bind((http_host.as_str(), http_port)).await?;
         // ISI-6320: this is the MEMORY API surface (`/memory/facts`,

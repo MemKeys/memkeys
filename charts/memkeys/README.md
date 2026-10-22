@@ -136,19 +136,30 @@ default; a bare `helm upgrade` now fails fast until you provide a credential
 
 ## Inspector UI (same-origin)
 
-The optional **Inspector UI** is a read-only SPA (`frontend.enabled=true`,
-default **off**) served from the nginx image
-`ghcr.io/memkeys/memkeys-inspector` (ISI-6406). It adds **no new auth surface**:
-the UI calls the same token-gated `/memory/*` API as any other client.
+The **Inspector UI** is a read-only SPA. It adds **no new auth surface**: the
+UI calls the same token-gated `/memory/*` API as any other client.
+
+**Server-bundled (default, nginx-free — ISI-6476).** The `memkeys-server`
+image bundles the built SPA (`MEMKEYS_UI_DIR=/usr/share/memkeys/ui`, built by
+the root Dockerfile `uibuild` stage) and serves it at `/` on the
+memory-transport port with a history-API fallback and immutable-cached
+`/assets/*`. No extra Deployment, Service, or nginx. With the chart-default
+HTTPRoute rules (all paths → the server memory port) the UI and the API share
+one origin out of the box — this is how `deploy/k8squad-test` is wired. A
+server image built before ISI-6476 has no bundle and serves only `/memory/*`;
+pin an image tag that includes the `uibuild` stage.
 
 Because the SPA uses a **relative** `/memory` API base, the UI and the memory
-API must share one external origin. Behind a Gateway there are two ways to wire
-that:
+API must share one external origin. Wiring options:
 
-- **(b) HTTPRoute split (recommended, lower-risk).** Serve both on one host and
+- **(c) Server-bundled (recommended).** Above — nothing to enable; just
+  `httpRoute.enabled=true` with the default rules.
+
+- **(b) HTTPRoute split with the nginx image.** Serve both on one host and
   split at the route: `/memory/*` → the server memory port (unchanged,
-  token-gated), everything else → the Inspector UI. Longest-prefix match wins,
-  so the API path keeps routing to the API:
+  token-gated), everything else → the Inspector UI Service
+  (`frontend.enabled=true`). Longest-prefix match wins, so the API path keeps
+  routing to the API:
 
   ```yaml
   frontend:
