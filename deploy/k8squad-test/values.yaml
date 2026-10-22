@@ -44,6 +44,11 @@ otel:
 extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
+  # Bound the DB pool: the 2-day-old sha-8bbb7b3 pod had leaked enough
+  # connections to saturate postgres max_connections and PoolTimedOut the
+  # rolling replacement (ISI-6395). 10 is ample for the single-node dogfood.
+  - name: MEMKEYS_PG_MAX_CONNECTIONS
+    value: "10"
 
 # Inspector UI (ISI-6476): NO frontend component — the server image bundles
 # the built SPA (root Dockerfile uibuild stage → MEMKEYS_UI_DIR) and serves
