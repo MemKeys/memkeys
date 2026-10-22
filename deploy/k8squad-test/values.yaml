@@ -47,6 +47,11 @@ otel:
 extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
+  # Bound the DB pool: the 2-day-old sha-8bbb7b3 pod had leaked enough
+  # connections to saturate postgres max_connections and PoolTimedOut the
+  # rolling replacement (ISI-6395). 10 is ample for the single-node dogfood.
+  - name: MEMKEYS_PG_MAX_CONNECTIONS
+    value: "10"
 
 # Inspector UI (ISI-6476): NO frontend component — the server image bundles
 # the built SPA (root Dockerfile uibuild stage → MEMKEYS_UI_DIR) and serves
@@ -72,5 +77,7 @@ httpRoute:
     - name: memkeys-gw
       namespace: memkeys
       sectionName: http
-  hostnames:
-    - memkeys.k8squad-test.internal
+  # No hostname pin: the dedicated memkeys-gw VIP has no LAN DNS for
+  # *.internal yet, so the route matches any Host — http://10.0.0.220/ works
+  # from any LAN browser with zero DNS setup. Re-pin a hostname when TLS
+  # lands (e.g. memkeys.k8squad-test.internal).
