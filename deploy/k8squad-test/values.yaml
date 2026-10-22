@@ -14,8 +14,11 @@ image:
   # The chart default repo (ghcr.io/memkeys/memkeys) does not exist; the
   # published server image is ghcr.io/memkeys/memkeys-server (ISI-6304).
   repository: ghcr.io/memkeys/memkeys-server
-  # Pinned to the most recent published main build for reproducibility.
-  tag: sha-8bbb7b3
+  # Pinned to a published main build for reproducibility. sha-44e0f21 is
+  # the FIRST main image containing the uibuild stage (ISI-6476 server-
+  # bundled Inspector UI, merged in PR #50) — the server now serves the SPA
+  # at / on the memory-transport listener.
+  tag: sha-44e0f21
   pullPolicy: IfNotPresent
 
 # Point the server at the bundled pgvector Postgres via the pre-provisioned secret.
@@ -51,9 +54,8 @@ extraEnv:
 # on ISI-6395 ("can we create a website without nginx?"). The chart's
 # frontend.* values stay at their defaults (disabled).
 #
-# NOTE image.tag above: the UI ships in the server image built AFTER the
-# ISI-6476 merge — bump the sha pin to the first published main build that
-# includes the uibuild stage, or the server serves /memory/* with no UI at /.
+# image.tag is pinned to sha-44e0f21 — the first main build with the
+# uibuild stage (PR #50 merge), so a plain `helm upgrade` serves the UI.
 
 # Expose the server (UI + /memory/*) through a dedicated kgateway Gateway
 # (exercises the HTTPRoute path). backendRef targets the memory port (3000)
