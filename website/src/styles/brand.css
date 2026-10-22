@@ -1,0 +1,52 @@
+/* MemKeys brand theme for Starlight.
+ * Palette (branding/_unpacked/memkeys-branding/README.txt + docs/BRAND-CONCEPTS.md):
+ *   Ink        #17356F  deep cobalt-blue — trustworthy, technical
+ *   Blue       #3E6FD9  gradient ring end / interactive accent
+ *   Accent     #F7C948  golden yellow — "the one keyed thing" (used sparingly)
+ *   Ground     #0B1830  dark ground
+ *   Reverse    #EAF1FF  light ink on dark grounds
+ *   Paper      #F7F4EC  optional light ground
+ * No new identity work (ISI-6398) — these map the locked palette onto
+ * Starlight's theme tokens. UX/visual refinement is M4a (ISI-6399).
+ */
+
+:root {
+  --mk-ink: #17356f;
+  --mk-blue: #3e6fd9;
+  --mk-accent: #f7c948;
+  --mk-ground: #0b1830;
+  --mk-reverse: #eaf1ff;
+  --mk-paper: #f7f4ec;
+}
+
+/* Dark theme (default): accent scale derived from the brand blue. */
+:root {
+  --sl-color-accent-low: #15294d;
+  --sl-color-accent: #3e6fd9;
+  --sl-color-accent-high: #c3d6ff;
+
+  --sl-color-bg: var(--mk-ground);
+  --sl-color-bg-nav: #0d1d38;
+  --sl-color-bg-sidebar: #0d1d38;
+}
+
+/* Light theme: deepen the accent toward the brand ink for contrast on paper. */
+:root[data-theme='light'] {
+  --sl-color-accent-low: #c3d6ff;
+  --sl-color-accent: #2f5cc0;
+  --sl-color-accent-high: #13294d;
+
+  --sl-color-bg: var(--mk-paper);
+}
+
+/* The golden accent marks the single keyed thing — use it only for the hero's
+ * primary call to action so it stays special, per the brand brief. */
+.hero a.sl-link-button.primary {
+  background: var(--mk-accent);
+  border-color: var(--mk-accent);
+  color: var(--mk-ground);
+}
+.hero a.sl-link-button.primary:hover {
+  background: #ffd866;
+  border-color: #ffd866;
+}
