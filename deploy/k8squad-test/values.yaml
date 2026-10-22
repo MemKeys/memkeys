@@ -45,8 +45,20 @@ extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
 
-# Expose /memory/* through a dedicated kgateway Gateway (exercises the HTTPRoute
-# path). backendRef targets the memory port (3000) automatically.
+# Inspector UI (ISI-6476): NO frontend component — the server image bundles
+# the built SPA (root Dockerfile uibuild stage → MEMKEYS_UI_DIR) and serves
+# it at / on the memory-transport listener. nginx-free per the board ruling
+# on ISI-6395 ("can we create a website without nginx?"). The chart's
+# frontend.* values stay at their defaults (disabled).
+#
+# NOTE image.tag above: the UI ships in the server image built AFTER the
+# ISI-6476 merge — bump the sha pin to the first published main build that
+# includes the uibuild stage, or the server serves /memory/* with no UI at /.
+
+# Expose the server (UI + /memory/*) through a dedicated kgateway Gateway
+# (exercises the HTTPRoute path). backendRef targets the memory port (3000)
+# automatically; the chart-default rules send all paths there — the server
+# itself splits /memory/* (token-gated API) from everything else (SPA).
 #
 # NOTE: the shared `ksquad` Gateway (k8squad-system) rejects cross-namespace routes
 # (listener allowedRoutes from: Same -> NotAllowedByListeners), so the deploy uses a
