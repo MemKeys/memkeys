@@ -1,0 +1,88 @@
+{{- if eq (include "memkeys.frontendEnabled" .) "true" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memkeys.frontendFullname" . }}
+  labels:
+    {{- include "memkeys.labels" . | nindent 4 }}
+    app.kubernetes.io/component: inspector
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "memkeys.frontendSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- with (include "memkeys.operatorAnnotations" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.frontend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "memkeys.frontendSelectorLabels" . | nindent 8 }}
+        {{- with .Values.frontend.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "memkeys.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.frontend.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: inspector
+          image: {{ include "memkeys.frontendImage" . | quote }}
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          {{- with .Values.frontend.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: {{ .Values.frontend.service.portName }}
+              # The nginx image listens on container port 80.
+              containerPort: 80
+              protocol: TCP
+          env:
+            # The nginx image reverse-proxies /memory to this upstream so the
+            # SPA (relative /memory base) works same-origin (option (a)). Unused
+            # under the HTTPRoute split, harmless to set.
+            - name: MEMORY_API_UPSTREAM
+              value: {{ include "memkeys.frontendMemoryUpstream" . | quote }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.frontend.service.portName }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.frontend.service.portName }}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+      {{- with .Values.frontend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

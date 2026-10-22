@@ -122,14 +122,62 @@ Other constraints, also validated fail-fast: `memoryTransport.port` must
 differ from `service.port` (listener collision) and `memoryTransport.portName`
 must differ from `service.portName`.
 
-When `httpRoute.enabled=true`, the `HTTPRoute` `backendRefs` port targets the
-**memory transport** (`memoryTransport.port`) — the health port stays
-probe-only. Clients authenticate with bearer run tokens signed by the issuer
-secret.
+When `httpRoute.enabled=true`, each `httpRoute.rules` entry routes to a backend
+chosen by its optional `backend:` field (`server`, the default, or `frontend`).
+A `server` rule targets the **memory transport** (`memoryTransport.port`) — the
+health port stays probe-only; clients authenticate with bearer run tokens
+signed by the issuer secret. A `frontend` rule targets the Inspector UI Service
+(see [Inspector UI](#inspector-ui-same-origin)). Rules with no `backend`
+preserve the pre-0.4.0 behaviour (all → server).
 
 **Upgrading from 0.2.0.** The memory transport exposure is new and on by
 default; a bare `helm upgrade` now fails fast until you provide a credential
 (above) or set `memoryTransport.enabled=false`.
+
+## Inspector UI (same-origin)
+
+The optional **Inspector UI** is a read-only SPA (`frontend.enabled=true`,
+default **off**) served from the nginx image
+`ghcr.io/memkeys/memkeys-inspector` (ISI-6406). It adds **no new auth surface**:
+the UI calls the same token-gated `/memory/*` API as any other client.
+
+Because the SPA uses a **relative** `/memory` API base, the UI and the memory
+API must share one external origin. Behind a Gateway there are two ways to wire
+that:
+
+- **(b) HTTPRoute split (recommended, lower-risk).** Serve both on one host and
+  split at the route: `/memory/*` → the server memory port (unchanged,
+  token-gated), everything else → the Inspector UI. Longest-prefix match wins,
+  so the API path keeps routing to the API:
+
+  ```yaml
+  frontend:
+    enabled: true
+    image:
+      repository: ghcr.io/memkeys/memkeys-inspector
+      tag: <pinned-tag>
+  httpRoute:
+    enabled: true
+    parentRefs:
+      - name: memkeys-gw      # dedicated memkeys-gw VIP (ISI-6334)
+        namespace: memkeys
+        sectionName: http
+    rules:
+      - matches:
+          - path: { type: PathPrefix, value: /memory }
+        backend: server
+      - matches:
+          - path: { type: PathPrefix, value: / }
+        backend: frontend
+  ```
+
+- **(a) Single Service.** Route all paths to the Inspector Service; the nginx
+  image reverse-proxies `/memory` to `frontend.memoryApiUpstream` (default the
+  in-cluster `<release>` Service on `memoryTransport.port`). Use when you do not
+  want a path split at the Gateway.
+
+Setting `backend: frontend` on a rule while `frontend.enabled=false` fails
+`helm template`/`helm install` fast.
 
 ## Single-container quickstart (no Kubernetes)
 
@@ -157,6 +205,7 @@ image instead of building locally.
 | `ConfigMap` | non-secret config: `MEMKEYS_DEPLOYMENT_ENV`, OTLP endpoint, service namespace, sampler ratio |
 | `Secret` | `MEMKEYS_DATABASE_URL` (only when `database.url` is set and no `existingSecret`); `MEMKEYS_RUN_TOKEN_SECRET` (only when `memoryTransport.runTokenSecret.value` is set) |
 | `ServiceAccount` | dedicated identity (token automount off by default) |
+| `Deployment` + `Service` (inspector) | optional read-only Inspector UI SPA — **`frontend.enabled=true` only** |
 | `HTTPRoute` | optional Gateway API ingress (disabled by default — **not** legacy Ingress) |
 
 ## Database wiring
