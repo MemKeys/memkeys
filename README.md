@@ -9,6 +9,8 @@
 
 The attribute-based memory server: facts keyed by agent-supplied attributes, temporal validity, graph+vector as derived views, open contract, pluggable backends (Grail plugin as reference).
 
+**Website:** <https://memkeys.github.io/memkeys-website/> — landing page, Why MemKeys, quickstart, and the published docs. The docs are authored in [`docs/`](docs/) in this repo and ingested at build time by the [website repo](https://github.com/MemKeys/memkeys-website); merges to `main` that touch `docs/` trigger an automatic republish.
+
 The name is final: **MemKeys** (camelCase) was locked in on 2026-10-14 after a full naming and collision sweep — it is no longer a working name. The brand kit (mark, wordmark lockups, palette, favicon set) lives in [`branding/`](branding/_unpacked/memkeys-branding/).
 
 **Keyed-first invariant:** attribute keys bound the candidate set before any vector/graph work; the keyed/temporal store is the single source of truth; graph and vector are derived, rebuildable projections.

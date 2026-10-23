@@ -175,6 +175,7 @@ kubectl describe mki memkeys-sample
 | `memoryTransport.runTokenSecret.name` / `.key` | — / `MEMKEYS_RUN_TOKEN_SECRET` | Secret holding the run-token issuer secret; required unless `allowInsecure` |
 | `memoryTransport.allowInsecure` | `false` | dev only: bind off-loopback with no verifier |
 | `resources` | chart defaults | server container requests/limits |
+| `imagePullSecrets` | — | list of `LocalObjectReference` names; secrets with registry credentials for pulling the server/worker image from private registries |
 
 Exactly one of `database.url` / `database.existingSecret` must be set, else
 the instance is marked `Degraded` and no pods roll out (fail-closed).

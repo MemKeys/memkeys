@@ -1,0 +1,43 @@
+name: Site republish
+
+# The site at https://memkeys.github.io/memkeys-website/ builds in the
+# dedicated MemKeys/memkeys-website repo, ingesting this repo's docs/ at
+# build time. That repo also polls docs/ on a schedule (drift check in its
+# Deploy workflow), so docs changes republish automatically either way.
+#
+# This workflow adds an immediate push-notification path: when docs change
+# on main, dispatch "docs-updated" to the website repo without waiting for
+# its next scheduled drift check. It needs a cross-repo token stored as the
+# WEBSITE_DISPATCH_TOKEN secret (Actions secrets admin) — until that secret
+# exists, runs skip cleanly and the website's drift poll covers republishes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Notify memkeys-website
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger docs-updated rebuild
+        env:
+          TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "WEBSITE_DISPATCH_TOKEN not configured — skipping immediate dispatch."
+            echo "The website repo's scheduled drift check will pick up this docs change."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/MemKeys/memkeys-website/dispatches" \
+            -d '{"event_type":"docs-updated","client_payload":{"source":"MemKeys/memkeys","ref":"'"${GITHUB_SHA}"'"}}'
+          echo "dispatched docs-updated for ${GITHUB_SHA}"
