@@ -9,6 +9,11 @@ import {
   toGraphData,
   nodeLabel,
   DEFAULT_LIMIT,
+  buildSearchBody,
+  DEFAULT_SEARCH_K,
+  hasSearchText,
+  hitToRecord,
+  isFeatureDisabled,
 } from './transform';
 import { FactRecord, FactsQuery, TraverseResult } from '../types/api';
 
@@ -139,5 +144,65 @@ describe('buildNodeId / encodeSegment', () => {
     expect(KIND_ID_SEGMENT.entity_agent).toBe('entity.agent');
     expect(KIND_ID_SEGMENT.entity_run).toBe('entity.run');
     expect(KIND_ID_SEGMENT.fact).toBe('fact');
+  });
+});
+
+// --- ISI-6581: Explore tab query transforms (POST /memory/search) ---
+
+describe('buildSearchBody', () => {
+  it('trims the query and stays keyless (no entity scope)', () => {
+    const b = buildSearchBody({ query: '  what did we decide about run tokens?  ', type: '', k: DEFAULT_SEARCH_K });
+    expect(b).toEqual({ query: 'what did we decide about run tokens?' });
+  });
+
+  it('maps the type filter to scope["fact.type"]', () => {
+    const b = buildSearchBody({ query: 'q', type: ' decision ', k: DEFAULT_SEARCH_K });
+    expect(b['scope']).toEqual({ 'fact.type': 'decision' });
+  });
+
+  it('emits k only when it differs from the server default', () => {
+    expect(buildSearchBody({ query: 'q', type: '', k: 25 })['k']).toBe(25);
+    expect(buildSearchBody({ query: 'q', type: '', k: DEFAULT_SEARCH_K })['k']).toBeUndefined();
+  });
+});
+
+describe('hasSearchText', () => {
+  it('requires non-blank text — the only Explore requirement', () => {
+    expect(hasSearchText({ query: '   ', type: '', k: 10 })).toBe(false);
+    expect(hasSearchText({ query: ' hi ', type: 'decision', k: 10 })).toBe(true);
+  });
+});
+
+describe('hitToRecord', () => {
+  it('flattens a semantic hit onto a FactRecord with entity_* fields', () => {
+    const r = hitToRecord({
+      'fact.id': 'f9',
+      score: 0.875,
+      'fact.type': 'decision',
+      'fact.subject': 'Use run-token JWTs',
+      'fact.body': 'decided: run tokens gate /memory/*',
+      entity: { project: 'memkeys', issue: 'ISI-6541' },
+      event_time: '2026-10-20T00:00:00Z',
+      provenance: 'agent-a',
+      via: 'semantic',
+    });
+    expect(r.id).toBe('f9');
+    expect(r.fact_type).toBe('decision');
+    expect(r.subject).toBe('Use run-token JWTs');
+    expect(r.entity_project).toBe('memkeys');
+    expect(r.entity_issue).toBe('ISI-6541');
+    expect(r.entity_agent).toBeNull();
+    expect(r.ingested_at).toBe('2026-10-20T00:00:00Z');
+    expect(r.keyed).toBe(true);
+    expect(r.provenance_principal).toBe('agent-a');
+  });
+});
+
+describe('isFeatureDisabled', () => {
+  it('matches the 501 feature_disabled in both code spellings', () => {
+    expect(isFeatureDisabled({ error: 'semantic module disabled', code: 'feature_disabled' })).toBe(true);
+    expect(isFeatureDisabled({ error: 'x', code: '501' })).toBe(true);
+    expect(isFeatureDisabled({ error: 'x', code: 'invalid_argument' })).toBe(false);
+    expect(isFeatureDisabled({ error: 'x' })).toBe(false);
   });
 });
