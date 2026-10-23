@@ -6,3 +6,7 @@ branding
 docs
 *.md
 .dockerignore
+# Keep the uibuild stage deterministic: dependencies come from `npm ci`
+# against the lockfile, the shipped bundle from the in-image `vite build`.
+frontend/node_modules
+frontend/dist

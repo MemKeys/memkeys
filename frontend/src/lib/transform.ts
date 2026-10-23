@@ -15,6 +15,40 @@ import {
 export const DEFAULT_LIMIT = 100;
 
 /**
+ * The id-segment spelling of each node kind (graph.rs `NodeKind::as_str`).
+ * Entity kinds use a DOT in ids (`entity.project`) even though the wire enum
+ * and the kind dropdown are snake_case (`entity_project`) — the mismatch that
+ * made hand-built ids return `not_found`.
+ */
+export const KIND_ID_SEGMENT: Record<NodeKind, string> = {
+  fact: 'fact',
+  entity_project: 'entity.project',
+  entity_issue: 'entity.issue',
+  entity_pr: 'entity.pr',
+  entity_agent: 'entity.agent',
+  entity_run: 'entity.run',
+  a2a_hint: 'a2a_hint',
+};
+
+/** Percent-encode one node-id segment for `|` and `%` (graph.rs `encode_segment`). */
+export function encodeSegment(s: string): string {
+  // split/join over replaceAll: the tsconfig lib target predates ES2021.
+  return s.split('%').join('%25').split('|').join('%7C');
+}
+
+/**
+ * Build the tenant-qualified opaque start id `"{tenant}|{kind}|{value}"`
+ * client-side (graph.rs `node_id`), so users never hand-assemble it.
+ */
+export function buildNodeId(tenant: string, kind: NodeKind, value: string): string {
+  return [
+    encodeSegment(tenant.trim()),
+    KIND_ID_SEGMENT[kind],
+    encodeSegment(value.trim()),
+  ].join('|');
+}
+
+/**
  * Flatten a {@link FactsQuery} into the flat query-param map the server's
  * `build_keyed_query` expects (`entity.project=…`, `type=…`, `valid=…`, …).
  * Empty/blank entity values are dropped. `limit` is emitted only when it

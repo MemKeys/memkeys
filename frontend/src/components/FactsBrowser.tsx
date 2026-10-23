@@ -8,6 +8,19 @@ import ErrorBanner from './ErrorBanner';
 // Canonical §5.1 fact types for the type filter.
 const FACT_TYPES = ['decision', 'outcome', 'observation', 'learning', 'context'];
 
+// One concrete placeholder per entity key (values verified live on
+// k8squad-test) so the required exact-match values are discoverable in the
+// UI itself - the board test (ISI-6395 B3) showed users guessing blind.
+const KEY_PLACEHOLDERS: Record<EntityKeyName, string> = {
+  project: 'e.g. memkeys',
+  issue: 'e.g. ISI-6541',
+  pr: 'e.g. 51',
+  agent: 'e.g. backup_Architect',
+  run: 'e.g. run id',
+  thread: 'e.g. thread id',
+  service: 'e.g. service name',
+};
+
 const emptyQuery: FactsQuery = {
   keys: {},
   type: '',
@@ -32,9 +45,9 @@ export default function FactsBrowser() {
   const setKey = (name: EntityKeyName, value: string) =>
     setQuery((q) => ({ ...q, keys: { ...q.keys, [name]: value } }));
 
-  async function search(e: React.FormEvent) {
-    e.preventDefault();
-    if (!hasEntityKey(query)) {
+  /** Shared query runner used by both the form submit and the example buttons. */
+  async function doSearch(q: FactsQuery) {
+    if (!hasEntityKey(q)) {
       setError({ error: 'Provide at least one entity key (keys are ANDed).' });
       return;
     }
@@ -42,7 +55,7 @@ export default function FactsBrowser() {
     setError(null);
     setSelected(null);
     try {
-      const res = await factsAPI.fetchFacts(query, auth);
+      const res = await factsAPI.fetchFacts(q, auth);
       setFacts(res.facts);
     } catch (err) {
       setError(err as APIError);
@@ -50,6 +63,19 @@ export default function FactsBrowser() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function search(e: React.FormEvent) {
+    e.preventDefault();
+    await doSearch(query);
+  }
+
+  /** Fill the form with a known-good example query and run it immediately, so
+   * a fresh visitor sees data with one click instead of guessing key values. */
+  async function runExample(keys: Partial<Record<EntityKeyName, string>>) {
+    const q: FactsQuery = { ...emptyQuery, keys };
+    setQuery(q);
+    await doSearch(q);
   }
 
   return (
@@ -61,6 +87,7 @@ export default function FactsBrowser() {
               {name}
               <input
                 type="text"
+                placeholder={KEY_PLACEHOLDERS[name]}
                 value={query.keys[name] ?? ''}
                 onChange={(e) => setKey(name, e.target.value)}
               />
@@ -117,6 +144,19 @@ export default function FactsBrowser() {
           </button>
         </div>
       </form>
+
+      <div className="examples-row">
+        <span>examples:</span>
+        <button
+          type="button"
+          className="link-button"
+          disabled={loading}
+          onClick={() => runExample({ project: 'memkeys' })}
+        >
+          project=memkeys
+        </button>
+        <span className="hint">exact entity values required · tenant &amp; token: header bar</span>
+      </div>
 
       {error && <ErrorBanner error={error} />}
 

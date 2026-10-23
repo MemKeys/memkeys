@@ -14,8 +14,10 @@ image:
   # The chart default repo (ghcr.io/memkeys/memkeys) does not exist; the
   # published server image is ghcr.io/memkeys/memkeys-server (ISI-6304).
   repository: ghcr.io/memkeys/memkeys-server
-  # Pinned to the most recent published main build for reproducibility.
-  tag: sha-8bbb7b3
+  # Pinned to a published main build for reproducibility. sha-ce85160 is
+  # the first main image with the ISI-6541 Inspector UX affordances
+  # (graph start picker + facts examples, merged in PR #56).
+  tag: sha-ce85160
   pullPolicy: IfNotPresent
 
 # Point the server at the bundled pgvector Postgres via the pre-provisioned secret.
@@ -44,9 +46,25 @@ otel:
 extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
+  # Bound the DB pool: the 2-day-old sha-8bbb7b3 pod had leaked enough
+  # connections to saturate postgres max_connections and PoolTimedOut the
+  # rolling replacement (ISI-6395). 10 is ample for the single-node dogfood.
+  - name: MEMKEYS_PG_MAX_CONNECTIONS
+    value: "10"
 
-# Expose /memory/* through a dedicated kgateway Gateway (exercises the HTTPRoute
-# path). backendRef targets the memory port (3000) automatically.
+# Inspector UI (ISI-6476): NO frontend component — the server image bundles
+# the built SPA (root Dockerfile uibuild stage → MEMKEYS_UI_DIR) and serves
+# it at / on the memory-transport listener. nginx-free per the board ruling
+# on ISI-6395 ("can we create a website without nginx?"). The chart's
+# frontend.* values stay at their defaults (disabled).
+#
+# image.tag is pinned to sha-ce85160 — the main build with the ISI-6541
+# Inspector UX fix (PR #56 merge), so a plain `helm upgrade` serves it.
+
+# Expose the server (UI + /memory/*) through a dedicated kgateway Gateway
+# (exercises the HTTPRoute path). backendRef targets the memory port (3000)
+# automatically; the chart-default rules send all paths there — the server
+# itself splits /memory/* (token-gated API) from everything else (SPA).
 #
 # NOTE: the shared `ksquad` Gateway (k8squad-system) rejects cross-namespace routes
 # (listener allowedRoutes from: Same -> NotAllowedByListeners), so the deploy uses a
@@ -58,5 +76,7 @@ httpRoute:
     - name: memkeys-gw
       namespace: memkeys
       sectionName: http
-  hostnames:
-    - memkeys.k8squad-test.internal
+  # No hostname pin: the dedicated memkeys-gw VIP has no LAN DNS for
+  # *.internal yet, so the route matches any Host — http://10.0.0.220/ works
+  # from any LAN browser with zero DNS setup. Re-pin a hostname when TLS
+  # lands (e.g. memkeys.k8squad-test.internal).
