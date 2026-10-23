@@ -3,8 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 // GitHub Pages project-page deployment: https://memkeys.github.io/memkeys/
-// (domain deferred to *.github.io until memkeys.dev/.io is registered — ISI-5919).
-// Override via the SITE / BASE env vars when a custom domain lands.
+// (domain deferred to *.github.io until a custom domain lands).
+// Override via the SITE / BASE env vars when a custom domain arrives.
 const site = process.env.SITE ?? 'https://memkeys.github.io';
 const base = process.env.BASE ?? '/memkeys';
 const ogImage = `${site}${base.replace(/\/$/, '')}/og.png`;
@@ -28,7 +28,7 @@ export default defineConfig({
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/MemKeys/memkeys' },
       ],
-      // SEO metadata from landing copy (ISI-6400)
+      // SEO metadata
       head: [
         { tag: 'meta', attrs: { name: 'theme-color', content: '#17356F' } },
         { tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
@@ -49,7 +49,7 @@ export default defineConfig({
         {
           tag: 'script',
           attrs: { type: 'application/ld+json' },
-          innerHTML: JSON.stringify({
+          content: JSON.stringify({
             "@context": "https://schema.org",
             "@type": "SoftwareApplication",
             "name": "MemKeys",
@@ -64,11 +64,43 @@ export default defineConfig({
         // Canonical URL
         { tag: 'link', attrs: { rel: 'canonical', href: site } }
       ],
-      // Sidebar is left to Starlight's automatic generation from the synced
-      // docs/ tree for now. The content milestone (M1 · ISI-6397) curates the
-      // final information architecture; the assemble milestone (M5 · ISI-6402)
-      // wires the landing + nav.
-      //
+      // Curated information architecture (the sync allowlist + hand-authored
+      // pages define what exists; this sidebar defines the story):
+      //   header: Why MemKeys · Quickstart · Docs  (+ GitHub via social)
+      //   docs sidebar: Overview → Guides → Reference
+      // Why/Quickstart are splash pages listed as sidebar links so they also
+      // surface in the header; the landing (index) page is not listed.
+      sidebar: [
+        { label: 'Why MemKeys', link: '/why/' },
+        { label: 'Quickstart', link: '/quickstart/' },
+        {
+          label: 'Docs',
+          items: [
+            {
+              label: 'Overview',
+              items: [
+                { label: 'What is MemKeys', link: '/what-is-memkeys/' },
+                { label: 'Architecture', link: '/architecture/' },
+              ],
+            },
+            {
+              label: 'Guides',
+              items: [
+                { label: 'Connect your agents', link: '/connect-your-agents/' },
+                { label: 'MCP transport', link: '/agent-mcp-transport/' },
+                { label: 'Kubernetes: Helm + operator', link: '/k8s-operator/' },
+              ],
+            },
+            {
+              label: 'Reference',
+              items: [
+                { label: 'Retrieval contract', link: '/retrieval-contract/' },
+                { label: 'Configuration', link: '/configuration/' },
+              ],
+            },
+          ],
+        },
+      ],
       // Edit links are set per-page in sync-docs.mjs so they point at the real
       // source file under repo-root docs/, not the generated copy.
     }),
