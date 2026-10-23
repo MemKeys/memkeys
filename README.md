@@ -11,6 +11,8 @@ The attribute-based memory server: facts keyed by agent-supplied attributes, tem
 
 The name is final: **MemKeys** (camelCase) was locked in on 2026-10-14 after a full naming and collision sweep — it is no longer a working name. The brand kit (mark, wordmark lockups, palette, favicon set) lives in [`branding/`](branding/_unpacked/memkeys-branding/).
 
+**Website & docs:** <https://memkeys.github.io/memkeys-website/> — landing page plus the published docs from this repo's [`docs/`](docs/) tree (what MemKeys is, architecture, configuration, retrieval contract, MCP transport, Kubernetes, and verified [connect-your-agents recipes](https://memkeys.github.io/memkeys-website/docs/connect-your-agents/)). CI republishes the site when `docs/` changes on `main`.
+
 **Keyed-first invariant:** attribute keys bound the candidate set before any vector/graph work; the keyed/temporal store is the single source of truth; graph and vector are derived, rebuildable projections.
 
 ## MemKeys is not MemPalace
