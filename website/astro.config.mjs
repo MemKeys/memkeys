@@ -58,12 +58,14 @@ const headerNav = [
   { href: 'https://github.com/MemKeys/memkeys', label: 'GitHub' },
 ];
 
-// IBM Plex Sans — the locked brand-kit face, loaded by src/styles/brand.css
-// via @fontsource-variable/ibm-plex-sans. The woff2 files are emitted under a
-// stable, hash-free name (see the vite config below) so this preload can
-// reference them; the latin variable file covers wght 100–700.
+// IBM Plex Sans — the locked brand-kit face, self-hosted from
+// branding/_fonts/IBMPlexSans.ttf as static Regular (400) / Bold (700)
+// instances under src/assets/fonts/ (SIL OFL 1.1) and loaded by
+// src/styles/brand.css via @font-face. The woff2 files are emitted under
+// stable, hash-free names (see the vite config below) so this preload can
+// reference the body-weight file.
 const fontPreload = withBase(
-  '/assets/fonts/ibm-plex-sans-latin-wght-normal.woff2',
+  '/assets/fonts/IBMPlexSans-Regular.woff2',
 );
 
 // Baseline styles for the injected header nav. The brand look (palette,

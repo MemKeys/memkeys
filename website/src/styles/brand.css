@@ -1,20 +1,40 @@
-/* MemKeys brand theme for Starlight — maps the locked M3 brand kit
- * (branding/_unpacked/memkeys-branding/) onto Starlight's theme tokens.
+/* MemKeys brand theme for Starlight — maps the locked brand kit (lockups,
+ * palette, IBM Plex Sans) onto Starlight's theme tokens.
  *
- * Palette (kit README + BRAND-CONCEPTS):
- *   Ink        #17356F  deep cobalt-blue — trustworthy, technical
- *   Blue       #3E6FD9  gradient ring end / interactive accent
- *   Accent     #F7C948  golden yellow — "the one keyed thing" (used sparingly)
- *   Ground     #0B1830  dark ground
- *   Reverse    #EAF1FF  light ink on dark grounds
- *   Paper      #F7F4EC  optional light ground
+ * Palette (locked):
+ *   Ink     #17356F  deep cobalt — headings on light, structural accents
+ *   Blue    #3E6FD9  interactive accent — links, active states, borders
+ *   Accent  #F7C948  gold — the primary CTA and keyhole accents only
+ *   Ground  #0B1830  dark-first background
+ *   Reverse #EAF1FF  dark-theme text
+ *   Paper   #F7F4EC  light-theme background
  *
- * Type: IBM Plex Sans (the locked wordmark face, SIL OFL), variable weight,
- * loaded via @fontsource-variable. Headings and UI in Plex; gold is reserved
- * for the primary CTA and keyhole accents — never the wordmark letters.
+ * Type: IBM Plex Sans (SIL OFL), self-hosted from the brand kit. Body runs
+ * Regular (400); headings run Bold (700). Gold is reserved for the primary
+ * CTA and the keyhole accents — never for headings, body text, or rules.
  */
 
-@import '@fontsource-variable/ibm-plex-sans';
+/* ---------------------------------------------------------------------------
+ * Type — IBM Plex Sans (SIL OFL), self-hosted from the brand kit. The build
+ * emits these under stable paths: /assets/fonts/IBMPlexSans-Regular.woff2
+ * and /assets/fonts/IBMPlexSans-Bold.woff2.
+ * ------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  src: url('../assets/fonts/IBMPlexSans-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  src: url('../assets/fonts/IBMPlexSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
   --mk-ink: #17356f;
@@ -24,67 +44,75 @@
   --mk-reverse: #eaf1ff;
   --mk-paper: #f7f4ec;
 
-  /* Type: the wordmark face everywhere; system monospace for code. */
-  --sl-font: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
-  --sl-font-heading: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --sl-font: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-heading: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   --sl-font-mono: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
 }
 
-/* Dark theme (default): accent scale derived from the brand blue. */
+/* ---------------------------------------------------------------------------
+ * Palette — dark-first on Ground, light theme on Paper. Tints and shades
+ * below are mixes of the locked colors only.
+ * ------------------------------------------------------------------------- */
+
+/* Dark theme (default). */
 :root {
+  --sl-color-white: var(--mk-reverse);
+  --sl-color-text-accent: #c3d6ff;
+
   --sl-color-accent-low: #15294d;
-  --sl-color-accent: #3e6fd9;
+  --sl-color-accent: var(--mk-blue);
   --sl-color-accent-high: #c3d6ff;
 
   --sl-color-bg: var(--mk-ground);
   --sl-color-bg-nav: #0d1d38;
   --sl-color-bg-sidebar: #0d1d38;
+  --sl-color-bg-inline-code: color-mix(in srgb, var(--mk-blue) 16%, var(--mk-ground));
+
+  --sl-color-hairline: color-mix(in srgb, var(--mk-blue) 24%, transparent);
+  --sl-color-hairline-light: color-mix(in srgb, var(--mk-blue) 14%, transparent);
+  --sl-color-hairline-shade: var(--mk-ground);
+  --sl-color-black: var(--mk-ground);
+
+  /* Blue-tinted neutral ramp (replaces Starlight's neutral grays). */
+  --sl-color-gray-1: color-mix(in srgb, var(--mk-reverse) 94%, var(--mk-ground));
+  --sl-color-gray-2: color-mix(in srgb, var(--mk-reverse) 78%, var(--mk-ground));
+  --sl-color-gray-3: color-mix(in srgb, var(--mk-reverse) 60%, var(--mk-ground));
+  --sl-color-gray-4: color-mix(in srgb, var(--mk-reverse) 44%, var(--mk-ground));
+  --sl-color-gray-5: color-mix(in srgb, var(--mk-reverse) 30%, var(--mk-ground));
+  --sl-color-gray-6: color-mix(in srgb, var(--mk-reverse) 17%, var(--mk-ground));
 }
 
-/* Light theme: deepen the accent toward the brand ink for contrast on paper. */
+/* Light theme — Ink headings and deepened Blue accents on Paper. */
 :root[data-theme='light'] {
-  --sl-color-accent-low: #c3d6ff;
+  --sl-color-white: var(--mk-ink);
+  --sl-color-text-accent: #2f5cc0;
+
+  --sl-color-accent-low: #dbe5fa;
   --sl-color-accent: #2f5cc0;
   --sl-color-accent-high: #13294d;
 
   --sl-color-bg: var(--mk-paper);
+  --sl-color-bg-nav: color-mix(in srgb, var(--mk-ink) 5%, var(--mk-paper));
+  --sl-color-bg-sidebar: color-mix(in srgb, var(--mk-ink) 5%, var(--mk-paper));
+  --sl-color-bg-inline-code: color-mix(in srgb, var(--mk-blue) 9%, var(--mk-paper));
+
+  --sl-color-hairline: color-mix(in srgb, var(--mk-blue) 28%, transparent);
+  --sl-color-hairline-light: color-mix(in srgb, var(--mk-blue) 16%, transparent);
+  --sl-color-hairline-shade: var(--mk-paper);
+  --sl-color-black: var(--mk-paper);
+
+  /* Ink-tinted neutral ramp on Paper. */
+  --sl-color-gray-1: color-mix(in srgb, var(--mk-ink) 88%, var(--mk-paper));
+  --sl-color-gray-2: color-mix(in srgb, var(--mk-ink) 76%, var(--mk-paper));
+  --sl-color-gray-3: color-mix(in srgb, var(--mk-ink) 58%, var(--mk-paper));
+  --sl-color-gray-4: color-mix(in srgb, var(--mk-ink) 42%, var(--mk-paper));
+  --sl-color-gray-5: color-mix(in srgb, var(--mk-ink) 26%, var(--mk-paper));
+  --sl-color-gray-6: color-mix(in srgb, var(--mk-ink) 12%, var(--mk-paper));
+  --sl-color-gray-7: color-mix(in srgb, var(--mk-ink) 5%, var(--mk-paper));
 }
 
 /* ---------------------------------------------------------------------------
- * Hero
- * ------------------------------------------------------------------------- */
-
-/* The golden accent marks the single keyed thing — use it only for the hero's
- * primary call to action so it stays special, per the brand brief. */
-.hero a.sl-link-button.primary {
-  background: var(--mk-accent);
-  border-color: var(--mk-accent);
-  color: var(--mk-ground);
-  font-weight: 600;
-}
-.hero a.sl-link-button.primary:hover {
-  background: #ffd866;
-  border-color: #ffd866;
-}
-
-.hero tagline,
-.hero .tagline {
-  letter-spacing: 0.14em;
-}
-
-/* Secondary hero actions: quiet ghost buttons, not a second shout. */
-.hero a.sl-link-button:not(.primary) {
-  border-color: color-mix(in srgb, currentColor 35%, transparent);
-  color: inherit;
-  font-weight: 500;
-}
-.hero a.sl-link-button:not(.primary):hover {
-  border-color: var(--sl-color-accent);
-  color: var(--sl-color-accent);
-}
-
-/* ---------------------------------------------------------------------------
- * Typography
+ * Type scale — headings in Plex Sans Bold with tight tracking.
  * ------------------------------------------------------------------------- */
 
 h1,
@@ -101,65 +129,263 @@ h4 {
   border-bottom: 1px solid color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
 }
 
-/* Pull quotes / blockquotes read as catalog cards. */
-.sl-markdown-content blockquote {
-  border-inline-start: 3px solid var(--mk-accent);
-  background: color-mix(in srgb, var(--sl-color-accent-low) 30%, transparent);
-  border-radius: 0.5rem;
-  padding: 0.9rem 1.2rem;
-  font-style: italic;
+::selection {
+  background: color-mix(in srgb, var(--mk-blue) 45%, transparent);
 }
 
 /* ---------------------------------------------------------------------------
- * Components
+ * Hero — the keyhole mark on Ground with a quiet Blue glow behind it.
  * ------------------------------------------------------------------------- */
 
-/* Cards: thin brand-ink borders, gentle lift on hover. */
-sl-card,
-.sl-card {
-  border: 1px solid color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
-  border-radius: 0.75rem;
-  transition: border-color 120ms ease, transform 120ms ease;
+.hero {
+  background: radial-gradient(
+    ellipse 60% 50% at 50% 45%,
+    color-mix(in srgb, var(--mk-blue) 16%, transparent),
+    transparent 70%
+  );
 }
-sl-card:hover,
-.sl-card:hover {
+
+.hero > img {
+  width: min(80%, 24rem);
+}
+
+@media (min-width: 50rem) {
+  .hero > img {
+    width: min(100%, 26rem);
+  }
+}
+
+.hero .tagline {
+  color: var(--sl-color-text-accent);
+  font-size: var(--sl-text-sm);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}
+
+.hero h1 {
+  letter-spacing: -0.02em;
+}
+
+/* ---------------------------------------------------------------------------
+ * Buttons — gold is the one primary CTA; every other action stays ghost.
+ * ------------------------------------------------------------------------- */
+
+.sl-link-button.primary {
+  background: var(--mk-accent);
+  border-color: var(--mk-accent);
+  color: var(--mk-ground);
+  font-weight: 600;
+}
+
+.sl-link-button.primary:hover,
+.sl-link-button.primary:focus-visible {
+  background: #ffd866;
+  border-color: #ffd866;
+  color: var(--mk-ground);
+}
+
+.sl-link-button.secondary {
+  border-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+  color: var(--sl-color-text);
+}
+
+.sl-link-button.secondary:hover,
+.sl-link-button.secondary:focus-visible {
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-text-accent);
+}
+
+.sl-link-button.minimal {
+  color: var(--sl-color-text);
+}
+
+.sl-link-button.minimal:hover,
+.sl-link-button.minimal:focus-visible {
+  color: var(--sl-color-text-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Cards — a quiet Blue-tinted panel with Ink/Blue borders; the icon chip
+ * carries the Blue. Overrides Starlight's per-card rainbow borders.
+ * ------------------------------------------------------------------------- */
+
+.card {
+  --sl-card-border: color-mix(in srgb, var(--mk-blue) 60%, var(--mk-ink));
+  --sl-card-bg: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
+  background-color: color-mix(in srgb, var(--mk-blue) 7%, transparent);
+  border: 1px solid var(--sl-card-border);
+  border-radius: 0.75rem;
+  transition: border-color 120ms ease;
+}
+
+.card:hover {
   border-color: var(--sl-color-accent);
 }
+
+.card .icon {
+  color: var(--sl-color-accent-high);
+}
+
+.sl-link-card {
+  border: 1px solid color-mix(in srgb, var(--mk-blue) 35%, transparent);
+  background-color: color-mix(in srgb, var(--mk-blue) 6%, transparent);
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
+.sl-link-card:hover {
+  border-color: var(--sl-color-accent);
+  box-shadow: var(--sl-shadow-md);
+  transform: translateY(-2px);
+}
+
+.sl-link-card .icon {
+  color: var(--sl-color-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Content — links, pull quotes, code, tables, admonitions.
+ * ------------------------------------------------------------------------- */
 
 /* Links: brand blue, underlined on hover — quiet confidence. */
 .sl-markdown-content a:not(.sl-link-button) {
   text-decoration: none;
 }
+
 .sl-markdown-content a:not(.sl-link-button):hover {
   text-decoration: underline;
   text-underline-offset: 3px;
 }
 
-/* Code blocks: grounded panel with a brand-ink border. */
-.sl-markdown-content pre {
-  border: 1px solid color-mix(in srgb, var(--sl-color-accent) 22%, transparent);
+/* Pull quotes read as quiet catalog cards — a Blue rule, never gold. */
+.sl-markdown-content blockquote {
+  border-inline-start: 3px solid var(--sl-color-accent);
+  background: color-mix(in srgb, var(--sl-color-accent-low) 35%, transparent);
   border-radius: 0.5rem;
+  padding: 0.9rem 1.2rem;
+  font-style: italic;
+}
+
+/* Code blocks: grounded panel with a brand-blue hairline. */
+.sl-markdown-content pre {
+  border: 1px solid color-mix(in srgb, var(--mk-blue) 30%, transparent);
+  border-radius: 0.5rem;
+  box-shadow: var(--sl-shadow-sm);
+}
+
+.sl-markdown-content :not(pre) > code {
+  border-radius: 0.25rem;
 }
 
 /* Tables: header row carries the accent-low surface. */
-.sl-markdown-content table thead {
-  background: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
-}
 .sl-markdown-content table {
   border: 1px solid color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
   border-radius: 0.5rem;
   border-collapse: separate;
   border-spacing: 0;
 }
+
+.sl-markdown-content table thead {
+  background: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
+}
+
+.sl-markdown-content table th {
+  font-weight: 600;
+}
+
 .sl-markdown-content table th,
 .sl-markdown-content table td {
   border-bottom: 1px solid color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
 }
 
-/* Sidebar / nav active states stay in the brand blue. */
-.sidebar-group-item[aria-current='page'],
-.sidebar-item-link[aria-current='page'] {
-  color: var(--sl-color-accent);
+/* Admonitions: one brand panel surface; note/tip in the Blue family,
+ * caution/danger keep their semantic hues for the accent only. */
+.starlight-aside {
+  border-radius: 0.5rem;
+  background-color: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
+}
+
+.starlight-aside--note,
+.starlight-aside--tip {
+  --sl-color-asides-border: var(--mk-blue);
+  --sl-color-asides-text-accent: var(--sl-color-accent-high);
+}
+
+.starlight-aside__title {
+  font-weight: 700;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sidebar + header nav — active states in Blue.
+ * ------------------------------------------------------------------------- */
+
+.sidebar a[aria-current='page'] {
+  background-color: color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+  color: var(--sl-color-accent-high);
+}
+
+.mk-header-nav a[aria-current='page'] {
+  box-shadow: inset 0 -2px 0 var(--sl-color-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Footer — quiet brand hairline, license line, pagination cards in Blue.
+ * ------------------------------------------------------------------------- */
+
+footer {
+  border-top: 1px solid var(--sl-color-hairline);
+}
+
+footer .meta {
+  color: var(--sl-color-gray-3);
+}
+
+/* The footer carries the mark, the tagline, and the license; the GitHub link
+ * lives in the header social icons. */
+footer .meta::before {
+  content: 'MemKeys — keyed memory for AI agents';
+  display: inline-flex;
+  align-items: center;
+  padding-inline-start: 1.5rem;
+  background: url('../assets/hero-mark.svg') left center / 1.125rem 1.125rem
+    no-repeat;
+  font-size: var(--sl-text-xs);
+}
+
+footer .meta::after {
+  content: 'Apache-2.0';
+  margin-inline-start: auto;
+  font-size: var(--sl-text-xs);
+}
+
+.pagination-links a {
+  border-color: color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
+}
+
+.pagination-links a:hover {
+  border-color: var(--sl-color-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Steps — numbered markers in Blue, keyed like the catalog.
+ * ------------------------------------------------------------------------- */
+
+.sl-steps > li::before {
+  background-color: var(--sl-color-accent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sl-color-accent) 55%, transparent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Search — the Pagefind UI inherits the brand tokens.
+ * ------------------------------------------------------------------------- */
+
+.pagefind-ui {
+  --pagefind-ui-primary: var(--sl-color-accent);
+  --pagefind-ui-text: var(--sl-color-text);
+  --pagefind-ui-background: var(--sl-color-bg);
+  --pagefind-ui-border: var(--sl-color-hairline);
+  --pagefind-ui-border-radius: 0.5rem;
+  --pagefind-ui-tag: var(--sl-color-bg-inline-code);
 }
 
 /* Focus visibility: brand-consistent ring. */
