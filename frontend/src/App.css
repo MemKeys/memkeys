@@ -92,6 +92,18 @@
   font-style: italic;
 }
 
+/* --- examples row (ISI-6541: one-click known-good queries) --- */
+.examples-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* --- errors / status --- */
 .error-banner {
   background: rgba(255, 107, 107, 0.12);

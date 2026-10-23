@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildNodeId,
   buildQueryParams,
+  encodeSegment,
   hasEntityKey,
+  KIND_ID_SEGMENT,
   recordEntityKeys,
   toGraphData,
   nodeLabel,
@@ -111,5 +114,30 @@ describe('nodeLabel', () => {
     ).toBe('short body');
     const topo = nodeLabel({ kind: 'entity_issue', id: 'a'.repeat(30), unhydratable: false, record: null });
     expect(topo.startsWith('…')).toBe(true);
+  });
+});
+
+describe('buildNodeId / encodeSegment', () => {
+  it('builds tenant|kind|value with the dotted id spelling for entity kinds', () => {
+    expect(buildNodeId('615e9564', 'entity_project', 'memkeys')).toBe(
+      '615e9564|entity.project|memkeys',
+    );
+  });
+
+  it('percent-encodes % and | inside segments', () => {
+    expect(encodeSegment('a|b%c')).toBe('a%7Cb%25c');
+    expect(buildNodeId('a|b', 'fact', 'x%y')).toBe('a%7Cb|fact|x%25y');
+  });
+
+  it('trims tenant and value before encoding', () => {
+    expect(buildNodeId('  t  ', 'fact', ' v ')).toBe('t|fact|v');
+  });
+
+  it('keeps the snake_case wire kinds distinct from the dotted id segments', () => {
+    expect(KIND_ID_SEGMENT.entity_issue).toBe('entity.issue');
+    expect(KIND_ID_SEGMENT.entity_pr).toBe('entity.pr');
+    expect(KIND_ID_SEGMENT.entity_agent).toBe('entity.agent');
+    expect(KIND_ID_SEGMENT.entity_run).toBe('entity.run');
+    expect(KIND_ID_SEGMENT.fact).toBe('fact');
   });
 });
