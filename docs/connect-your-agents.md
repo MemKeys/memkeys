@@ -135,8 +135,8 @@ pass identity through the environment):
 #!/bin/sh
 export PATH="$HOME/.local/bin:$PATH"          # kubectl lives here on some hosts
 export KUBECONFIG=/path/to/cluster.kubeconfig
-export PAPERCLIP_COMPANY_ID=my-tenant          # -> company_id claim (tenant floor)
-export PAPERCLIP_AGENT_ID=my-agent-id          # -> sub claim (entity.agent)
+export MEMKEYS_TENANT_ID=my-tenant             # -> company_id claim (tenant floor)
+export MEMKEYS_AGENT_ID=my-agent-id            # -> sub claim (entity.agent)
 exec bash /path/to/memkeys-mcp-launcher.sh
 \`\`\`
 
@@ -322,14 +322,14 @@ the child process — e.g. the official TypeScript
   its own all-in-one server; keep the randomized-alt-ports pattern until
   `MEMKEYS_ROLE=mcp` (bind-less MCP-only mode) ships.
 
-## Appendix: how each recipe was verified (2026-10-22/23, ISI-6401)
+## Appendix: how each recipe was verified (2026-10-22/23)
 
 | Recipe | Result | Evidence |
 |---|---|---|
 | Raw JSON-RPC driver | **verified** — initialize, tools/list, store (`fact_id` returned), fetch, traverse (hydrated `entity_fact` edge), search (score 0.60) | in-pod run on the `k8squad-test` cluster, tenant `isi6401-verify`, live Postgres |
 | Claude Code 2.1.239 | **verified** — `claude mcp list` health check `✔ Connected` through the launcher | registered via `claude mcp add-json` on the agent host, same cluster |
 | kagent | **verified** — control-plane: `MCPServer/memkeys-mcp` Ready, `Agent/memkeys-demo` READY/ACCEPTED, pod 1/1; session-level (2026-10-23): full stdio handshake through the kagent-hosted pod — initialize, tools/list, store (`fact_id f70e0f87…`), fetch, traverse (`entity_fact` edge) | applied live on the `memory-benchmark` cluster with the real memkeys image |
-| goose 1.55.0 | **documented** — config-registered but tools did not attach in a non-interactive session; provider (Ollama) reachable, model responded | attempt log in the ISI-6401 run; re-verify with `goose configure` |
+| goose 1.55.0 | **documented** — config-registered but tools did not attach in a non-interactive session; provider (Ollama) reachable, model responded | attempt log in the verification run; re-verify with `goose configure` |
 
-Raw transcripts are in the ISI-6401 run log; the driver and manifests are
+Raw transcripts are in the verification run log; the driver and manifests are
 reproducible from this page verbatim.
