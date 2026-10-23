@@ -1,97 +1,114 @@
-# Agent MCP transport + per-run token policy (ISI-6337)
+# MCP transport
 
-Status: **ACCEPTED** (Architect, 2026-10-20) · Parent: ISI-6328 Ph2 cutover ·
-Owner split: Architect owns this recipe (MemKeys config); ProxOps owns the
-agent/cluster wiring and the canary→fleet rollout.
+MemKeys speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+as **newline-delimited JSON-RPC 2.0 over stdio**. Any MCP-capable client —
+Claude Code, Claude Desktop, goose, kagent, or your own — can use MemKeys as
+its memory server with zero glue code.
 
-This is the blessed, fleet-safe recipe for pointing Claude Code agents at
-MemKeys over MCP, replacing the `mempalace` MCP server in `~/.claude.json`.
+There is no thin remote connector: the MCP server *is* the `memkeys-server`
+binary. Depending on its role, the same process either serves MCP alongside
+the HTTP listeners (`MEMKEYS_ROLE` unset — the all-in-one default) or serves
+MCP **only** (`MEMKEYS_ROLE=mcp`) — no HTTP binds, no boot reconcile, no
+maintenance loop. The MCP-only role exists so per-agent sessions can share
+one Postgres-backed deployment without colliding on ports or double-running
+the projection workers.
 
----
+## Wire protocol
 
-## 1. Decision — transport shape
+- One JSON-RPC request per line on stdin, one response per line on stdout.
+- Methods: `initialize`, `tools/list`, `tools/call`. Unknown methods return
+  `-32601`.
+- Requests without an `id` are JSON-RPC **notifications** and get no reply
+  (e.g. `notifications/initialized`).
+- `initialize` returns `protocolVersion: "2024-11-05"`, `serverInfo:
+  {name: "memkeys", version: …}`, `capabilities: {tools: {}}`.
+- Errored tool calls come back as a *successful* JSON-RPC reply with
+  `"isError": true` and the standard error body (`code` / `retriable` /
+  `detail`) as the content text — parity with the HTTP error surface, so
+  clients need one error path for both transports.
+- Stdout carries only JSON-RPC. Server logs and traces never target stdout.
 
-ProxOps proved a working remote MCP stdio path (ISI-6333): `kubectl exec` into
-the primary MemKeys pod and spawn a **second full `memkeys-server`** (workers +
-HTTP on alt-ports) per MCP session. That is fine for a one-agent canary but
-fragile at fleet scale, for two reasons:
+## The four tools
 
-1. the second server binds the health (`:8080`) and memory-HTTP (`:3000`)
-   listeners, so every concurrent session needs **unique alt-ports** or it dies
-   with "address already in use";
-2. every session **double-runs** the projection/LLM worker + maintenance stack
-   inside the primary pod — wasted CPU and redundant reconcile scans.
+The four operations of the [retrieval contract](/memkeys/retrieval-contract/),
+as tools:
 
-Three options were on the table:
-
-| Option | What | Verdict |
+| Tool | Arguments (essentials) | Returns |
 |---|---|---|
-| (a) `--mcp-only` launch mode (repo change) | Server runs ONLY stdio MCP: no binds, no workers | **CHOSEN** |
-| (b) stdio↔HTTP bridge | New shim translating MCP stdio → the proven `/memory/*` bearer path | Rejected: a brand-new component + protocol translation layer; more code, second codepath to keep in sync |
-| (c) accept the exec recipe + randomized ports + resource caps | No code; keep spawning a full second server | Interim only (see §6) — still binds ports and double-runs workers |
+| `memory_store` | `{envelope}` — the fact envelope | `{fact_id, keyed, entity_keys_resolved, duplicate}` |
+| `memory_fetch` | `{entity.*, type?, as_of?, limit?, valid?}` — at least one `entity.*` key | `{facts: […]}` |
+| `memory_traverse` | `{start:{kind,id}, edges?, direction?, depth?, hydrate?, deadline_ms?}` | `{nodes, edges, cursor, truncated}` |
+| `memory_search` | `{query, scope?, k?, tiers?, as_of?}` — requires the semantic module | `{hits: […]}` |
 
-**Chosen: (a).** It is the smallest change that removes *both* failure modes at
-the source. `MEMKEYS_ROLE=mcp` is the symmetric sibling of the existing
-`MEMKEYS_ROLE=worker` gate: the process connects to the shared Postgres, binds
-the single stdio principal from the run token, and runs `mcp::run_stdio` inline
-until stdin closes — **nothing else**:
+**Traversal addressing rule:** `start.id` is the *composite node id*
+`<tenant>|<dotted-kind>|<value>` while `start.kind` is the snake_case enum —
+e.g. `{"kind":"entity_project","id":"acme|entity.project|billing"}`. A raw
+value returns `not_found`, by design.
 
-- **no health or `/memory/*` HTTP bind** → concurrent sessions can never collide
-  on a port (no alt-port juggling);
-- **no maintenance/worker loop and no boot reconcile** → no double worker stack;
-  the primary all-in-one pod remains the sole owner of projection + maintenance;
-- **a small Postgres pool** → each MCP-only process serves ONE sequential stdio
-  session, so set `MEMKEYS_PG_MAX_CONNECTIONS=2`; a fleet of N agents at the
-  default pool of 8 would open `N × 8` connections and blow past Postgres'
-  default `max_connections` (100). This caps each session's footprint on the
-  shared Postgres;
-- **stdout carries only JSON-RPC** — all the all-in-one startup `println!`s are
-  gated off, and tracing/OTel logs never target stdout, so the protocol stream
-  stays clean (a latent hazard in the exec-a-full-server recipe).
+**Search parity:** the MCP search path runs the same semantic read pipeline
+as HTTP. A `MEMKEYS_ROLE=mcp` process must enable the semantic module and
+point at the **same embedder** as the primary deployment — otherwise query
+vectors land in a different embedding space than the stored vectors. When you
+exec into the server pod, the pod env already carries this; keep it that way.
 
-Option (a) *dominates* option (c): (c) keeps binding two listeners the MCP
-session never uses and keeps double-running the worker stack; randomized ports
-only paper over the collision (a) deletes outright.
+## Principal binding
 
-### Read-path parity (do not skip)
+The stdio pipe is the trust boundary. At launch the server binds **one**
+principal from `MEMKEYS_RUN_TOKEN`, an HS256 JWT minted with the deployment's
+`MEMKEYS_RUN_TOKEN_SECRET`:
 
-The MCP `memory_search` op runs the semantic read path, so the MCP-only process
-**must have the semantic module wired** (`MEMKEYS_SEMANTIC=1`) and **must use the
-exact same embedder** as the primary pod — otherwise query vectors land in a
-different ANN space than the stored vectors (the M7 model-stamp lesson). Because
-the MCP-only process is `exec`'d *inside* the primary pod it inherits the pod's
-`MEMKEYS_EMBED_URL` / embedder env automatically; keep it that way.
+| JWT claim | Becomes |
+|---|---|
+| `company_id` | tenant floor — all four operations are scoped to it; tenant is never a tool argument |
+| `sub` | `entity.agent` and the provenance principal |
+| `exp` | expiry window, re-checked on every `tools/call`; an expired token fails `unauthenticated` |
 
----
+If `MEMKEYS_RUN_TOKEN` / `MEMKEYS_RUN_TOKEN_SECRET` are absent, the server
+binds an unverified dev principal for tenant `MEMKEYS_STDIO_TENANT`
+(default `default`) — loopback dev only.
 
-## 2. Per-run token policy (F12)
+Mint a token with nothing but `openssl`:
 
-- **Issuer secret:** HS256, from `MEMKEYS_RUN_TOKEN_SECRET` (k8s secret
-  `memkeys-run-token`). The server's `JwtVerifier` validates the launch token
-  once and **re-checks the expiry window on every tool call** (F12), so a token
-  that expires mid-session hard-fails `unauthenticated` rather than lingering.
-- **Claims:** `company_id` = tenant floor (`Principal.tenant_id`), `sub` = agent
-  id (`Principal.agent_id`), plus `exp`. `run_id` / `trace_id` optional. The
-  caller **cannot** assert a tenant — it is derived server-side from the verified
-  principal (ISI-6148 / ISI-6137 S1). Agents' `entity.agent` is stamped from
-  `sub`.
-- **No static long-lived token in `~/.claude.json`.** The MCP `command` **mints a
-  short-lived token at session launch** from the in-pod secret and injects it as
-  `MEMKEYS_RUN_TOKEN` for that one process. The token lives only for the session
-  and is never written to disk/config.
-- **Target end-state (follow-up, not a cutover blocker):** Paperclip injects a
-  per-run short-lived token into the agent env so even the mint step leaves the
-  pod. For the canary, in-pod mint from the secret is the accepted posture.
+```sh
+b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+now=$(date +%s); exp=$((now + 3600))
+hdr=$(printf '{"alg":"HS256","typ":"JWT"}' | b64)
+pl=$(printf '{"company_id":"%s","sub":"%s","iat":%s,"exp":%s}' \
+      "$TENANT" "$AGENT_ID" "$now" "$exp" | b64)
+sig=$(printf '%s.%s' "$hdr" "$pl" \
+      | openssl dgst -sha256 -hmac "$MEMKEYS_RUN_TOKEN_SECRET" -binary | b64)
+TOKEN="$hdr.$pl.$sig"
+```
 
----
+Size the TTL to the expected session length plus headroom — the server
+re-checks `exp` on every call, so a session that outlives its token fails
+cleanly rather than silently. Never write long-lived tokens into client
+config files; mint per session.
 
-## 3. The `~/.claude.json` MCP server block
+## Reaching the server
 
-Swap the `mempalace` entry for `memkeys` (keep `mempalace` present but unused for
-rollback). `type: "stdio"` with `kubectl exec` as the command; the inline script
-mints a short-TTL token from the in-pod secret, exports the read-path env, then
-`exec`s the server in MCP-only mode so stdin/stdout are handed straight to the
-MCP server process (the `exec` is essential — no wrapper left holding the pipe).
+**Local process (dev).** Run the server on the agent host; the MCP client
+owns its stdin/stdout:
+
+```json
+{
+  "mcpServers": {
+    "memkeys": {
+      "type": "stdio",
+      "command": "memkeys-server",
+      "env": {
+        "MEMKEYS_DATABASE_URL": "postgres://memkeys:memkeys@localhost:5432/memkeys",
+        "MEMKEYS_RUN_TOKEN_SECRET": "<issuer-secret>",
+        "MEMKEYS_RUN_TOKEN": "<minted-token>"
+      }
+    }
+  }
+}
+```
+
+**In-cluster (shared deployment).** Exec into the server pod in the MCP-only
+role and hand the pipe to the server binary — no extra ports, no second
+worker stack, and a small Postgres footprint:
 
 ```json
 {
@@ -100,15 +117,13 @@ MCP server process (the `exec` is essential — no wrapper left holding the pipe
       "type": "stdio",
       "command": "kubectl",
       "args": [
-        "-n", "memkeys",
-        "exec", "-i", "deploy/memkeys-server", "--",
-        "sh", "-lc",
-        "TOKEN=$(memkeys-token mint --secret-env MEMKEYS_RUN_TOKEN_SECRET --tenant \"$MEMKEYS_CANARY_TENANT\" --sub \"$MEMKEYS_AGENT_ID\" --ttl 3600); exec env MEMKEYS_ROLE=mcp MEMKEYS_PG_MAX_CONNECTIONS=2 MEMKEYS_RUN_TOKEN=\"$TOKEN\" memkeys-server"
+        "exec", "-i", "-n", "memkeys", "deploy/memkeys", "--",
+        "sh", "-c",
+        "exec env MEMKEYS_ROLE=mcp MEMKEYS_PG_MAX_CONNECTIONS=2 MEMKEYS_RUN_TOKEN=\"$TOKEN\" memkeys-server"
       ],
       "env": {
-        "KUBECONFIG": "/home/hrexed/.config/capmox/k8squad-test.kubeconfig",
-        "MEMKEYS_AGENT_ID": "<paperclip-agent-uuid>",
-        "MEMKEYS_CANARY_TENANT": "615e9564-65df-4465-9b19-a5afb73446c6"
+        "KUBECONFIG": "/path/to/kubeconfig",
+        "TOKEN": "<minted-run-token>"
       }
     }
   }
@@ -116,89 +131,97 @@ MCP server process (the `exec` is essential — no wrapper left holding the pipe
 ```
 
 Notes:
-- `MEMKEYS_ROLE=mcp`, `MEMKEYS_RUN_TOKEN`, `MEMKEYS_RUN_TOKEN_SECRET`,
-  `MEMKEYS_DATABASE_URL`, `MEMKEYS_SEMANTIC=1`, and the embedder env are what the
-  server reads. `MEMKEYS_RUN_TOKEN_SECRET` + `MEMKEYS_DATABASE_URL` + the
-  embedder env already live in the pod (inherited by the `exec`'d process); only
-  `MEMKEYS_ROLE`, `MEMKEYS_PG_MAX_CONNECTIONS`, and the freshly minted
-  `MEMKEYS_RUN_TOKEN` are set per session.
-- `MEMKEYS_PG_MAX_CONNECTIONS=2` caps each MCP-only session's Postgres pool (the
-  default is 8) so a fleet of sessions cannot exhaust `max_connections`.
-- `MEMKEYS_SEMANTIC=1` must be set on the **pod** (it already is on k8squad-test,
-  per ISI-6327) so the inherited env enables `memory_search`.
-- `memkeys-token mint` is the in-pod minting helper (see §4); if it is not yet
-  packaged in the image, use the inline `sh` mint from §4 instead.
-- No `MEMKEYS_HTTP_PORT` / `MEMKEYS_MEMORY_HTTP_PORT` appear — MCP-only binds
-  nothing, so there are **no per-session ports to allocate**. This is the whole
-  point of option (a).
 
----
+- `MEMKEYS_ROLE=mcp` is the point of this shape: the exec'd process binds
+  nothing and reconcils nothing; the primary all-in-one pod stays the sole
+  owner of projection and maintenance.
+- `MEMKEYS_PG_MAX_CONNECTIONS=2` caps the session's Postgres pool — the
+  default 8, multiplied across a fleet of sessions, exhausts Postgres
+  `max_connections`.
+- `MEMKEYS_DATABASE_URL`, the secret, and the embedder env are inherited
+  from the pod; only the role, pool size, and fresh token are per session.
 
-## 4. Token-minting recipe (in-pod, per session)
+If you write your own `kubectl exec` wrapper, keep a stdin bridge (e.g.
+`cat | memkeys-server`): a bare exec stream can deliver only the first stdin
+burst and starve subsequent requests.
 
-The token is an HS256 JWT over the `memkeys-run-token` secret. If the image ships
-a `memkeys-token mint` subcommand, prefer it. Otherwise mint inline in the `sh`
-command with a tiny HS256 signer (secret already in the pod env as
-`$MEMKEYS_RUN_TOKEN_SECRET`):
+## Raw wire reference
 
-```sh
-# header.payload.signature, HS256, exp = now + TTL seconds
-b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-now=$(date +%s); exp=$((now + 3600))
-hdr=$(printf '{"alg":"HS256","typ":"JWT"}' | b64)
-pl=$(printf '{"company_id":"%s","sub":"%s","iat":%s,"exp":%s}' \
-       "$MEMKEYS_CANARY_TENANT" "$MEMKEYS_AGENT_ID" "$now" "$exp" | b64)
-sig=$(printf '%s.%s' "$hdr" "$pl" \
-       | openssl dgst -sha256 -hmac "$MEMKEYS_RUN_TOKEN_SECRET" -binary | b64)
-TOKEN="$hdr.$pl.$sig"
+Every exchange, verbatim:
+
+```jsonc
+// → initialize
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"my-client","version":"1"}}}
+// ← {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"memkeys","version":"0.1.0"}}}
+
+// → notification — no reply, by design
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+// → tools/list
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+// ← {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"memory_store",…},{"name":"memory_fetch",…},{"name":"memory_traverse",…},{"name":"memory_search",…}]}}
+
+// → memory_store
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_store","arguments":{"envelope":{"source":{"kind":"gateway_flush","emitted_at":"2026-10-22T10:56:57Z"},"entity":{"project":"billing","agent":"triage-bot","run":"run-1"},"fact":{"body":"deploy freeze starts Friday","subject":"freeze"}}}}}
+// ← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"duplicate\":false,\"entity_keys_resolved\":{…},\"fact_id\":\"…\",\"keyed\":true}"}]}}
+
+// → memory_fetch (at least one entity.* key)
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.project":"billing"}}}
+// ← … "facts":[{… "body":"deploy freeze starts Friday" …}] …
+
+// → memory_traverse (composite id: <tenant>|<dotted kind>|<value>)
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory_traverse","arguments":{"start":{"kind":"entity_project","id":"acme|entity.project|billing"},"depth":2,"direction":"out","hydrate":true}}}
+// ← … "edges":[{"edge_type":"entity_fact",…}], "nodes":[{…hydrated records…}] …
+
+// → memory_search (requires the semantic module on the server)
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"deploy freeze","k":5,"scope":{"entity.project":"billing"}}}}
+// ← … "hits":[{"score":0.645, "fact":{"body":"deploy freeze starts Friday"}, …}] …
+
+// errored tool call — an OK reply with isError:
+// ← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"{\"code\":\"unauthenticated\",\"retriable\":false,…}"}],"isError":true}}
 ```
 
-TTL = 3600s (1h) for the canary; shorten once the Paperclip-injected path
-(§2 end-state) lands. The server re-checks `exp` on every call, so a long agent
-session that outlives the token fails cleanly rather than silently — size the TTL
-to the expected session length plus headroom, or have the wrapper re-mint.
+Minimal client in Python (stdlib only), against a local server:
 
----
+```python
+import json, subprocess
 
-## 5. Canary tenant / scoping
+proc = subprocess.Popen(
+    ["memkeys-server"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    env={"MEMKEYS_DATABASE_URL": "postgres://memkeys:memkeys@localhost:5432/memkeys",
+         "PATH": "/usr/bin:/bin:/usr/local/bin"},
+)
 
-- **Tenant = the company UUID `615e9564-65df-4465-9b19-a5afb73446c6`** (the
-  `company_id` claim = tenant floor). Clean-start dogfood (ISI-6307 decision C),
-  so there is no legacy tenant to reconcile.
-- `sub` = the Paperclip agent UUID → stamped as `entity.agent` on every write, so
-  cross-agent recall within the tenant works (ProxOps verified session A → session
-  B, same tenant, ISI-6328 transcripts).
-- `memory_traverse` start ids are the **opaque composite** `tenant|entity.project|value`
-  (dotted kind), not the raw value (ISI-6333) — unchanged by this transport.
+def call(req_id, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    proc.stdin.write(json.dumps(msg) + "\n"); proc.stdin.flush()
+    return json.loads(proc.stdout.readline())
 
----
-
-## 6. Interim path to unblock the canary before this PR merges
-
-The one-agent canary does **not** have to wait for the `MEMKEYS_ROLE=mcp` image.
-ProxOps may start it today with option (c): the already-proven exec recipe that
-spawns a full second server, with **randomized alt-ports + resource caps** so the
-single canary session does not collide with the primary listeners:
-
-```sh
-exec env MEMKEYS_HTTP_PORT=$((20000 + RANDOM % 20000)) \
-         MEMKEYS_MEMORY_HTTP_PORT=$((20000 + RANDOM % 20000)) \
-         MEMKEYS_RUN_TOKEN="$TOKEN" memkeys-server
+print(call(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                             "clientInfo": {"name": "py", "version": "1"}}))
+print([t["name"] for t in call(2, "tools/list")["result"]["tools"]])
+print(call(3, "tools/call", {"name": "memory_fetch",
+                             "arguments": {"entity.project": "billing"}}))
+proc.stdin.close(); proc.wait()
 ```
 
-This is a **canary-only bridge** — it still double-runs the worker stack and
-risks a rare port clash, which is exactly why the fleet flip waits for
-`MEMKEYS_ROLE=mcp` (§1). Do not roll (c) out to multiple concurrent agents.
+## Troubleshooting
 
----
+| Symptom | Cause | Fix |
+|---|---|---|
+| `tools/list` times out but `initialize` answers | your exec wrapper hands the server a bare exec stream as fd 0 | bridge stdin (`cat \| memkeys-server`) or use `MEMKEYS_ROLE=mcp` exec directly |
+| `memory_traverse` → `not_found` | raw value as `start.id` | composite id `<tenant>\|<dotted-kind>\|<value>` |
+| `memory_search` → `isError:true feature_disabled` | semantic module off | run the server with `MEMKEYS_SEMANTIC=1` (and the digest sub-flag for digests) |
+| every call → `unauthenticated` | run-token `exp` window closed | relaunch with a fresh token |
+| fetch returns another tenant's data | not possible by construction — the tenant comes from the launch-bound principal, never a tool argument | — |
+| server refuses to bind | non-loopback host without `MEMKEYS_RUN_TOKEN_SECRET` | keep `127.0.0.1`, set the secret, or set `MEMKEYS_ALLOW_INSECURE=1` (dev only) |
 
-## 7. Strategic note — the long-term fleet transport
+## Roadmap
 
-The ideal fleet-scale shape is **MCP-over-HTTP (streamable HTTP)** served at the
-existing VIP (`10.0.0.220`), so agents use Claude Code's native remote MCP
-(`type: "http"`, url + bearer header) with **no kubectl, no exec, and no
-per-session process in the pod at all** — just the per-request bearer the
-`/memory/*` path already proved. That is a new server transport (out of scope for
-this cutover) and is filed as a follow-up. `MEMKEYS_ROLE=mcp` is the right answer
-for shipping the cutover now; MCP-over-HTTP is the right answer for retiring
-kubectl-exec later.
+The long-term fleet shape is **MCP over streamable HTTP** at the existing
+`/memory/*` listener — no `kubectl`, no exec, no per-session process, just a
+per-request bearer. Until it lands, the MCP-only stdio role is the supported
+per-agent transport.

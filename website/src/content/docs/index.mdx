@@ -13,23 +13,21 @@ hero:
   actions:
     # NB: Starlight does not prefix the Pages base onto hero action links, so
     # the base (/memkeys) is included explicitly. Keep in sync with BASE in
-    # astro.config.mjs if a custom domain lands (ISI-5919).
+    # astro.config.mjs if a custom domain lands.
     - text: Get started
-      link: /memkeys/#quickstart
+      link: /memkeys/quickstart/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
+    - text: Why MemKeys
+      link: /memkeys/why/
+      variant: minimal
+    - text: GitHub
       link: https://github.com/MemKeys/memkeys
       icon: external
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
-
-{/*
-  Landing page (M5 · ISI-6479). Assembled from copy deck (ISI-6400) and 
-  design package (ISI-6399) onto the Astro + Starlight scaffold (ISI-6398).
- */}
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 ## What is MemKeys?
 
@@ -45,54 +43,8 @@ it with the keys that describe it and a window for when it was true. Retrieval s
 of that keyed core so you still get relationship traversal and semantic search, but they are
 *derived projections* you can rebuild at any time, never a parallel store that can drift.
 
-> **Pull quote:** "Store each fact with the keys that describe it, and retrieve it by address —
-> the way you pull a card from a catalog."
-
-## How it works
-
-MemKeys is organized as **one source of truth and two derived views**, reached through **four
-retrieval operations**.
-
-**Storage — single source of truth + derived views:**
-- **Keyed / temporal store (source of truth).** Every fact lives here once, append-only and
-  bi-temporal. This is what the server writes at commit time.
-- **Knowledge graph (derived, async).** Entity→entity relationships, supersedes-chains, and
-  cross-fact links projected from the keyed store. Rebuildable by replay.
-- **Vector index (derived, async).** Embeddings for semantic recall, scoped by the same keys —
-  so similarity search is always *bounded* by the candidate set the keys define.
-
-**Retrieval — four operations:**
-- **Store** a fact with its keys and validity.
-- **Fetch** by the keys you know (exact, keyed retrieval).
-- **Search** semantically *within* a keyed scope.
-- **Traverse** the graph from a start node to discover how entities connect.
-
-## Get started
-
-Run the memory server locally:
-
-```bash
-# Run the MemKeys server on :3000 (loopback dev mode self-asserts the tenant)
-cargo run -p memkeys-server
-```
-
-Browse your memory with the read-only **Inspector UI** — it talks only to the public read
-surface, never to the database, and never writes:
-
-```bash
-cd frontend
-npm install
-npm run dev   # dev server on :3001, proxies /memory → :3000
-```
-
-Open `http://localhost:3001`, set the **Tenant** field in the top bar (and a bearer token if
-the server runs with a verifier configured), then search facts or traverse the graph.
-
-**Inspector at a glance:**
-- **Facts Browser** — keyed retrieval by entity attributes (`project`, `issue`, `pr`, `agent`,
-  `run`, `thread`, `service`) with `type` / `valid` / `as_of` filters and a fact-detail view.
-- **Memory Graph** — a force-directed view of a traversal from a start node, with direction /
-  depth / edge-type controls; truncation and dangling-edge gaps are surfaced, never hidden.
+> Store each fact with the keys that describe it, and retrieve it by address —
+> the way you pull a card from a catalog.
 
 <CardGrid stagger>
   <Card title="Keyed-first retrieval" icon="setting">
@@ -107,20 +59,64 @@ the server runs with a verifier configured), then search facts or traverse the g
   </Card>
   <Card title="Open contract, pluggable backends" icon="open-book">
     A small, open retrieval contract — four operations, one keyed core. Graph and vector are
-    **derived, rebuildable** views, not a second source of truth. Backends are pluggable, with
-    the Grail plugin as the reference implementation.
+    **derived, rebuildable** views, not a second source of truth. Postgres + pgvector ships in
+    the repo; the contract is designed so other stores can implement it.
   </Card>
+</CardGrid>
+
+## How it works
+
+MemKeys is organized as **one source of truth and two derived views**, reached through **four
+retrieval operations**.
+
+**Storage — single source of truth + derived views:**
+- **Keyed / temporal store (source of truth).** Every fact lives here once, append-only and
+  bi-temporal. This is what the server writes at commit time.
+- **Knowledge graph (derived, async).** Entity→entity relationships, supersede chains, and
+  cross-fact links projected from the keyed store. Rebuildable by replay.
+- **Vector index (derived, async).** Embeddings for semantic recall, scoped by the same keys —
+  so similarity search is always *bounded* by the candidate set the keys define.
+
+**Retrieval — four operations:**
+- **Store** a fact with its keys and validity.
+- **Fetch** by the keys you know (exact, keyed retrieval).
+- **Search** semantically *within* a keyed scope.
+- **Traverse** the graph from a start node to discover how entities connect.
+
+The same four operations are exposed over HTTP and over MCP (stdio), so Claude Code, goose,
+kagent — or your own client — use MemKeys as their memory server with a config block, not an
+integration project.
+
+## Run it in five minutes
+
+```bash
+docker run -d --name memkeys-pg -e POSTGRES_PASSWORD=memkeys -p 5432:5432 pgvector/pgvector:pg16
+docker run -e MEMKEYS_DATABASE_URL=postgres://postgres:memkeys@host.docker.internal:5432/postgres \
+  -p 3000:3000 ghcr.io/memkeys/memkeys-server
+```
+
+Store a fact, then get it back by key:
+
+```bash
+curl -s localhost:3000/memory/facts -H 'content-type: application/json' -H 'X-MemKeys-Tenant: default' \
+  -d '{"source":{"kind":"gateway_flush","emitted_at":"2026-10-23T09:00:00Z"},
+       "entity":{"project":"demo","agent":"you"},
+       "fact":{"body":"deploy freeze starts Friday","subject":"freeze"}}'
+
+curl -s 'localhost:3000/memory/facts?entity.project=demo' -H 'X-MemKeys-Tenant: default'
+```
+
+Local dev with `cargo`, the Inspector UI, and the Kubernetes paths:
+**[Quickstart](/memkeys/quickstart/)**.
+
+<CardGrid>
+  <LinkCard title="Why MemKeys" description="The keyed-first inversion — and when it beats a vector blob." href="/memkeys/why/" />
+  <LinkCard title="Connect your agents" description="MCP recipes for Claude Code, goose, kagent, and any client." href="/memkeys/connect-your-agents/" />
+  <LinkCard title="Architecture" description="The fact envelope, the write pipeline, the derived views." href="/memkeys/architecture/" />
+  <LinkCard title="Kubernetes" description="Helm chart and operator, single-node or microservice." href="/memkeys/k8s-operator/" />
 </CardGrid>
 
 ## Memory your agents can actually find again.
 
 MemKeys is open source and built in the open. Read the architecture, run it locally
 in a minute, and bring your own backend.
-
----
-
-<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-8">
-  <a href="/memkeys/" class="button primary">Read the docs</a>
-  <a href="/memkeys/connect-your-agents/" class="button">Connect an agent</a>
-  <a href="https://github.com/MemKeys/memkeys" class="button minimal" target="_blank">Star on GitHub</a>
-</div>
