@@ -10,7 +10,7 @@ import {
 } from '../types/api';
 import { graphAPI } from '../services/api';
 import { useAuth } from '../services/authContext';
-import { GraphLink, GraphNode, toGraphData } from '../lib/transform';
+import { buildNodeId, GraphLink, GraphNode, toGraphData } from '../lib/transform';
 import ErrorBanner from './ErrorBanner';
 
 const NODE_KINDS: NodeKind[] = [
@@ -48,9 +48,10 @@ type SimLink = d3.SimulationLinkDatum<SimNode> & { edge_type: string };
 export default function MemoryGraph() {
   const { auth } = useAuth();
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const [startKind, setStartKind] = useState<NodeKind>('fact');
+  const [startKind, setStartKind] = useState<NodeKind>('entity_project');
   const [startId, setStartId] = useState('');
-  const [direction, setDirection] = useState<Direction>('out');
+  const [startValue, setStartValue] = useState('');
+  const [direction, setDirection] = useState<Direction>('both');
   const [depth, setDepth] = useState(2);
   const [hydrate, setHydrate] = useState(true);
   const [edges, setEdges] = useState<EdgeType[]>([]);
@@ -61,21 +62,46 @@ export default function MemoryGraph() {
   const toggleEdge = (t: EdgeType) =>
     setEdges((cur) => (cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t]));
 
+  /** Compose the opaque start id from the picker (tenant|kind|value). */
+  function composeStartId(kind: NodeKind, value: string): string {
+    return buildNodeId(auth.tenantId, kind, value);
+  }
+
+  /** Fill the picker with a known-good combo and traverse immediately, so a
+   * fresh visitor sees data with one click instead of guessing id formats. */
+  async function runExample() {
+    const kind: NodeKind = 'entity_project';
+    const value = 'memkeys';
+    const id = composeStartId(kind, value);
+    setStartKind(kind);
+    setStartValue(value);
+    setDirection('both');
+    setDepth(2);
+    setStartId(id);
+    await traverse({ start: { kind, id }, direction: 'both', depth: 2 });
+  }
+
   async function run(e: React.FormEvent) {
     e.preventDefault();
     if (startId.trim() === '') {
       setError({ error: 'A start node id is required.' });
       return;
     }
+    await traverse({ start: { kind: startKind, id: startId.trim() } });
+  }
+
+  async function traverse(
+    partial: Pick<TraverseRequest, 'start'> & Partial<Pick<TraverseRequest, 'direction' | 'depth'>>,
+  ) {
     setLoading(true);
     setError(null);
     const req: TraverseRequest = {
-      start: { kind: startKind, id: startId.trim() },
       edges, // empty = all edge types
       direction,
       depth,
       hydrate,
       deadline_ms: 2000,
+      ...partial,
     };
     try {
       const result = await graphAPI.traverse(req, auth);
@@ -196,7 +222,14 @@ export default function MemoryGraph() {
         <div className="filter-row">
           <label>
             start kind
-            <select value={startKind} onChange={(e) => setStartKind(e.target.value as NodeKind)}>
+            <select
+              value={startKind}
+              onChange={(e) => {
+                const kind = e.target.value as NodeKind;
+                setStartKind(kind);
+                if (startValue.trim() !== '') setStartId(composeStartId(kind, startValue));
+              }}
+            >
               {NODE_KINDS.map((k) => (
                 <option key={k} value={k}>
                   {k}
@@ -204,11 +237,24 @@ export default function MemoryGraph() {
               ))}
             </select>
           </label>
+          <label>
+            start value
+            <input
+              type="text"
+              placeholder="e.g. memkeys"
+              value={startValue}
+              onChange={(e) => {
+                const v = e.target.value;
+                setStartValue(v);
+                setStartId(composeStartId(startKind, v));
+              }}
+            />
+          </label>
           <label className="grow">
             start id
             <input
               type="text"
-              placeholder="opaque node id"
+              placeholder="auto-built: tenant|kind|value - kind uses dots (entity.project)"
               value={startId}
               onChange={(e) => setStartId(e.target.value)}
             />
@@ -240,6 +286,9 @@ export default function MemoryGraph() {
           <button type="submit" disabled={loading}>
             {loading ? 'Traversing…' : 'Traverse'}
           </button>
+          <button type="button" className="link-button" onClick={runExample} disabled={loading}>
+            Try example
+          </button>
         </div>
         <div className="edge-filters">
           <span>edges:</span>
@@ -250,6 +299,9 @@ export default function MemoryGraph() {
             </label>
           ))}
           <span className="hint">(none = all)</span>
+          <span className="hint">
+            start id = tenant|kind|value · current tenant: {auth.tenantId.trim() || 'not set'}
+          </span>
         </div>
       </form>
 
