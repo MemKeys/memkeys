@@ -106,6 +106,8 @@ export interface GraphLink {
   source: string;
   target: string;
   edge_type: string;
+  /** Bitemporal event time carried on the wire edge (`TraverseEdge.event_time`). */
+  event_time: string;
 }
 
 export interface GraphData {
@@ -129,8 +131,9 @@ export function nodeLabel(n: TraverseNode): string {
 /**
  * Transform a {@link TraverseResult} into d3-friendly `{nodes, links}`. Edges
  * that reference an unknown node id are dropped (a projection hole should not
- * crash the force layout); dropped edges are reported in `droppedEdges` so the
- * UI can surface the gap rather than silently hide it.
+ * crash the force layout); dropped edges are reported in `droppedEdges` so
+ * the UI can surface the gap rather than silently hide it. The wire edge's
+ * `event_time` is carried through for the edge-detail popup (ISI-6582).
  */
 export function toGraphData(result: TraverseResult): GraphData & { droppedEdges: number } {
   const nodes: GraphNode[] = result.nodes.map((n) => ({
@@ -145,7 +148,12 @@ export function toGraphData(result: TraverseResult): GraphData & { droppedEdges:
   let droppedEdges = 0;
   for (const e of result.edges) {
     if (ids.has(e.from) && ids.has(e.to)) {
-      links.push({ source: e.from, target: e.to, edge_type: e.edge_type });
+      links.push({
+        source: e.from,
+        target: e.to,
+        edge_type: e.edge_type,
+        event_time: e.event_time,
+      });
     } else {
       droppedEdges += 1;
     }
