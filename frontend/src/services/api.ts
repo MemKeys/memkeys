@@ -17,7 +17,7 @@ const API_BASE_URL = '/memory';
  *  where the tenant is self-asserted via the `X-MemKeys-Tenant` header. */
 export interface AuthConfig {
   tenantId: string;
-  /** Optional Paperclip run-token JWT; sent as `Authorization: Bearer …`. */
+  /** Optional Paperclip run-token JWT; sent as `Authorization: Bearer ***` */
   token?: string;
 }
 
@@ -28,13 +28,47 @@ function authHeaders(auth: AuthConfig): Record<string, string> {
   return h;
 }
 
-function client(): AxiosInstance {
-  return axios.create({
-    baseURL: API_BASE_URL,
-    timeout: 30000,
-    headers: { 'Content-Type': 'application/json' },
+// --- 401 session-expiry signal (ISI-6580) ---------------------------------
+// Any API 401 means the session (tenant/token) is no longer accepted by the
+// server. The response interceptor below fans the event out to registered
+// listeners; the config provider subscribes and clears the persisted session,
+// which returns the app to the login page with a "session expired" notice.
+type UnauthorizedListener = () => void;
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+function notifyUnauthorized(): void {
+  unauthorizedListeners.forEach((listener) => {
+    try {
+      listener();
+    } catch {
+      // a broken listener must not break the fan-out
+    }
   });
 }
+
+/** Subscribe to API 401 events; returns an unsubscribe function. */
+export function onUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+// One shared client so the 401 interceptor covers every request.
+const client: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+client.interceptors.response.use(
+  (response) => response,
+  (error: unknown) => {
+    const status = (error as { response?: { status?: number } }).response?.status;
+    if (status === 401) notifyUnauthorized();
+    return Promise.reject(error);
+  },
+);
 
 /** Normalize an axios failure into the WS-5 §7 {@link APIError} shape. */
 function toAPIError(error: unknown, fallback: string): APIError {
@@ -54,7 +88,7 @@ export const factsAPI = {
   /** Keyed retrieval (op 1). At least one entity key must be set upstream. */
   async fetchFacts(query: FactsQuery, auth: AuthConfig): Promise<FactsResponse> {
     try {
-      const { data } = await client().get<FactsResponse>('/facts', {
+      const { data } = await client.get<FactsResponse>('/facts', {
         params: buildQueryParams(query),
         headers: authHeaders(auth),
       });
@@ -69,7 +103,7 @@ export const graphAPI = {
   /** Graph traversal (op 3). The body never carries a tenant (§7.3). */
   async traverse(request: TraverseRequest, auth: AuthConfig): Promise<TraverseResult> {
     try {
-      const { data } = await client().post<TraverseResult>('/graph/traverse', request, {
+      const { data } = await client.post<TraverseResult>('/graph/traverse', request, {
         headers: authHeaders(auth),
       });
       return data;
@@ -78,3 +112,14 @@ export const graphAPI = {
     }
   },
 };
+
+/** Connection test used by the login page (ISI-6580): the cheapest
+ * authenticated read. Resolves when the server accepts the tenant/token,
+ * throws an {@link APIError} carrying the server's reason otherwise. */
+export async function testConnection(auth: AuthConfig): Promise<void> {
+  try {
+    await client.get('/facts', { params: { limit: 1 }, headers: authHeaders(auth) });
+  } catch (error) {
+    throw toAPIError(error, 'Connection test failed');
+  }
+}

@@ -7,6 +7,12 @@ import { AuthConfig } from './api';
 export interface ConfigContextValue {
   auth: AuthConfig;
   setAuth: (next: AuthConfig) => void;
+  /** True right after a mid-session API 401 forced the user back to login. */
+  sessionExpired: boolean;
+  /** Dismiss the "session expired" notice once it has been shown. */
+  acknowledgeSessionExpired: () => void;
+  /** Sign out: clears the session and its persisted copy. */
+  signOut: () => void;
 }
 
 export const ConfigContext = createContext<ConfigContextValue | null>(null);

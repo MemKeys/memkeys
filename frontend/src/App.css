@@ -229,3 +229,81 @@
   border-radius: 8px;
   color: var(--text);
 }
+
+/* --- login page (ISI-6580) --- */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-card h1 {
+  font-size: 22px;
+  margin: 0;
+  text-align: center;
+}
+
+.login-sub {
+  margin: -6px 0 0;
+  text-align: center;
+  color: var(--muted);
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.login-field input {
+  width: 100%;
+}
+
+.login-advanced-toggle {
+  align-self: flex-start;
+  font-size: 12px;
+}
+
+.login-submit {
+  width: 100%;
+  padding: 10px;
+}
+
+.session-expired-notice {
+  background: rgba(79, 140, 255, 0.12);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 10px 12px;
+  border-radius: 8px;
+  text-align: center;
+}
+
+/* --- identity chip (ISI-6580) --- */
+.identity-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.identity-tenant {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
