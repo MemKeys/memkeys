@@ -1,0 +1,122 @@
+---
+title: MemKeys — Keyed memory for AI agents
+description: MemKeys is an open-source, attribute-based memory server for AI agents. Store each fact by the keys that describe it — with temporal validity — and retrieve it by address. Graph and vector are derived views. Open contract, pluggable backends.
+template: splash
+editUrl: false
+hero:
+  tagline: OPEN-SOURCE AGENT MEMORY
+  heading: Every fact has an address.
+  subhead: MemKeys is an open-source, attribute-based memory server for AI agents. Store each fact by the keys that describe it — with a validity window — and retrieve it by address. No vector guesswork.
+  image:
+    file: ../../assets/hero-mark.svg
+    alt: The MemKeys mark — a gradient @ with a golden keyhole center.
+  actions:
+    # NB: Starlight does not prefix the Pages base onto hero action links, so
+    # the base (/memkeys) is included explicitly. Keep in sync with BASE in
+    # astro.config.mjs if a custom domain lands.
+    - text: Get started
+      link: /memkeys/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: Why MemKeys
+      link: /memkeys/why/
+      variant: minimal
+    - text: GitHub
+      link: https://github.com/MemKeys/memkeys
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## What is MemKeys?
+
+Agents produce *facts*: a decision taken on a pull request, the outcome of a run, a learning
+derived from telemetry, the context an agent flushes at the end of a session. Every fact is
+*about something* — a project, an issue, a PR, an agent, a run, a thread. Those "somethings"
+are the **entities**, the agent-supplied attributes, and they are the primary index into
+memory.
+
+Instead of dropping each fact into a vector blob and hoping to find it again, MemKeys stores
+it with the keys that describe it and a window for when it was true. Retrieval starts from
+**what you know** — the keys — and narrows from there. Graph and vector views are built on top
+of that keyed core so you still get relationship traversal and semantic search, but they are
+*derived projections* you can rebuild at any time, never a parallel store that can drift.
+
+> Store each fact with the keys that describe it, and retrieve it by address —
+> the way you pull a card from a catalog.
+
+<CardGrid stagger>
+  <Card title="Keyed-first retrieval" icon="setting">
+    Reach a fact by its address, not by a similarity guess. Attribute keys — project, issue, run,
+    agent, thread — bound the candidate set *before* any vector or graph work runs. You get the
+    fact you meant, not the one that happened to be nearest.
+  </Card>
+  <Card title="Memory with a validity window" icon="seti:clock">
+    Every fact is bi-temporal: it knows when it was true and when it was recorded. Ask "what did
+    we believe on the 14th?" and get the answer from *then*, not whatever is cached *now*.
+    Superseded facts close automatically; history is never silently overwritten.
+  </Card>
+  <Card title="Open contract, pluggable backends" icon="open-book">
+    A small, open retrieval contract — four operations, one keyed core. Graph and vector are
+    **derived, rebuildable** views, not a second source of truth. Postgres + pgvector ships in
+    the repo; the contract is designed so other stores can implement it.
+  </Card>
+</CardGrid>
+
+## How it works
+
+MemKeys is organized as **one source of truth and two derived views**, reached through **four
+retrieval operations**.
+
+**Storage — single source of truth + derived views:**
+- **Keyed / temporal store (source of truth).** Every fact lives here once, append-only and
+  bi-temporal. This is what the server writes at commit time.
+- **Knowledge graph (derived, async).** Entity→entity relationships, supersede chains, and
+  cross-fact links projected from the keyed store. Rebuildable by replay.
+- **Vector index (derived, async).** Embeddings for semantic recall, scoped by the same keys —
+  so similarity search is always *bounded* by the candidate set the keys define.
+
+**Retrieval — four operations:**
+- **Store** a fact with its keys and validity.
+- **Fetch** by the keys you know (exact, keyed retrieval).
+- **Search** semantically *within* a keyed scope.
+- **Traverse** the graph from a start node to discover how entities connect.
+
+The same four operations are exposed over HTTP and over MCP (stdio), so Claude Code, goose,
+kagent — or your own client — use MemKeys as their memory server with a config block, not an
+integration project.
+
+## Run it in five minutes
+
+```bash
+docker run -d --name memkeys-pg -e POSTGRES_PASSWORD=memkeys -p 5432:5432 pgvector/pgvector:pg16
+docker run -e MEMKEYS_DATABASE_URL=postgres://postgres:memkeys@host.docker.internal:5432/postgres \
+  -p 3000:3000 ghcr.io/memkeys/memkeys-server
+```
+
+Store a fact, then get it back by key:
+
+```bash
+curl -s localhost:3000/memory/facts -H 'content-type: application/json' -H 'X-MemKeys-Tenant: default' \
+  -d '{"source":{"kind":"gateway_flush","emitted_at":"2026-10-23T09:00:00Z"},
+       "entity":{"project":"demo","agent":"you"},
+       "fact":{"body":"deploy freeze starts Friday","subject":"freeze"}}'
+
+curl -s 'localhost:3000/memory/facts?entity.project=demo' -H 'X-MemKeys-Tenant: default'
+```
+
+Local dev with `cargo`, the Inspector UI, and the Kubernetes paths:
+**[Quickstart](/memkeys/quickstart/)**.
+
+<CardGrid>
+  <LinkCard title="Why MemKeys" description="The keyed-first inversion — and when it beats a vector blob." href="/memkeys/why/" />
+  <LinkCard title="Connect your agents" description="MCP recipes for Claude Code, goose, kagent, and any client." href="/memkeys/connect-your-agents/" />
+  <LinkCard title="Architecture" description="The fact envelope, the write pipeline, the derived views." href="/memkeys/architecture/" />
+  <LinkCard title="Kubernetes" description="Helm chart and operator, single-node or microservice." href="/memkeys/k8s-operator/" />
+</CardGrid>
+
+## Memory your agents can actually find again.
+
+MemKeys is open source and built in the open. Read the architecture, run it locally
+in a minute, and bring your own backend.
