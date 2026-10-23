@@ -151,3 +151,41 @@ export interface APIError {
   code?: string;
   retriable?: boolean;
 }
+
+// --- semantic search (op-4; ISI-6581 Explore tab) ---
+
+/**
+ * Semantic search op-4 — the keyless Explore query. 'query' is plain natural
+ * language (no entity keys required; the tenant floor is server-set from the
+ * verified principal, R6); 'type' maps to the server's scope["fact.type"]
+ * AND-filter; 'k' is the result count (server default DEFAULT_K=10, ceiling
+ * MAX_K=100).
+ */
+export interface SearchQuery {
+  query: string;
+  /** Canonical fact-type filter; empty = any type. */
+  type?: string;
+  k: number;
+}
+
+/**
+ * One semantic-search hit (SemanticHit::to_wire_json, service.rs): the
+ * authoritative record flattened as fact.* fields plus a resolved entity
+ * map, with the fused similarity score and the via provenance path.
+ */
+export interface SearchHit {
+  'fact.id': string;
+  score: number;
+  'fact.type': string;
+  'fact.subject': string | null;
+  'fact.body': string;
+  entity: Partial<Record<EntityKeyName, string>>;
+  event_time: string;
+  provenance: string;
+  via: string;
+}
+
+/** Response-shape invariant: always wrapped, never a bare array. */
+export interface SearchResponse {
+  hits: SearchHit[];
+}

@@ -229,3 +229,42 @@
   border-radius: 8px;
   color: var(--text);
 }
+
+/* --- Explore tab (ISI-6581: keyless POST /memory/search) --- */
+.query-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.query-row .grow {
+  flex: 1;
+}
+
+.query-input {
+  width: 100%;
+  font-size: 1rem;
+}
+
+.score-cell {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.explore-disabled {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+
+.explore-disabled p {
+  color: var(--muted);
+  margin: 8px 0 10px;
+}
+
+.explore-disabled code {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+}

@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { APIError, ENTITY_KEY_NAMES, EntityKeyName, FactRecord, FactsQuery, Validity } from '../types/api';
 import { factsAPI } from '../services/api';
 import { useAuth } from '../services/authContext';
-import { DEFAULT_LIMIT, hasEntityKey, recordEntityKeys } from '../lib/transform';
+import { DEFAULT_LIMIT, hasEntityKey } from '../lib/transform';
 import ErrorBanner from './ErrorBanner';
+import FactResults from './FactResults';
 
 // Canonical §5.1 fact types for the type filter.
 const FACT_TYPES = ['decision', 'outcome', 'observation', 'learning', 'context'];
@@ -30,9 +31,11 @@ const emptyQuery: FactsQuery = {
 };
 
 /**
- * Facts Browser — keyed retrieval over `GET /memory/facts`. The server requires
- * at least one entity key, so the search button stays disabled until one is
- * provided (surfaced inline rather than letting the server 400).
+ * Keyed lookup (advanced) — keyed retrieval over `GET /memory/facts`. The
+ * server requires at least one entity key, so the search button stays
+ * disabled until one is provided (surfaced inline rather than letting the
+ * server 400). The keyless Explore tab (ISI-6581, POST /memory/search) is
+ * the default landing view; this exact-key browser remains for scoping.
  */
 export default function FactsBrowser() {
   const { auth } = useAuth();
@@ -40,7 +43,6 @@ export default function FactsBrowser() {
   const [facts, setFacts] = useState<FactRecord[] | null>(null);
   const [error, setError] = useState<APIError | null>(null);
   const [loading, setLoading] = useState(false);
-  const [selected, setSelected] = useState<FactRecord | null>(null);
 
   const setKey = (name: EntityKeyName, value: string) =>
     setQuery((q) => ({ ...q, keys: { ...q.keys, [name]: value } }));
@@ -53,7 +55,6 @@ export default function FactsBrowser() {
     }
     setLoading(true);
     setError(null);
-    setSelected(null);
     try {
       const res = await factsAPI.fetchFacts(q, auth);
       setFacts(res.facts);
@@ -160,69 +161,7 @@ export default function FactsBrowser() {
 
       {error && <ErrorBanner error={error} />}
 
-      {facts && (
-        <div className="results">
-          <div className="results-count">{facts.length} fact(s)</div>
-          <table className="facts-table">
-            <thead>
-              <tr>
-                <th>type</th>
-                <th>subject</th>
-                <th>entity keys</th>
-                <th>event_time</th>
-                <th>keyed</th>
-              </tr>
-            </thead>
-            <tbody>
-              {facts.map((f) => (
-                <tr
-                  key={f.id}
-                  className={selected?.id === f.id ? 'selected' : ''}
-                  onClick={() => setSelected(f)}
-                >
-                  <td>{f.fact_type}</td>
-                  <td>{f.subject ?? '—'}</td>
-                  <td className="keys-cell">
-                    {recordEntityKeys(f)
-                      .map(([k, v]) => `${k}=${v}`)
-                      .join(' ')}
-                  </td>
-                  <td>{new Date(f.event_time).toLocaleString()}</td>
-                  <td>{f.keyed ? '✓' : ''}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {facts.length === 0 && <p className="empty">No facts for this query.</p>}
-        </div>
-      )}
-
-      {selected && (
-        <div className="fact-detail">
-          <div className="fact-detail-header">
-            <h3>Fact detail</h3>
-            <button type="button" className="link-button" onClick={() => setSelected(null)}>
-              close
-            </button>
-          </div>
-          <dl>
-            <dt>id</dt>
-            <dd className="mono">{selected.id}</dd>
-            <dt>fact_type</dt>
-            <dd>{selected.fact_type}</dd>
-            <dt>confidence</dt>
-            <dd>{selected.confidence ?? '—'}</dd>
-            <dt>supersedes</dt>
-            <dd className="mono">{selected.supersedes ?? '—'}</dd>
-            <dt>provenance</dt>
-            <dd>{selected.provenance_principal}</dd>
-            <dt>ingested_at</dt>
-            <dd>{new Date(selected.ingested_at).toLocaleString()}</dd>
-          </dl>
-          <h4>body</h4>
-          <pre className="fact-body">{selected.body}</pre>
-        </div>
-      )}
+      {facts && <FactResults facts={facts} emptyLabel="No facts for this query." />}
     </div>
   );
 }
