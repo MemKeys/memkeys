@@ -1,0 +1,138 @@
+---
+title: Why MemKeys
+description: Most agent memory is a pile of embeddings. MemKeys inverts it — keys first, vectors second — so agents find facts by address, with a validity window, over an open contract.
+template: splash
+editUrl: false
+hero:
+  tagline: WHY MEMKEYS
+  heading: Retrieval starts from what you know.
+  subhead: "Most agent memory is a pile of embeddings. MemKeys inverts that: store each fact with the attributes that make it findable, and let keys — not similarity — decide what comes back."
+  actions:
+    - text: Get started
+      link: /memkeys/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: What is MemKeys
+      link: /memkeys/docs/what-is-memkeys/
+      variant: minimal
+---
+
+import { Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+## The problem with "memory as embeddings"
+
+Write text, get back whatever is *nearest*, cross your fingers. That is the
+memory model most agent stacks ship today, and for open-ended discovery it is
+fine. But agents spend most of their reads on questions that are not open at
+all:
+
+- *What do we know about issue X?*
+- *What did the last run conclude?*
+- *What was true when this decision was made?*
+
+A vector store answers these approximately — nearest neighbors, ranking
+drift, no opinion about time, no audit trail. When the question is an
+address, similarity is the wrong primitive. And when memory is *only*
+embeddings, every write is a one-way trip into a blob: nothing is keyed,
+nothing expires, nothing supersedes anything. Yesterday's wrong answer and
+today's right one coexist, equally retrievable.
+
+## The inversion: keys are the index, vectors are the view
+
+MemKeys stores each fact with **the attributes that make it findable** — the
+project, the issue, the run, the agent, the thread — plus a window for when
+it was true. Retrieval starts from what you know about the fact, not from a
+similarity guess:
+
+<Steps>
+  1. **Keys bound the candidate set** — before any vector or graph work runs.
+  2. **The keyed, temporal store is the single source of truth** — append-only,
+     bi-temporal, queryable as of any past instant.
+  3. **Graph and vector are derived views** — projections you can rebuild at
+     any time, never a parallel store that can drift.
+</Steps>
+
+That is the whole product in one line: **memory your agents can actually
+find again.**
+
+## The three pillars
+
+<CardGrid stagger>
+  <Card title="Keyed-first retrieval" icon="setting">
+    Reach a fact by its address, not by a similarity guess. Attribute keys —
+    project, issue, run, agent, thread — bound the candidate set *before* any
+    vector or graph work runs. Deterministic: the same key always returns the
+    same set. No ranking drift, no false neighbors, no embedding-model
+    dependence. And the failure mode is honest — a keyed miss means "nothing
+    recorded about X," not "the embedding didn't surface it."
+  </Card>
+  <Card title="Memory with a validity window" icon="seti:clock">
+    Every fact is bi-temporal: it knows when it was true (event time) and when
+    it was recorded (transaction time). Ask "what did we believe on the 14th?"
+    and get the answer from *then* — a point-in-time replay, not whatever is
+    cached *now*. New versions supersede old ones through explicit chains;
+    history is never silently overwritten, and superseded facts close
+    automatically.
+  </Card>
+  <Card title="Open contract, pluggable backends" icon="open-book">
+    A small, open retrieval contract — four operations over one keyed core —
+    expressible against any store that can filter by field + time range, hop
+    graphs, and run nearest-neighbor search. Postgres + pgvector ships in the
+    repo. Graph and vector are derived, rebuildable views, so you can lose
+    them and lose nothing permanent.
+  </Card>
+</CardGrid>
+
+## What that buys you in practice
+
+**Deterministic recall for coordination.** The handoff note agent A flushed
+at the end of its session is the *first* thing agent B sees when it picks up
+the same issue — fetched by key, not by hoping the embedding is close. Agent
+A sent only its run id; the server enriched the rest. Cross-session,
+cross-agent memory that behaves like a lookup, because it is one.
+
+**An audit trail, not a vibe.** Who recorded this, when, on whose authority,
+and what did it replace — provenance is stamped server-side from the verified
+caller, supersession is a linked chain, and the full history stays queryable.
+Human-in-the-loop review becomes `GET /memory/facts?entity.issue=X&valid=all`.
+
+**Time travel for free.** Bi-temporality falls out of the append-only store:
+every past state of the world is reconstructable. Debugging an agent decision
+from last week is an `as_of` query, not archaeology.
+
+**Cheap defaults.** The hot path is a filtered scan, not vector math. The
+semantic tier is opt-in and scoped; the graph is lean (ids and edges, no
+bodies). A minimal deployment runs keyed + graph only.
+
+## When MemKeys fits — and when it doesn't
+
+Fits well:
+
+- **Agent platforms** that need durable, findable memory shared across
+  sessions and agents.
+- **Human-in-the-loop review** that needs a queryable record of what agents
+  believed and when.
+- **Any workflow where "what was true then" matters** — incident review,
+  decision logs, rollout notes.
+
+Less of a fit:
+
+- Pure lexical or fuzzy document search — use a search engine.
+- Unbounded "find me anything vaguely related" with no keys in sight — that
+  is exactly the failure mode MemKeys exists to avoid; if you have no
+  entities, you have no addresses.
+- Storing blobs or files — facts are small, addressed records; attachments
+  are references, never inlined.
+
+## What MemKeys is not
+
+Not a vector database — similarity search exists, but as a derived, scoped
+view. Not a graph database — the graph is a projection you never write to
+directly. Not an agent framework — it is the memory layer underneath the
+agents you already run. And despite the shared "mem-" prefix, not MemPalace —
+a separate, unrelated project.
+
+---
+
+**Next:** [run it in five minutes](/memkeys/quickstart/), or read the
+[architecture](/memkeys/docs/architecture/) behind the contract.

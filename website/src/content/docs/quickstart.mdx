@@ -1,0 +1,161 @@
+---
+title: Quickstart
+description: Run the MemKeys memory server locally in five minutes — cargo or Docker — store your first fact, and fetch it back by key.
+template: splash
+editUrl: false
+hero:
+  tagline: QUICKSTART
+  heading: Store your first fact.
+  subhead: "One Postgres, one server, two commands — then a round-trip that shows the whole idea: store a fact by its keys, fetch it back by address."
+  actions:
+    - text: Why MemKeys
+      link: /memkeys/why/
+      variant: minimal
+---
+
+import { Steps, LinkCard } from '@astrojs/starlight/components';
+
+## Prerequisites
+
+- A **Rust toolchain** (1.80+) for the cargo path, or **Docker**.
+- **Postgres with [pgvector](https://github.com/pgvector/pgvector)** — the
+  server runs a `CREATE EXTENSION vector` migration at boot and preflights
+  for it; stock `postgres:*` images fail fast with a clear message.
+- For the Kubernetes path: a cluster ≥ 1.27 and Helm 3.
+
+## Path A — local dev with cargo (5 minutes)
+
+<Steps>
+  1. **Run Postgres with pgvector.**
+
+       ```bash
+       docker run -d --name memkeys-pg \
+         -e POSTGRES_PASSWORD=memkeys \
+         -p 5432:5432 pgvector/pgvector:pg16
+       ```
+
+  2. **Run the server from the repo.** Loopback dev mode self-asserts the
+     tenant; the memory API binds `:3000`, health `:8080`, MCP runs on stdio.
+
+       ```bash
+       export MEMKEYS_DATABASE_URL=postgres://postgres:memkeys@localhost:5432/postgres
+       cargo run -p memkeys-server
+       ```
+
+  3. **Store a fact.** The only thing only you can supply is the body — send
+     the keys you know and the server models the rest.
+
+       ```bash
+       curl -s localhost:3000/memory/facts \
+         -H 'content-type: application/json' \
+         -H 'X-MemKeys-Tenant: default' \
+         -d '{
+           "source": { "kind": "gateway_flush", "emitted_at": "2026-10-23T09:00:00Z" },
+           "entity": { "project": "demo", "agent": "you", "run": "run-1" },
+           "fact":   { "body": "deploy freeze starts Friday", "subject": "freeze" }
+         }'
+       ```
+
+       The response carries the server-resolved keys — cache them for later reads.
+
+  4. **Fetch it back — by key, not by similarity.**
+
+       ```bash
+       curl -s 'localhost:3000/memory/facts?entity.project=demo' \
+         -H 'X-MemKeys-Tenant: default'
+       ```
+
+       Deterministic: same key, same set, no ranking drift. That is the
+       whole idea.
+</Steps>
+
+The same round trip exists as MCP tools (`memory_store`, `memory_fetch`,
+`memory_search`, `memory_traverse`) over stdio, so an agent makes it with a
+config block — see [connect an agent](#connect-an-agent) below and the
+[connect-your-agents recipes](/memkeys/docs/connect-your-agents/).
+
+## Browse memory in the Inspector
+
+The read-only Inspector UI talks only to the public read surface — never to
+the database, never writes.
+
+```bash
+cd frontend
+npm install
+npm run dev    # :3001, proxies /memory → :3000
+```
+
+Open [http://localhost:3001](http://localhost:3001), set the **Tenant** field
+(default tenant: `default`), then browse facts by entity attributes or walk
+the graph from any node.
+
+## Path B — Docker
+
+The server image bundles the Inspector and serves it at `/` on the memory
+port, so this path needs no frontend dev server.
+
+```bash
+docker run -d --name memkeys-pg \
+  -e POSTGRES_PASSWORD=memkeys -p 5432:5432 pgvector/pgvector:pg16
+
+docker run --name memkeys -p 3000:3000 \
+  -e MEMKEYS_DATABASE_URL=postgres://postgres:memkeys@host.docker.internal:5432/postgres \
+  -e MEMKEYS_HTTP_HOST=0.0.0.0 -e MEMKEYS_ALLOW_INSECURE=1 \
+  ghcr.io/memkeys/memkeys-server
+```
+
+The bind flags matter: by default the server binds loopback only, and it
+*refuses* a non-loopback bind without a run-token verifier. In a container,
+`-p 3000:3000` needs `0.0.0.0`, so the quickstart pairs it with the explicit
+dev opt-in (`MEMKEYS_ALLOW_INSECURE=1` — loud warning, dev only). Anything
+shared beyond your machine should mint run tokens instead: see
+[configuration](/memkeys/docs/configuration/).
+
+Then open [http://localhost:3000](http://localhost:3000) for the Inspector,
+and run the same store/fetch round trip as Path A. (On Linux, add
+`--add-host=host.docker.internal:host-gateway` if the container cannot
+resolve it.)
+
+## Path C — Kubernetes
+
+The chart ships as a public OCI artifact; the operator adds a
+`MemKeysInstance` CRD for GitOps-style management.
+
+```bash
+kubectl create secret generic memkeys-run-token \
+  --from-literal=MEMKEYS_RUN_TOKEN_SECRET=dev-secret
+
+helm install memkeys oci://ghcr.io/memkeys/charts/memkeys \
+  --set database.url="postgres://user:pass@host:5432/memkeys" \
+  --set memoryTransport.runTokenSecret.existingSecret=memkeys-run-token
+```
+
+Profiles (`single-node` default, `microservice` with dedicated projection
+workers), the operator CRD, and the full spec reference:
+**[Kubernetes: Helm + operator](/memkeys/docs/k8s-operator/)**.
+
+## Connect an agent
+
+The same four operations are MCP tools over stdio, so wiring an agent is a
+config block:
+
+```bash
+# make the binary available, then register it with Claude Code
+cargo install --path crates/memkeys-server
+claude mcp add memkeys \
+  -e MEMKEYS_DATABASE_URL=postgres://postgres:memkeys@localhost:5432/postgres \
+  -- memkeys-server
+
+claude mcp get memkeys    # expect: Status: ✔ Connected
+```
+
+Recipes for Claude Code, Claude Desktop, goose, kagent, and a raw
+JSON-RPC client: **[Connect your agents](/memkeys/docs/connect-your-agents/)**.
+
+## Where to go next
+
+<LinkCard title="Why MemKeys" description="The keyed-first inversion, in depth." href="/memkeys/why/" />
+<LinkCard title="Architecture" description="The fact envelope, key extraction, derived views, write pipeline." href="/memkeys/docs/architecture/" />
+<LinkCard title="MCP transport" description="The stdio tool surface, sessions, and error handling." href="/memkeys/docs/agent-mcp-transport/" />
+<LinkCard title="Retrieval contract" description="The four operations — full request/response shapes." href="/memkeys/docs/retrieval-contract/" />
+<LinkCard title="Configuration" description="Every environment variable, with defaults." href="/memkeys/docs/configuration/" />
