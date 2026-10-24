@@ -3,7 +3,9 @@
 MemKeys is configured by environment variables. This page is the full
 reference for the server; the [Helm chart](/memkeys/k8s-operator/) and the
 [Kubernetes operator](/memkeys/k8s-operator/#spec-reference-v1alpha1) map
-their values onto these. To get a server running first, see the
+their values onto these. For what an instance needs provisioned end to end —
+Postgres + pgvector, which model endpoints gate which feature — see the
+[instance requirements](/memkeys/instance-requirements/) page. To get a server running first, see the
 [Quickstart](/memkeys/quickstart/).
 
 ## Required
