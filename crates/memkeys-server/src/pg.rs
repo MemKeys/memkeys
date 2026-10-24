@@ -30,21 +30,12 @@ impl PgStore {
     /// reject the scheme up front with a clear configuration error instead.
     pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
         validate_postgres_scheme(url)?;
-        // Pool size is env-tunable (default 8) for EVERY role (all-in-one /
-        // worker / mcp). Its motivating case (ISI-6337): a fleet of per-session
-        // MCP-only processes (MEMKEYS_ROLE=mcp) each serve ONE sequential stdio
-        // session, so each should take a small pool (e.g. 2) via
-        // MEMKEYS_PG_MAX_CONNECTIONS to avoid exhausting Postgres max_connections
-        // at scale (N agents × 8 would blow past the default 100).
-        let max_connections = std::env::var("MEMKEYS_PG_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(8);
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(url)
-            .await?;
+        // Pool sizing is role-aware (see `pool_options_from_env`): MCP-only
+        // per-session processes (MEMKEYS_ROLE=mcp) default to a tiny pool and
+        // shed idle connections, so a fleet of them cannot saturate Postgres
+        // (ISI-6549 RCA / ISI-6552). An explicit MEMKEYS_PG_MAX_CONNECTIONS
+        // always wins, for every role.
+        let pool = pool_options_from_env().connect(url).await?;
         // Preflight pgvector BEFORE any migration runs: migration 0003 does
         // `CREATE EXTENSION vector`, which on a stock Postgres image aborts
         // mid-migration with a raw sqlx error and can leave `_sqlx_migrations`
@@ -87,6 +78,59 @@ fn validate_postgres_scheme(url: &str) -> Result<(), sqlx::Error> {
     ))
 }
 
+/// Role-aware Postgres pool sizing (ISI-6552 defense-in-depth).
+///
+/// `MEMKEYS_ROLE=mcp` runs ONE sequential stdio session per process, so a fleet
+/// of per-agent sessions each holding the historical default (8) connections
+/// multiplies straight into Postgres `max_connections` — the ISI-6549
+/// saturation that PoolTimedOut a rolling replacement. For that role we default
+/// the pool to **2** and give it a short **idle timeout** so an abandoned-but-
+/// still-open session reaps its connections instead of pinning them. Every
+/// other role keeps the historical default 8 and no idle reaping. An explicit,
+/// positive `MEMKEYS_PG_MAX_CONNECTIONS` always wins, for every role.
+#[derive(Debug, PartialEq, Eq)]
+struct PoolConfig {
+    max_connections: u32,
+    idle_timeout: Option<std::time::Duration>,
+}
+
+/// Pure resolver (unit-testable without env or a DB). `role` is the raw
+/// `MEMKEYS_ROLE` value; `max_conn_override` is the raw
+/// `MEMKEYS_PG_MAX_CONNECTIONS` value. Matches `ServerRole::parse`'s
+/// case-insensitive `"mcp"` test (main.rs) so the two never drift.
+fn resolve_pool_config(role: Option<&str>, max_conn_override: Option<&str>) -> PoolConfig {
+    let is_mcp = role.is_some_and(|v| v.eq_ignore_ascii_case("mcp"));
+    let explicit = max_conn_override
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0);
+    let max_connections = explicit.unwrap_or(if is_mcp { 2 } else { 8 });
+    // 90s sits in the task's 60–120s window: long enough that a mid-task agent
+    // pause does not thrash the pool, short enough that an abandoned session
+    // frees its connections well before the next rolling replacement.
+    let idle_timeout = is_mcp.then(|| std::time::Duration::from_secs(90));
+    PoolConfig {
+        max_connections,
+        idle_timeout,
+    }
+}
+
+/// Build [`PgPoolOptions`] from the process environment via
+/// [`resolve_pool_config`]. Shared by every real connect path (FactStore and
+/// the graph projection) so pool sizing lives in exactly one place.
+pub(crate) fn pool_options_from_env() -> PgPoolOptions {
+    let cfg = resolve_pool_config(
+        std::env::var("MEMKEYS_ROLE").ok().as_deref(),
+        std::env::var("MEMKEYS_PG_MAX_CONNECTIONS").ok().as_deref(),
+    );
+    let mut opts = PgPoolOptions::new().max_connections(cfg.max_connections);
+    if let Some(idle) = cfg.idle_timeout {
+        // min_connections defaults to 0, so idle_timeout reaps the whole pool
+        // when a session goes quiet.
+        opts = opts.idle_timeout(idle);
+    }
+    opts
+}
+
 /// Fail fast when the `vector` extension (pgvector) is not available on the
 /// server. `available` is whether `pg_available_extensions` lists `vector`
 /// (installable), not whether it is already created. The message names the
@@ -104,6 +148,63 @@ fn ensure_pgvector_available(available: bool) -> Result<(), sqlx::Error> {
          requirements\")."
             .into(),
     ))
+}
+
+#[cfg(test)]
+mod pool_config_tests {
+    use super::resolve_pool_config;
+    use std::time::Duration;
+
+    #[test]
+    fn mcp_role_defaults_to_two_with_idle_timeout() {
+        let cfg = resolve_pool_config(Some("mcp"), None);
+        assert_eq!(cfg.max_connections, 2);
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn mcp_role_is_case_insensitive() {
+        assert_eq!(resolve_pool_config(Some("MCP"), None).max_connections, 2);
+        assert_eq!(resolve_pool_config(Some("Mcp"), None).max_connections, 2);
+    }
+
+    #[test]
+    fn other_roles_keep_default_eight_and_no_idle_reaping() {
+        for role in [None, Some("worker"), Some(""), Some("all-in-one")] {
+            let cfg = resolve_pool_config(role, None);
+            assert_eq!(cfg.max_connections, 8, "role {role:?}");
+            assert_eq!(cfg.idle_timeout, None, "role {role:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_override_wins_for_every_role() {
+        // Overriding up is allowed even for mcp; the idle reaper still applies.
+        let mcp = resolve_pool_config(Some("mcp"), Some("5"));
+        assert_eq!(mcp.max_connections, 5);
+        assert_eq!(mcp.idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(
+            resolve_pool_config(None, Some("20")).max_connections,
+            20,
+            "explicit override wins for the all-in-one role too"
+        );
+    }
+
+    #[test]
+    fn invalid_or_zero_override_falls_back_to_role_default() {
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                resolve_pool_config(Some("mcp"), Some(bad)).max_connections,
+                2,
+                "bad override {bad:?} should fall back to the mcp default"
+            );
+            assert_eq!(
+                resolve_pool_config(None, Some(bad)).max_connections,
+                8,
+                "bad override {bad:?} should fall back to the default"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

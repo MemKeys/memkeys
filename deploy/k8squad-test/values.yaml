@@ -46,9 +46,15 @@ otel:
 extraEnv:
   - name: MEMKEYS_SEMANTIC
     value: "1"
-  # Bound the DB pool: the 2-day-old sha-8bbb7b3 pod had leaked enough
-  # connections to saturate postgres max_connections and PoolTimedOut the
-  # rolling replacement (ISI-6395). 10 is ample for the single-node dogfood.
+  # Bound the all-in-one server's DB pool. Root cause of the postgres
+  # saturation that PoolTimedOut a rolling replacement was NOT this primary
+  # pod: every agent MCP session was exec'ing a FULL all-in-one server into
+  # the pod (launcher omitted MEMKEYS_ROLE=mcp), so N sessions × the default
+  # 8-connection pool blew past postgres max_connections (ISI-6549 RCA →
+  # ISI-6552). Fixed at the source — deploy/k8squad-test/memkeys-mcp-launcher.sh
+  # now sets MEMKEYS_ROLE=mcp + MEMKEYS_PG_MAX_CONNECTIONS=2, and role=mcp
+  # defaults the pool to 2 with a 90s idle timeout server-side. This 10 is the
+  # primary's own pool, ample for the single-node dogfood.
   - name: MEMKEYS_PG_MAX_CONNECTIONS
     value: "10"
 
