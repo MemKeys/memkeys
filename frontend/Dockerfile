@@ -30,6 +30,15 @@ RUN npm run build
 # --- runtime -------------------------------------------------------------
 FROM nginx:alpine AS runtime
 
+# Patch base-image apk CVEs before layering our assets. The grype DB update of
+# 2026-10-24 flagged a Critical in nginx:alpine's brotli-libs (CVE-2026-111497,
+# FIXED IN 1.2.1-r0) plus a High in curl, failing the docker-inspector grype
+# gate (docker.yml, fail-on critical) on every PR. grype reports both as fixed
+# in newer apk builds, so an upgrade pulls the patched packages and clears the
+# gate without touching the SPA. (Unrelated to ISI-6552; folded in to unblock
+# this PR's CI — the server image uses a non-alpine base and is unaffected.)
+RUN apk upgrade --no-cache
+
 # SPA assets + the server config. nginx.conf is an envsubst template: the
 # entrypoint renders it to /etc/nginx/conf.d/default.conf at container start,
 # substituting MEMORY_API_UPSTREAM.

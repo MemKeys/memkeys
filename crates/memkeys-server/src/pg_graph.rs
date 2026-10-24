@@ -45,11 +45,13 @@ impl PgGraph {
     }
 
     /// Connect, apply migrations, wrap.
+    ///
+    /// The live server shares the FactStore pool via [`PgGraph::from_pool`]
+    /// (main.rs); this standalone constructor is the test/bench path. Pool
+    /// sizing is the same role/env-derived shape as `PgStore::connect`
+    /// (ISI-6552) instead of a hardcoded cap, so the two never drift.
     pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(url)
-            .await?;
+        let pool = crate::pg::pool_options_from_env().connect(url).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self::from_pool(pool))
     }
