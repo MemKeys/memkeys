@@ -5,13 +5,18 @@ name: website-docs-updated
 # repo ingests this repo docs/ (sparse checkout of main) as its docs source
 # of truth — see MemKeys/memkeys-website .github/workflows/deploy.yml.
 # Requires repo secret WEBSITE_DISPATCH_PAT: a PAT with Contents: read/write
-# on MemKeys/memkeys-website (fine-grained) or classic repo scope.
+# on MemKeys/memkeys-website (fine-grained) or classic repo scope. When the
+# secret is absent the job skips with a warning instead of failing — the
+# website repo's scheduled pull-rebuild (deploy.yml `schedule:`) still picks
+# up docs/ changes within its window.
 
 on:
   push:
     branches: [main]
     paths:
       - 'docs/**'
+  # Manual firing: forced republish / verification without a docs push.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,7 +30,19 @@ jobs:
     name: Notify memkeys-website
     runs-on: ubuntu-latest
     steps:
+      - name: Check dispatch token presence
+        id: tok
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_PAT }}
+        run: |
+          if [ -n "${GH_TOKEN}" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fire docs-updated repository_dispatch
+        if: steps.tok.outputs.has == 'true'
         env:
           GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_PAT }}
         run: |
@@ -38,3 +55,8 @@ jobs:
             https://api.github.com/repos/MemKeys/memkeys-website/dispatches \
             -d "$payload"
           echo "docs-updated dispatch sent for ${GITHUB_SHA}"
+
+      - name: Notice — immediate republish disabled
+        if: steps.tok.outputs.has != 'true'
+        run: |
+          echo "::warning::WEBSITE_DISPATCH_PAT is not set — skipping immediate docs-updated dispatch. The memkeys-website scheduled rebuild still republishes docs/ changes automatically."
