@@ -68,7 +68,9 @@ sequenceDiagram
 | `memory_search` | Semantic search over the fact-vector tier | `query`, `scope`, `k`, `tiers`, `as_of` |
 
 Argument details live in the `tools/list` response — the schemas above are
-taken verbatim from it. Things that repeatedly surprise first-time users:
+taken verbatim from it. The full tool semantics — envelope shape, key resolution, and
+the shared error surface — are specified in the
+[retrieval contract](/memkeys/retrieval-contract/). Things that repeatedly surprise first-time users:
 
 - **`memory_fetch` keys are flat and dotted** (`"entity.project": "demo"`),
   not nested objects.
