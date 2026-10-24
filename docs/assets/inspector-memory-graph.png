@@ -1,0 +1,19 @@
+PLACEHOLDER: Inspector UI — Memory Graph screenshot
+
+This is a placeholder file. In a real deployment, this would be a PNG screenshot captured from a local browser run.
+
+To capture:
+1. Start the MemKeys server: `cargo run -p memkeys-server`
+2. Start the Inspector: `cd frontend && npm run dev`
+3. Navigate to http://localhost:3001
+4. Configure tenant and API connection
+5. Open the Memory Graph panel
+6. Select a start node and configure traversal
+7. Take a screenshot and save as `inspector-memory-graph.png`
+
+The screenshot should show:
+- Graph visualization with nodes and edges
+- Start node selector (kind + id)
+- Direction/depth/edge-type controls
+- Truncation or dangling-edge warnings (if applicable)
+- Legend (if shown)

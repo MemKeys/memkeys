@@ -1,0 +1,18 @@
+PLACEHOLDER: Inspector UI — Facts Browser screenshot
+
+This is a placeholder file. In a real deployment, this would be a PNG screenshot captured from a local browser run.
+
+To capture:
+1. Start the MemKeys server: `cargo run -p memkeys-server`
+2. Start the Inspector: `cd frontend && npm run dev`
+3. Navigate to http://localhost:3001
+4. Configure tenant and API connection
+5. Browse some facts using the Facts Browser
+6. Take a screenshot and save as `inspector-facts-browser.png`
+
+The screenshot should show:
+- Top bar with tenant/connection settings
+- Entity key filters (project, issue, pr, agent, run, thread, service)
+- Type and temporal filters
+- Facts results list
+- Fact detail panel (if opened)
