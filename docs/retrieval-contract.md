@@ -12,6 +12,9 @@ The same four operations are available over two transports:
 - **MCP over stdio** as the tools `memory_store`, `memory_fetch`,
   `memory_search`, `memory_traverse` (see [MCP transport](/memkeys/agent-mcp-transport/))
 
+New to MemKeys? Start with [What is MemKeys](/memkeys/what-is-memkeys/) and
+the [Quickstart](/memkeys/quickstart/).
+
 ## 1 — Store (write-with-keys)
 
 ```

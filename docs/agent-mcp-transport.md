@@ -3,7 +3,8 @@
 MemKeys speaks the [Model Context Protocol](https://modelcontextprotocol.io)
 as **newline-delimited JSON-RPC 2.0 over stdio**. Any MCP-capable client —
 Claude Code, Claude Desktop, goose, kagent, or your own — can use MemKeys as
-its memory server with zero glue code.
+its memory server with zero glue code. For host-by-host config recipes, see
+[Connect your agents](/memkeys/connect-your-agents/).
 
 There is no thin remote connector: the MCP server *is* the `memkeys-server`
 binary. Depending on its role, the same process either serves MCP alongside

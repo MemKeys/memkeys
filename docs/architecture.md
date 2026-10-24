@@ -4,7 +4,9 @@ MemKeys is an attribute-based memory server: facts keyed by agent-supplied
 attributes, temporal validity, graph and vector as derived views, behind a
 small open retrieval contract with pluggable backends. This page is the
 architecture of the shipped server — the storage model, the fact envelope,
-the write pipeline, and the retrieval contract.
+the write pipeline, and the retrieval contract. New to MemKeys? Start with
+[What is MemKeys](/memkeys/what-is-memkeys/) or the
+[Quickstart](/memkeys/quickstart/).
 
 The one invariant that organizes everything:
 
