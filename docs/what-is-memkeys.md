@@ -99,3 +99,4 @@ agent platform is a *consumer* of its contract.
 - [Quickstart](/memkeys/quickstart/) — store your first fact in five minutes.
 - [Architecture](/memkeys/architecture/) — the contract, the envelope, the
   derived views, and the write pipeline.
+- [Inspector UI](/memkeys/inspector-ui/) — browse and visualize your memory with the read-only web interface.

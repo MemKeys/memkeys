@@ -3,7 +3,10 @@
 MemKeys is configured by environment variables. This page is the full
 reference for the server; the [Helm chart](/memkeys/k8s-operator/) and the
 [Kubernetes operator](/memkeys/k8s-operator/#spec-reference-v1alpha1) map
-their values onto these.
+their values onto these. For what an instance needs provisioned end to end —
+Postgres + pgvector, which model endpoints gate which feature — see the
+[instance requirements](/memkeys/instance-requirements/) page. To get a server running first, see the
+[Quickstart](/memkeys/quickstart/).
 
 ## Required
 
@@ -34,7 +37,7 @@ On boot each listener logs its own line (`memkeys.server.health.listen` /
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMKEYS_RUN_TOKEN_SECRET` | — | HS256 issuer secret for run tokens. When set, every bearer / launch token is verified and the **tenant floor is derived server-side** from the token claims. Absent → open loopback dev mode (tenant self-asserted). |
+| `MEMKEYS_RUN_TOKEN_SECRET` | — | Shared HS256 secret for run tokens (the server verifies; your issuer mints). When set, every bearer / launch token is verified and the **tenant floor is derived server-side** from the token claims. Absent → open loopback dev mode (tenant self-asserted via the `x-memkeys-tenant` header). |
 | `MEMKEYS_RUN_TOKEN` | — | A launch-bound HS256 principal (JWT). Claims: `company_id` → tenant, `sub` → `entity.agent` / provenance principal, `exp` → expiry, re-checked on every call. Used by the MCP stdio transport; see [MCP transport](/memkeys/agent-mcp-transport/). |
 | `MEMKEYS_STDIO_TENANT` | `default` | Tenant for the unverified dev principal when no run token is configured (loopback dev only). |
 | `MEMKEYS_ALLOW_INSECURE` | — | `1` permits a non-loopback bind with no verifier, with a loud warning. Dev only; do not ship. |
@@ -43,8 +46,8 @@ On boot each listener logs its own line (`memkeys.server.health.listen` /
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMKEYS_SEMANTIC` | off | `1` enables the vector tier. Off → `/memory/search` and the `memory_search` tool return `feature_disabled` (501 over HTTP) rather than empty results. |
-| `MEMKEYS_SEMANTIC_DIGEST` | off | `1` additionally enables the digest tier (scope rollup summaries). See [Architecture — vector index](/memkeys/architecture/#vector-index-two-tiers-optional-module). |
+| `MEMKEYS_SEMANTIC` | off | `1` (or `on` / `true`) enables the vector tier. Off → `/memory/search` and the `memory_search` tool return `feature_disabled` (501 over HTTP) rather than empty results. |
+| `MEMKEYS_SEMANTIC_DIGEST` | off | `1` additionally enables the digest tier (scope rollup summaries, projected today; they join the search path as the digest read path matures). See [Architecture — vector index](/memkeys/architecture/#vector-index-two-tiers-optional-module). |
 | `MEMKEYS_EMBED_URL` | — | Embedder endpoint. Both tiers must use the same embedder as the process that wrote the vectors. |
 | `MEMKEYS_EMBED_MODEL` | — | Embedder model id. |
 | `MEMKEYS_GEN_URL` | — | Generative endpoint (summarizer) for digest rollups. |

@@ -1,0 +1,62 @@
+name: website-docs-updated
+
+# Fires the memkeys-website `docs-updated` repository_dispatch whenever the
+# docs/ tree changes on main, so the published site republishes. The website
+# repo ingests this repo docs/ (sparse checkout of main) as its docs source
+# of truth — see MemKeys/memkeys-website .github/workflows/deploy.yml.
+# Requires repo secret WEBSITE_DISPATCH_PAT: a PAT with Contents: read/write
+# on MemKeys/memkeys-website (fine-grained) or classic repo scope. When the
+# secret is absent the job skips with a warning instead of failing — the
+# website repo's scheduled pull-rebuild (deploy.yml `schedule:`) still picks
+# up docs/ changes within its window.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+  # Manual firing: forced republish / verification without a docs push.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-docs-updated
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Notify memkeys-website
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check dispatch token presence
+        id: tok
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_PAT }}
+        run: |
+          if [ -n "${GH_TOKEN}" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fire docs-updated repository_dispatch
+        if: steps.tok.outputs.has == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_PAT }}
+        run: |
+          set -eu
+          payload=$(printf '{"event_type":"docs-updated","client_payload":{"ref":"%s","source":"memkeys-docs"}}' "$GITHUB_SHA")
+          curl -sf --retry 3 --retry-delay 5 -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/MemKeys/memkeys-website/dispatches \
+            -d "$payload"
+          echo "docs-updated dispatch sent for ${GITHUB_SHA}"
+
+      - name: Notice — immediate republish disabled
+        if: steps.tok.outputs.has != 'true'
+        run: |
+          echo "::warning::WEBSITE_DISPATCH_PAT is not set — skipping immediate docs-updated dispatch. The memkeys-website scheduled rebuild still republishes docs/ changes automatically."

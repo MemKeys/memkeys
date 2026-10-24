@@ -10,6 +10,9 @@ import {
   NodeKind,
   TraverseNode,
   TraverseResult,
+  APIError,
+  SearchHit,
+  SearchQuery,
 } from '../types/api';
 
 export const DEFAULT_LIMIT = 100;
@@ -106,6 +109,8 @@ export interface GraphLink {
   source: string;
   target: string;
   edge_type: string;
+  /** Bitemporal event time carried on the wire edge (`TraverseEdge.event_time`). */
+  event_time: string;
 }
 
 export interface GraphData {
@@ -129,8 +134,9 @@ export function nodeLabel(n: TraverseNode): string {
 /**
  * Transform a {@link TraverseResult} into d3-friendly `{nodes, links}`. Edges
  * that reference an unknown node id are dropped (a projection hole should not
- * crash the force layout); dropped edges are reported in `droppedEdges` so the
- * UI can surface the gap rather than silently hide it.
+ * crash the force layout); dropped edges are reported in `droppedEdges` so
+ * the UI can surface the gap rather than silently hide it. The wire edge's
+ * `event_time` is carried through for the edge-detail popup (ISI-6582).
  */
 export function toGraphData(result: TraverseResult): GraphData & { droppedEdges: number } {
   const nodes: GraphNode[] = result.nodes.map((n) => ({
@@ -145,10 +151,75 @@ export function toGraphData(result: TraverseResult): GraphData & { droppedEdges:
   let droppedEdges = 0;
   for (const e of result.edges) {
     if (ids.has(e.from) && ids.has(e.to)) {
-      links.push({ source: e.from, target: e.to, edge_type: e.edge_type });
+      links.push({
+        source: e.from,
+        target: e.to,
+        edge_type: e.edge_type,
+        event_time: e.event_time,
+      });
     } else {
       droppedEdges += 1;
     }
   }
   return { nodes, links, droppedEdges };
+}
+
+/** Semantic-search op-4 defaults (service.rs SearchRequest::DEFAULT_K). */
+export const DEFAULT_SEARCH_K = 10;
+
+/**
+ * Build the POST /memory/search body. The query is trimmed; the type filter
+ * maps to scope["fact.type"] (omitted when blank so the scope stays empty
+ * and only the server-set tenant floor applies); k rides only when it
+ * differs from the server default, mirroring {@link buildQueryParams}.
+ */
+export function buildSearchBody(query: SearchQuery): Record<string, unknown> {
+  const body: Record<string, unknown> = { query: query.query.trim() };
+  if (query.type && query.type.trim() !== '') {
+    body['scope'] = { 'fact.type': query.type.trim() };
+  }
+  if (query.k !== DEFAULT_SEARCH_K) body['k'] = query.k;
+  return body;
+}
+
+/** True when the Explore query carries non-blank text — the only requirement. */
+export function hasSearchText(query: SearchQuery): boolean {
+  return query.query.trim() !== '';
+}
+
+/**
+ * Flatten a {@link SearchHit} onto a {@link FactRecord} so Explore results
+ * render through the shared fact-card table. Fields the hit does not carry
+ * (confidence, supersedes, ingested_at) degrade to null / event_time
+ * mirrors; the score travels separately (score column).
+ */
+export function hitToRecord(hit: SearchHit): FactRecord {
+  return {
+    id: hit['fact.id'],
+    fact_type: hit['fact.type'],
+    subject: hit['fact.subject'],
+    body: hit['fact.body'],
+    confidence: null,
+    supersedes: null,
+    event_time: hit.event_time,
+    ingested_at: hit.event_time,
+    entity_project: hit.entity.project ?? null,
+    entity_issue: hit.entity.issue ?? null,
+    entity_pr: hit.entity.pr ?? null,
+    entity_agent: hit.entity.agent ?? null,
+    entity_run: hit.entity.run ?? null,
+    entity_thread: hit.entity.thread ?? null,
+    entity_service: hit.entity.service ?? null,
+    keyed: true,
+    provenance_principal: hit.provenance,
+  };
+}
+
+/**
+ * True when an APIError is the "semantic module off" 501: the Explore tab
+ * renders its enable-memory.semantic empty state with a Keyed-lookup
+ * fallback instead of a raw error banner (ISI-6581 audit note).
+ */
+export function isFeatureDisabled(err: APIError): boolean {
+  return err.code === 'feature_disabled' || err.code === '501';
 }

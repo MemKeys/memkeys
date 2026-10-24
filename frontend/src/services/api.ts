@@ -5,8 +5,10 @@ import {
   FactsResponse,
   TraverseRequest,
   TraverseResult,
+  SearchQuery,
+  SearchResponse,
 } from '../types/api';
-import { buildQueryParams } from '../lib/transform';
+import { buildQueryParams, buildSearchBody } from '../lib/transform';
 
 // All reads go through the `/memory` prefix. In dev, vite proxies this to the
 // server (see vite.config.ts); in a deployed build the SPA is served from the
@@ -123,3 +125,25 @@ export async function testConnection(auth: AuthConfig): Promise<void> {
     throw toAPIError(error, 'Connection test failed');
   }
 }
+
+export const searchAPI = {
+  /**
+   * Keyless semantic search (op 4). No entity keys required — the scope is
+   * server-floored to the caller's tenant. Answers 501 feature_disabled
+   * when memory.semantic is off; the Explore tab degrades to its
+   * enable-hint empty state + Keyed-lookup fallback (ISI-6581) rather
+   * than showing a raw error.
+   */
+  async search(query: SearchQuery, auth: AuthConfig): Promise<SearchResponse> {
+    try {
+      const { data } = await client.post<SearchResponse>(
+        '/search',
+        buildSearchBody(query),
+        { headers: authHeaders(auth) },
+      );
+      return data;
+    } catch (error) {
+      throw toAPIError(error, 'Semantic search failed');
+    }
+  },
+};

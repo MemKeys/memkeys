@@ -30,12 +30,14 @@ or when you run many instances per cluster.
 
 ## Helm: install
 
-The chart is published as a public OCI artifact — no `helm repo add` needed:
+The chart is published as a public OCI artifact — no `helm repo add` needed.
+The full values reference lives in the [chart README](https://github.com/MemKeys/memkeys/blob/main/charts/memkeys/README.md);
+the essentials:
 
 ```sh
-# Create the run-token issuer secret
+# Create the run-token secret
 kubectl create secret generic memkeys-run-token \
-  --from-literal=MEMKEYS_RUN_TOKEN_SECRET=<issuer-secret>
+  --from-literal=MEMKEYS_RUN_TOKEN_SECRET=<shared-secret>
 
 # Install from GHCR
 helm install memkeys oci://ghcr.io/memkeys/charts/memkeys \
@@ -44,7 +46,7 @@ helm install memkeys oci://ghcr.io/memkeys/charts/memkeys \
 ```
 
 Or from a checkout: `helm install memkeys charts/memkeys …`. Inspect a
-version with `helm show chart oci://ghcr.io/memkeys/charts/memkeys`.
+published version with `helm show chart oci://ghcr.io/memkeys/charts/memkeys`.
 
 ### Profiles
 
@@ -162,7 +164,7 @@ kubectl describe mki memkeys-sample
 |---|---|---|
 | `profile` | `single-node` | `single-node` \| `microservice` |
 | `replicas` | profile (1 / 2) | server replica count override |
-| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/memkeys/memkeys` / app version / `IfNotPresent` | server + worker image; published release images live at `ghcr.io/memkeys/memkeys-server` — set it explicitly as in the samples |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/memkeys/memkeys` / `latest` / `IfNotPresent` | server + worker image; published release images live at `ghcr.io/memkeys/memkeys-server` — set it explicitly as in the samples |
 | `database.url` | — | inline URL → operator renders a `<name>-db` Secret |
 | `database.existingSecret` / `existingSecretKey` | — / `MEMKEYS_DATABASE_URL` | reference a pre-provisioned Secret |
 | `otel.endpoint` / `deploymentEnv` / `serviceNamespace` / `tracesSamplerRatio` | — / `dev` / — / — | OTel wiring, mirrors the chart |
@@ -176,15 +178,19 @@ kubectl describe mki memkeys-sample
 | `memoryTransport.allowInsecure` | `false` | dev only: bind off-loopback with no verifier |
 | `resources` | chart defaults | server container requests/limits |
 
-Exactly one of `database.url` / `database.existingSecret` must be set, else
-the instance is marked `Degraded` and no pods roll out (fail-closed).
+At least one of `database.url` / `database.existingSecret` must be set —
+with neither, the instance is marked `Degraded` (`DatabaseUnconfigured`) and
+no pods roll out (fail-closed). When both are set, `existingSecret` wins.
 
 ### Status conditions
 
 Conditions follow standard `metav1.Condition` semantics and reflect **real**
 Deployment availability: `Ready` (server — and workers, for microservice —
 fully available), `Progressing` (rolling out), `Degraded`
-(`ReplicaFailure`, `ProgressDeadlineExceeded`, or unusable DB config).
+(`DeploymentReplicaFailure`, `ProgressDeadlineExceeded`, or an unusable
+config — `DatabaseUnconfigured`, `MemoryTransportUnauthenticated`,
+`MemoryTransportPortCollision`). The fail-closed gates degrade before any pod
+rolls out, so a `Degraded` instance never serves a broken surface.
 
 ## Development
 

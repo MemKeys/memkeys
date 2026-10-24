@@ -4,7 +4,9 @@ MemKeys is an attribute-based memory server: facts keyed by agent-supplied
 attributes, temporal validity, graph and vector as derived views, behind a
 small open retrieval contract with pluggable backends. This page is the
 architecture of the shipped server — the storage model, the fact envelope,
-the write pipeline, and the retrieval contract.
+the write pipeline, and the retrieval contract. New to MemKeys? Start with
+[What is MemKeys](/memkeys/what-is-memkeys/) or the
+[Quickstart](/memkeys/quickstart/).
 
 The one invariant that organizes everything:
 
@@ -14,16 +16,28 @@ The one invariant that organizes everything:
 
 ## Overview
 
-```
-   client (thin)                     memory server (does the modeling)            storage
- ┌──────────────┐   raw fact       ┌──────────────────────────────────────┐   ┌──────────────────────────────┐
- │ agent flush   │ ───envelope───▶ │ normalize → key → temporalize        │──▶│ keyed / temporal store       │ ◀─ source of truth
- │ run settle    │                 │    └─ commit ──────────────────────── │   │ (Postgres + pgvector)        │
- │ MCP tool call │                 │                                       │   └────────────┬─────────────────┘
- └──────────────┘                 │ async derived-view maintenance:       │                 │ replay
-                                   │  graph edges + supersedes            │──▶ graph store   │ (rebuildable)
-                                   │  embeddings (if enabled)             │──▶ vector index  │ (rebuildable, optional)
-                                   └──────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph client ["client (thin)"]
+        C["agent flush · run settle · MCP tool call"]
+    end
+    subgraph server ["memory server (does the modeling)"]
+        P["normalize → key → temporalize → commit"]
+        M["async derived-view maintenance:<br/>graph edges + supersedes,<br/>embeddings (if enabled)"]
+    end
+    subgraph storage ["storage"]
+        K[("keyed / temporal store<br/>Postgres + pgvector<br/>single source of truth")]
+        G["graph store<br/>(rebuildable)"]
+        V["vector index<br/>(rebuildable, optional)"]
+    end
+
+    C -- "raw fact envelope" --> P
+    P -- "authoritative keyed write" --> K
+    P -. "after keyed commit" .-> M
+    M --> G
+    M --> V
+    K -. "replay" .-> G
+    K -. "replay" .-> V
 ```
 
 The server does the modeling. Clients push raw facts; the server normalizes
@@ -181,6 +195,29 @@ naturally from an append-only log.
 Temporal reads answer two distinct questions precisely: *what was true then*
 (event time) and *what had we recorded by then* (transaction time).
 
+### Physical layout
+
+"Postgres + pgvector" is not one table — it is one database holding the source
+of truth plus every derived projection, created by a linear migration sequence
+under `crates/memkeys-server/migrations/`:
+
+| Migration | Table(s) | Role |
+|---|---|---|
+| `0001_factstore` | `facts` | The keyed / temporal **source of truth**: one immutable row per processed fact, with partial indexes per entity key (`facts_tenant_{project,issue,pr,agent,run,thread,service}_idx`) and a `WHERE keyed` time index for scoped scans. |
+| `0002_graph_projection` | `edges` | The **graph projection** — derived, rebuildable, never written directly (see [Derived views](#derived-views)). |
+| `0003_fact_vectors` | `fact_vectors` | The **fact tier** of the semantic index. Runs `CREATE EXTENSION vector`; stores one `vector(256)` embedding per fact with an HNSW cosine ANN index. |
+| `0004_llm_pipeline` | `derived_keys`, `digests`, `category_facets`, `derivation_runs` | The LLM-derived tier: extracted keys, scope-rollup digests (embedding inline in the digest row), category facets, and the per-artifact derivation bookkeeping that drives catch-up/backfill. |
+| `0005_digest_poison_quarantine` | *(alters `derivation_runs`)* | Quarantine stamps for scopes whose rollup deterministically fails, so poison does not re-drive forever. |
+| `0006_live_head` | *(alters `facts`)* | `facts.entity_identity` + `facts_live_head_idx` partial index — accelerates the live-head gate in the write path; no write-back to prior rows. |
+| `0007_embedding_model_stamp` | *(alters `fact_vectors`, `digests`)* | Stamps each embedded row with the embedder `model_id` so an embedder change triggers re-embedding instead of silently mixing vector spaces. |
+
+Later migrations refine the two structural rows of the story: `facts` stays
+append-only (0006 adds a column computed at commit, never rewritten), and the
+derived tables stay rebuildable (0005/0007 exist to make *rebuilding* smarter).
+What a deployment actually needs to provision — Postgres version, pgvector,
+model endpoints — is specified on the [instance requirements](/memkeys/instance-requirements/)
+page.
+
 ## Derived views
 
 Both derived views are projections of the keyed store. Three invariants hold
@@ -282,14 +319,23 @@ violating configs at load with a warning.
 
 ## Write pipeline
 
-```
-ingest ─▶ [1 normalize] ─▶ [2 key] ─▶ [3 temporalize] ─▶ [4 commit] ─▶ ack
-                                                                │
-                                              async derived-view maintenance
-                                              ├─ [5a] project graph edges
-                                              ├─ [5b] embed fact.body          → fact tier    (if semantic)
-                                              ├─ [5c] scope rollup → embed     → digest tier  (if semantic.digest)
-                                              └─ [5d] categorize → consolidate → category facets
+```mermaid
+flowchart LR
+    IN[ingest] --> N1["1 · normalize"]
+    N1 --> N2["2 · key"]
+    N2 --> N3["3 · temporalize"]
+    N3 --> N4["4 · commit<br/>keyed store (source of truth)"]
+    N4 --> ACK["ack<br/>gated on stage 4 only"]
+
+    N4 -. "async · idempotent · retryable" .-> S5
+
+    subgraph S5 ["stage 5 — derived-view maintenance"]
+        direction TB
+        S5A["5a · project graph edges"]
+        S5B["5b · embed fact.body → fact tier<br/>(if semantic)"]
+        S5C["5c · scope rollup → embed → digest tier<br/>(if semantic.digest)"]
+        S5D["5d · categorize → consolidate → category facets"]
+    end
 ```
 
 - **Stages 1–4 are synchronous, cheap, and authoritative.** The ack is gated
@@ -303,6 +349,55 @@ ingest ─▶ [1 normalize] ─▶ [2 key] ─▶ [3 temporalize] ─▶ [4 comm
   Projection lag is an exported metric, so a deployment can alert on a
   derived view falling behind its source of truth. A projection failure
   never blocks writes or keyed reads.
+
+## Process roles
+
+One binary, three personalities. `MEMKEYS_ROLE` selects which surfaces a
+process runs (full reference in [Configuration — roles](/memkeys/configuration/#roles)):
+
+| Role | Runs | Typical shape |
+|---|---|---|
+| `all-in-one` *(default)* | Stages 1–4 (HTTP + stdio MCP), the stage-5 worker stack, reconciler, health | Single process; the default `memkeys-server` image entrypoint. |
+| `worker` | Stage 5 + reconciler + health — **no** memory transport | Scaled Deployment for projection throughput; the only role that talks to model endpoints at volume. |
+| `mcp` | stdio MCP **only** — no listeners, no boot reconcile, no maintenance loop | Per-session sidecar next to an agent; small pool (`MEMKEYS_PG_MAX_CONNECTIONS=2`). |
+
+```mermaid
+flowchart TB
+    PG[("Postgres + pgvector<br/>facts · edges · fact_vectors · llm-pipeline tables")]
+
+    subgraph aio ["MEMKEYS_ROLE=all-in-one (default)"]
+        HTTP["/memory/* HTTP + stdio MCP<br/>stages 1–4"]
+        W1["stage 5 workers + reconciler"]
+        HTTP --> W1
+    end
+
+    subgraph micro ["microservice profile"]
+        FRONT["MEMKEYS_ROLE=all-in-one<br/>memory API + stdio MCP"]
+        WK["MEMKEYS_ROLE=worker<br/>projection-only"]
+    end
+
+    subgraph sessions ["agent hosts"]
+        MCP1["MEMKEYS_ROLE=mcp<br/>per-session stdio"]
+        MCP2["MEMKEYS_ROLE=mcp<br/>per-session stdio"]
+    end
+
+    EMB["embedder endpoint<br/>(optional)"]
+    GEN["summarizer endpoint<br/>(optional)"]
+
+    FRONT --> PG
+    HTTP --> PG
+    WK --> PG
+    MCP1 --> PG
+    MCP2 --> PG
+    W1 --> EMB
+    WK --> EMB
+    WK --> GEN
+```
+
+All roles converge on the same database; the split is about which listeners
+and loops a process owns, never about different data. What each shape needs
+provisioned is on the [instance requirements](/memkeys/instance-requirements/)
+page.
 
 ## The retrieval contract
 
@@ -345,21 +440,21 @@ network bind.
 
 The founding roundtrip — flush → key → hydrate by issue:
 
-```
-Agent A (end of session, working issue X)
-  └─ POST /memory/facts  { source.kind: gateway_flush,
-                           entity.run: R,            // A knows only its run id
-                           fact: { body: "<handoff note>" } }
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent A (end of session, working issue X)
+    participant S as Server
+    participant B as Agent B (later, picks up issue X)
 
-Server
-  ├─ normalize   → fact.id = F
-  ├─ key         → enrich run=R ⇒ issue=X, project=P
-  ├─ temporalize → event_time = emitted_at
-  └─ commit      → keyed record; async projections enqueued
-
-Agent B (later, picks up issue X)
-  └─ GET /memory/facts?entity.issue=X&valid=current
-        └─ returns A's handoff context, keyed by issue — no embeddings touched
+    A->>S: POST /memory/facts<br/>source.kind: gateway_flush<br/>entity.run: R (A knows only its run id)<br/>fact.body: "handoff note"
+    S->>S: normalize → fact.id = F
+    S->>S: key → enrich run=R ⇒ issue=X, project=P
+    S->>S: temporalize → event_time = emitted_at
+    S->>S: commit → keyed record (async projections enqueued)
+    S-->>A: ack (gated on the keyed commit)
+    B->>S: GET /memory/facts?entity.issue=X&valid=current
+    S-->>B: A's handoff context, keyed by issue — no embeddings touched
 ```
 
 Criteria: B retrieves A's context by issue key alone; the run-only envelope
