@@ -11,39 +11,42 @@ import {
 import { graphAPI } from '../services/api';
 import { useAuth } from '../services/authContext';
 import { buildNodeId, GraphLink, GraphNode, toGraphData } from '../lib/transform';
+import {
+  EdgeDetail,
+  EDGE_COLOR,
+  EDGE_MEANINGS,
+  edgeDirectionRelativeToStart,
+  EDGE_TYPE_ORDER,
+  KIND_COLOR,
+  NODE_KIND_ORDER,
+  supersededNodeIds,
+} from '../lib/legend';
 import ErrorBanner from './ErrorBanner';
+import GraphLegend from './GraphLegend';
+import DetailPopup from './DetailPopup';
 
-const NODE_KINDS: NodeKind[] = [
-  'fact',
-  'entity_project',
-  'entity_issue',
-  'entity_pr',
-  'entity_agent',
-  'entity_run',
-  'a2a_hint',
-];
 const EDGE_TYPES: EdgeType[] = ['entity_fact', 'supersedes', 'produced_by', 'a2a_participant'];
 const DIRECTIONS: Direction[] = ['out', 'in', 'both'];
 
-// Stable color per node kind (color-blind-safe-ish categorical ramp).
-const KIND_COLOR: Record<NodeKind, string> = {
-  fact: '#4f8cff',
-  entity_project: '#2ca02c',
-  entity_issue: '#ff7f0e',
-  entity_pr: '#9467bd',
-  entity_agent: '#17becf',
-  entity_run: '#bcbd22',
-  a2a_hint: '#e377c2',
-};
-
 type SimNode = GraphNode & d3.SimulationNodeDatum;
-type SimLink = d3.SimulationLinkDatum<SimNode> & { edge_type: string };
+type SimLink = d3.SimulationLinkDatum<SimNode> & { edge_type: string; event_time: string };
+
+/**
+ * Endpoint id of a d3 link endpoint. Before the force layout initializes a
+ * link, d3 leaves its endpoints as the raw datum (string id or link index);
+ * afterwards they are resolved to the sim node.
+ */
+function linkEndId(v: string | number | SimNode): string {
+  return typeof v === 'object' ? v.id : String(v);
+}
 
 /**
  * Memory Graph — renders the neighborhood returned by
  * `POST /memory/graph/traverse` as a d3 force-directed graph. Topology-only or
  * unhydratable nodes are still drawn (body omitted, never faked); dropped
- * dangling edges are surfaced in the status line.
+ * dangling edges are surfaced in the status line. Clicking a node opens the
+ * fact-detail popup, clicking an edge opens the edge-detail popup (ISI-6582);
+ * a static legend under the canvas decodes edge semantics and node styles.
  */
 export default function MemoryGraph() {
   const { auth } = useAuth();
@@ -58,6 +61,10 @@ export default function MemoryGraph() {
   const [error, setError] = useState<APIError | null>(null);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  const [selectedEdge, setSelectedEdge] = useState<EdgeDetail | null>(null);
+  /** The traverse start id, for edge-direction tooltips/popups (survives redraws). */
+  const startIdRef = useRef<string | null>(null);
 
   const toggleEdge = (t: EdgeType) =>
     setEdges((cur) => (cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t]));
@@ -103,6 +110,9 @@ export default function MemoryGraph() {
       deadline_ms: 2000,
       ...partial,
     };
+    startIdRef.current = req.start.id;
+    setSelectedNode(null);
+    setSelectedEdge(null);
     try {
       const result = await graphAPI.traverse(req, auth);
       draw(result);
@@ -130,6 +140,7 @@ export default function MemoryGraph() {
 
     const simNodes: SimNode[] = nodes.map((n) => ({ ...n }));
     const simLinks: SimLink[] = (links as GraphLink[]).map((l) => ({ ...l }));
+    const superseded = supersededNodeIds(links);
 
     const sim = d3
       .forceSimulation<SimNode>(simNodes)
@@ -144,6 +155,25 @@ export default function MemoryGraph() {
       .force('center', d3.forceCenter(width / 2, height / 2))
       .force('collide', d3.forceCollide(26));
 
+    // Per-type arrowheads (approved mock: edges show direction), one marker
+    // per edge color; userSpaceOnUse keeps the head size off the 10px hit stroke.
+    svg
+      .append('defs')
+      .selectAll('marker')
+      .data(EDGE_TYPE_ORDER)
+      .join('marker')
+      .attr('id', (d) => `mk-arrow-${d}`)
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 19)
+      .attr('refY', 0)
+      .attr('markerWidth', 8)
+      .attr('markerHeight', 8)
+      .attr('orient', 'auto')
+      .attr('markerUnits', 'userSpaceOnUse')
+      .append('path')
+      .attr('d', 'M0,-5L10,0L0,5')
+      .attr('fill', (d) => EDGE_COLOR[d]);
+
     const root = svg.append('g');
     svg.call(
       d3
@@ -151,6 +181,48 @@ export default function MemoryGraph() {
         .scaleExtent([0.2, 4])
         .on('zoom', (ev) => root.attr('transform', ev.transform.toString())),
     );
+    // Clicking the empty canvas dismisses any open detail popup.
+    svg.on('click', () => {
+      setSelectedNode(null);
+      setSelectedEdge(null);
+    });
+
+    // Wide transparent hit-lines carry the hover tooltip and click for edges —
+    // a 1.5px stroke is an impossible click target.
+    const hit = root
+      .append('g')
+      .attr('stroke', 'transparent')
+      .attr('stroke-width', 10)
+      .attr('cursor', 'pointer')
+      .selectAll('line')
+      .data(simLinks)
+      .join('line')
+      .on('click', (ev, d) => {
+        ev.stopPropagation();
+        const source = linkEndId(d.source);
+        const target = linkEndId(d.target);
+        setSelectedNode(null);
+        setSelectedEdge({
+          source,
+          target,
+          edge_type: d.edge_type,
+          event_time: d.event_time,
+          direction: edgeDirectionRelativeToStart(source, target, startIdRef.current),
+        });
+      });
+    hit.append('title').text((d) => {
+      const dir = edgeDirectionRelativeToStart(
+        linkEndId(d.source),
+        linkEndId(d.target),
+        startIdRef.current,
+      );
+      return (
+        `${d.edge_type} — ${EDGE_MEANINGS[d.edge_type as EdgeType] ?? 'unknown edge type'}\n` +
+        `${linkEndId(d.source)} → ${linkEndId(d.target)}\n` +
+        `event time: ${d.event_time}` +
+        (dir ? `\ndirection: ${dir} (relative to traversal start)` : '')
+      );
+    });
 
     const link = root
       .append('g')
@@ -159,23 +231,38 @@ export default function MemoryGraph() {
       .selectAll('line')
       .data(simLinks)
       .join('line')
-      .attr('stroke-width', 1.5);
-
-    link.append('title').text((d) => d.edge_type);
+      .attr('stroke-width', 1.5)
+      .attr('stroke', (d) => EDGE_COLOR[d.edge_type as EdgeType] ?? '#999')
+      .attr('marker-end', (d) => `url(#mk-arrow-${d.edge_type})`)
+      .attr('pointer-events', 'none');
 
     const node = root
       .append('g')
+      .attr('cursor', 'pointer')
       .selectAll<SVGGElement, SimNode>('g')
       .data(simNodes)
       .join('g')
-      .call(drag(sim));
+      .call(drag(sim))
+      .on('click', (ev, d) => {
+        ev.stopPropagation();
+        setSelectedEdge(null);
+        setSelectedNode({
+          id: d.id,
+          kind: d.kind,
+          label: d.label,
+          unhydratable: d.unhydratable,
+          record: d.record,
+        });
+      });
 
     node
       .append('circle')
       .attr('r', 12)
       .attr('fill', (d) => KIND_COLOR[d.kind])
       .attr('stroke', (d) => (d.unhydratable ? '#d62728' : '#fff'))
-      .attr('stroke-width', (d) => (d.unhydratable ? 3 : 1.5));
+      .attr('stroke-width', (d) => (d.unhydratable ? 3 : 1.5))
+      // Superseded facts get a dashed ring (see the legend).
+      .attr('stroke-dasharray', (d) => (superseded.has(d.id) ? '4 3' : null));
 
     node
       .append('text')
@@ -183,11 +270,17 @@ export default function MemoryGraph() {
       .attr('y', 4)
       .attr('font-size', '11px')
       .attr('fill', 'currentColor')
+      .attr('pointer-events', 'none')
       .text((d) => d.label);
 
     node.append('title').text((d) => `${d.kind}\n${d.id}`);
 
     sim.on('tick', () => {
+      hit
+        .attr('x1', (d) => (d.source as SimNode).x ?? 0)
+        .attr('y1', (d) => (d.source as SimNode).y ?? 0)
+        .attr('x2', (d) => (d.target as SimNode).x ?? 0)
+        .attr('y2', (d) => (d.target as SimNode).y ?? 0);
       link
         .attr('x1', (d) => (d.source as SimNode).x ?? 0)
         .attr('y1', (d) => (d.source as SimNode).y ?? 0)
@@ -195,6 +288,15 @@ export default function MemoryGraph() {
         .attr('y2', (d) => (d.target as SimNode).y ?? 0);
       node.attr('transform', (d) => `translate(${d.x ?? 0},${d.y ?? 0})`);
     });
+  }
+
+  /** Node-popup action (approved mock): restart the traversal from a node. */
+  function traverseFromHere(n: GraphNode) {
+    setStartKind(n.kind);
+    setStartId(n.id);
+    setSelectedNode(null);
+    setSelectedEdge(null);
+    void traverse({ start: { kind: n.kind, id: n.id } });
   }
 
   function drag(sim: d3.Simulation<SimNode, undefined>) {
@@ -230,7 +332,7 @@ export default function MemoryGraph() {
                 if (startValue.trim() !== '') setStartId(composeStartId(kind, startValue));
               }}
             >
-              {NODE_KINDS.map((k) => (
+              {NODE_KIND_ORDER.map((k) => (
                 <option key={k} value={k}>
                   {k}
                 </option>
@@ -309,6 +411,20 @@ export default function MemoryGraph() {
       {status && <div className="graph-status">{status}</div>}
 
       <svg ref={svgRef} className="graph-canvas" />
+
+      <GraphLegend />
+
+      {(selectedNode || selectedEdge) && (
+        <DetailPopup
+          node={selectedNode}
+          edge={selectedEdge}
+          onTraverseFromHere={traverseFromHere}
+          onClose={() => {
+            setSelectedNode(null);
+            setSelectedEdge(null);
+          }}
+        />
+      )}
     </div>
   );
 }

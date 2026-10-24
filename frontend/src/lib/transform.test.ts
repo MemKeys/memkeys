@@ -108,6 +108,8 @@ describe('toGraphData', () => {
     expect(g.links).toHaveLength(1);
     expect(g.droppedEdges).toBe(1);
     expect(g.nodes).toHaveLength(2);
+    // ISI-6582: the wire edge event_time is carried through for the edge popup.
+    expect(g.links[0].event_time).toBe('2026-10-18T00:00:00Z');
   });
 });
 
