@@ -30,6 +30,12 @@ RUN npm run build
 # --- runtime -------------------------------------------------------------
 FROM nginx:alpine AS runtime
 
+# Patch base-image OS packages so the grype scan's `--fail-on critical` gate
+# (docker.yml) stays green when a new Alpine CVE lands before the nginx:alpine
+# tag is rebuilt — e.g. CVE-2026-111497 in brotli-libs (<1.2.1-r0). The base
+# is already a floating tag, so this does not change the image's determinism.
+RUN apk upgrade --no-cache
+
 # SPA assets + the server config. nginx.conf is an envsubst template: the
 # entrypoint renders it to /etc/nginx/conf.d/default.conf at container start,
 # substituting MEMORY_API_UPSTREAM.
