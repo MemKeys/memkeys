@@ -67,6 +67,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("MEMKEYS_SEMANTIC").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"));
     if semantic_on {
         let embedder = memkeys_server::embed::from_env();
+        // ISI-6671: reconcile the fact-vector column width to the active
+        // embedder BEFORE the worker starts upserting. Migration 0003 declares
+        // vector(256); a wider external embedder (MEMKEYS_EMBED_DIM) widens the
+        // column in place on a fresh table, or fails fast on a populated one.
+        memkeys_server::pg_vector::ensure_vector_column_dim(
+            &pool,
+            "fact_vectors",
+            "fact_vectors_embedding_idx",
+            embedder.dim(),
+        )
+        .await?;
         let vector: Arc<dyn VectorIndex> = Arc::new(PgVectorIndex::from_pool(pool.clone()));
         let vworker = Arc::new(VectorProjectionWorker::new(
             pool.clone(),
@@ -102,6 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The digest worker embeds summaries with the SAME embedder as the
             // fact tier (ADR Decision 3: one embedder, both tiers, RRF-fusable).
             let embedder = memkeys_server::embedder_from_env();
+            // ISI-6671: the digest tier's embedding column (migration 0004 =
+            // vector(256)) must track the same embedder width as fact_vectors.
+            memkeys_server::pg_vector::ensure_vector_column_dim(
+                &pool,
+                "digests",
+                "digests_embedding_idx",
+                embedder.dim(),
+            )
+            .await?;
             let dw = Arc::new(DigestWorker::new(pool.clone(), generator.clone(), embedder));
             service = service.with_digest_worker(dw.clone());
             digest_worker = Some(dw);

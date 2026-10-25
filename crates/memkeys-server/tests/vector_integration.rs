@@ -415,3 +415,88 @@ async fn as_of_scopes_out_facts_on_the_unscoped_whole_tenant_path() {
         .collect();
     assert!(all.contains(&f_old.id) && all.contains(&f_new.id));
 }
+
+/// ISI-6671: `ensure_vector_column_dim` widens an embedding column to the active
+/// embedder's width on an EMPTY table (the benchmark apples-to-apples path:
+/// migration 0003 ships vector(256); a 768-dim external embedder re-dimensions
+/// in place), and FAILS FAST rather than dropping rows on a populated mismatch.
+///
+/// Exercised against a uniquely-named scratch table so it never re-dimensions
+/// the shared `fact_vectors` that the rest of this suite upserts 256-dim vectors
+/// into concurrently.
+#[tokio::test]
+async fn ensure_vector_column_dim_widens_empty_and_fails_populated() {
+    use memkeys_server::pg_vector::ensure_vector_column_dim;
+    let Some(url) = db_url() else { return };
+    let store = PgStore::connect(&url).await.expect("connect + migrate");
+    let pool = store.pool().clone();
+    let tbl = format!("zz_dimtest_{}", run_nonce().replace('-', "_"));
+    let idx = format!("{tbl}_embedding_idx");
+
+    sqlx::query(&format!(
+        "CREATE TABLE {tbl} (fact_id UUID PRIMARY KEY, embedding vector(256) NOT NULL)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE INDEX {idx} ON {tbl} USING hnsw (embedding vector_cosine_ops)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    async fn typmod(pool: &sqlx::PgPool, t: &str) -> i32 {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT a.atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = $1 AND a.attname = 'embedding'",
+        )
+        .bind(t)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // Empty table, width differs -> re-dimension in place to 768.
+    ensure_vector_column_dim(&pool, &tbl, &idx, 768)
+        .await
+        .expect("widen empty column");
+    assert_eq!(
+        typmod(&pool, &tbl).await,
+        768,
+        "column widened to vector(768)"
+    );
+
+    // A matching-width call is a no-op.
+    ensure_vector_column_dim(&pool, &tbl, &idx, 768)
+        .await
+        .expect("no-op when width already matches");
+
+    // Populate, then a mismatched width must fail fast (no silent data loss).
+    let v768 = format!("[{}]", vec!["0.1"; 768].join(","));
+    sqlx::query(&format!(
+        "INSERT INTO {tbl} (fact_id, embedding) VALUES ($1, $2::vector)"
+    ))
+    .bind(Uuid::new_v4())
+    .bind(&v768)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = ensure_vector_column_dim(&pool, &tbl, &idx, 256)
+        .await
+        .expect_err("populated + mismatched width must fail fast");
+    assert!(
+        err.to_string().contains("holds 1 rows") || err.to_string().contains("1 rows"),
+        "error names the populated-row remediation: {err}"
+    );
+    assert_eq!(
+        typmod(&pool, &tbl).await,
+        768,
+        "column untouched on fail-fast"
+    );
+
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
