@@ -6,8 +6,8 @@ answers *correct*, not on raw retrieval recall@k.
 
 > **Status.** Set A (single-agent SRE investigation) is complete with all five
 > backends scored. Set B (multi-agent crew: build → suspend/resume → fact-change)
-> is published at four backends; the MemKeys row is being scored and will be folded
-> in — see [Set B](#set-b--multi-agent-crew-suspendresume--fact-change).
+> is scored across five backends, including MemKeys — see
+> [Set B](#set-b--multi-agent-crew-suspendresume--fact-change).
 >
 > These numbers come from the KubeCon memory-benchmark re-run (project *Talks*,
 > ISI-5581 plan rev 6). Methodology and raw records are reproducible — see
@@ -110,7 +110,7 @@ memory**), then probed with **fact-change** questions. Per-sub-scenario scores
 
 | Backend | build | resume | restart | factchange | Composite |
 |---------|:-----:|:------:|:-------:|:----------:|:---------:|
-| **MemKeys** | — | — | — | — | *scoring in progress* |
+| **MemKeys** | 0.00 | 0.00 | 0.00 | **1.00** | ≈0.25 |
 | mempalace | 0.00 | **1.00** | 0.00 † | **1.00** | ≈0.50 |
 | zep (graphiti) | **1.00** | 0.55 | — | 0.00 ‡ | ≈0.52 |
 | mem0 | 0.00 | 0.00 | — | **1.00** | ≈0.33 |
@@ -127,10 +127,12 @@ the harness discriminates. Caveats are reported in the open, not hidden:
   as an independent backend went **NO-GO** on the fail-closed gate (seeded fact not
   recalled within the async-ingestion window).
 
-**MemKeys row:** the Set B run for MemKeys has been launched on the same crew
-harness (`setb-runner`, `deepseek-flash`) and its health gate is GREEN; scoring is
-in progress and the row will be filled when the run completes. Tracking issue:
-ISI-6724.
+**MemKeys row:** scored on the same crew harness (`setb-runner`, `deepseek-flash`).
+MemKeys **nails fact-change (4/4, score 1.00)** — all three probes correctly report
+that 5500 supersedes 5432, with verbatim recall of the stored fact — while build,
+resume, and restart score 0.00. The profile matches **mem0** (fact-change strong;
+no cross-session crew recall) and clears the memref control floor (0.06). Composite
+≈0.25. Tracking issue: ISI-6724.
 
 ---
 
