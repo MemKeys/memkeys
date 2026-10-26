@@ -147,3 +147,43 @@ On the outer `memory.recall` / `memory.search` CLIENT span:
 `candidates_count` / `key_kind` / `key_count` have no equivalent in memory-semconv
 v0.1.0 or the GenAI memory conventions yet → tracked as an upstream extension proposal
 (talk narrative: "the standard caught up to what we proposed").
+
+## Released artifact — reproducible bench / dogfood deploy (ISI-6678)
+
+The memory-semconv dual-emit above ships in an **official released artifact** so the
+ISI-6183 Set A benchmark and the dogfood OTel consumers no longer run a local kaniko
+build of the `isi6216-semconv` image tag (ISI-6216 / PR #27).
+
+| Artifact | Pinned reference | Notes |
+|----------|------------------|-------|
+| Server image | `ghcr.io/memkeys/memkeys-server:0.1.0` | multi-arch (amd64+arm64), cosign-signed keyless, SBOM. Carries the semconv commit `22ea2107` (ISI-6216). Git tag `v0.1.0` → `docker/metadata-action` `type=semver,{{version}}` publishes the `0.1.0` tag (also `0.1`, `v0.1.0`, `latest`). |
+| Helm chart | `oci://ghcr.io/memkeys/charts/memkeys` **0.5.0** (`appVersion 0.1.0`) | `image.repository: ghcr.io/memkeys/memkeys-server`; empty `image.tag` defaults to `appVersion` → pulls `:0.1.0`. No local build, no manual image patch. |
+
+Both are produced from the **`v0.1.0` tag on `main`** (merge `79bde54b`, PR #75) by the
+existing `ghcr-publish.yml` + `release.yml` + `helm-publish.yml` path (ISI-6304/6305/6306).
+
+### Wiring the external embedder (no env patch — ISI-6671)
+
+The chart exposes the embedder knobs as values, so a bench/dogfood deploy points memkeys
+at an OpenAI-compatible `/embeddings` endpoint without editing the Deployment:
+
+```yaml
+# values override for a bench/dogfood deploy
+semantic:
+  enabled: true                 # MEMKEYS_SEMANTIC=1 — wire the fact-vector read path
+  embedder:
+    url: http://embeddings.svc/v1/embeddings   # MEMKEYS_EMBED_URL (empty → built-in HashEmbedder, dim 256)
+    model: text-embedding-3-small              # MEMKEYS_EMBED_MODEL (also the derivation stamp)
+    dim: 1536                                  # MEMKEYS_EMBED_DIM (must equal the endpoint's width)
+```
+
+`configmap.yaml` emits `MEMKEYS_EMBED_URL` / `MEMKEYS_EMBED_MODEL` / `MEMKEYS_EMBED_DIM`
+only when the matching value is set, so leaving them empty falls back to the built-in
+deterministic HashEmbedder (dim 256) — the default `helm install` still works.
+
+### Bench run note (cross-ref ISI-6183)
+ISI-6183 Set A runs should record the pinned reference
+`ghcr.io/memkeys/memkeys-server:0.1.0` / chart `memkeys-0.5.0` as the substrate under
+test. The benchmark harness itself is in-process (`MemKeysService` direct); this pin is
+for the **dogfood/OTel-consumer deploy** that must emit memory-semconv from an official
+image rather than a local kaniko build.
