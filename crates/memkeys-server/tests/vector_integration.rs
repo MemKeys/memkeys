@@ -204,6 +204,68 @@ async fn stage_5b_is_idempotent_and_catch_up_fills_holes() {
 }
 
 #[tokio::test]
+async fn flush_semantic_makes_a_just_stored_fact_deterministically_searchable() {
+    // ISI-6677: stage 5b is async OFF the ack path, so a fact committed with no
+    // projection pass is a hole — a harness that writes then immediately
+    // queries races the worker and sees an empty hit set. `flush_semantic` is
+    // the opt-in readiness primitive: after it returns the tier is converged
+    // for the tenant and the store->search round-trip is deterministic.
+    let Some(ctx) = ctx().await else { return };
+    let t = next_tenant();
+    let f = fact(
+        &t,
+        1,
+        "r",
+        "flush makes this fact searchable without a race",
+    );
+
+    // Commit only — NO enqueue/drain. This is the write-then-query race window.
+    ctx.store.commit_fact(&f).await.unwrap();
+    let req = SearchRequest {
+        query: "flush makes this fact searchable".into(),
+        scope: vec![],
+        fact_type: None,
+        k: 10,
+        as_of: None,
+    };
+    let before = ctx.service.semantic_search(&t, &req).await.unwrap();
+    assert!(
+        !before.iter().any(|h| h.record.id == f.id),
+        "unflushed: the fact is not yet embedded, so it is not searchable"
+    );
+
+    // Opt-in flush converges the fact-vector tier for the tenant.
+    let embedded = ctx.service.flush_semantic(&t).await.unwrap();
+    assert_eq!(
+        embedded, 1,
+        "flush embedded exactly the one outstanding fact"
+    );
+
+    let after = ctx.service.semantic_search(&t, &req).await.unwrap();
+    assert!(
+        after.iter().any(|h| h.record.id == f.id),
+        "after flush the just-stored fact is deterministically searchable"
+    );
+    // Flush is convergent: a second call embeds nothing new.
+    assert_eq!(ctx.service.flush_semantic(&t).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flush_semantic_disabled_is_feature_disabled() {
+    // The module off is the same 501 seam as op-4 — a harness must never
+    // mistake "disabled" for "converged" and then query an empty tier.
+    let Some(ctx) = ctx().await else { return };
+    let bare = MemKeysService::new(ctx.store.clone());
+    let err = bare.flush_semantic("t").await.unwrap_err();
+    assert!(matches!(
+        err,
+        QueryError::FeatureDisabled {
+            feature: "memory.semantic"
+        }
+    ));
+}
+
+#[tokio::test]
 async fn semantic_search_disabled_is_feature_disabled() {
     let Some(ctx) = ctx().await else { return };
     // A service with the SAME store but no semantic module wired → op-4 returns

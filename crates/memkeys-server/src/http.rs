@@ -6,6 +6,10 @@
 //!   POST /memory/graph/traverse   → service.traverse()
 //!   POST /memory/search           → service.semantic_search() (op-4, §7.4;
 //!                                    501 feature_disabled when the module is off)
+//!   POST /memory/flush            → service.flush_semantic() (ISI-6677: force
+//!                                    the async stage-5b vector projection to
+//!                                    converge so a just-stored fact is
+//!                                    deterministically searchable; opt-in)
 //!
 //! Admission (ISI-6148, closes ISI-6134 S1):
 //!   1. Concurrency shedding ([`AdmissionControl::try_admit`]) gates every
@@ -113,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         .route("/memory/facts", get(fetch))
         .route("/memory/graph/traverse", post(traverse))
         .route("/memory/search", post(search))
+        .route("/memory/flush", post(flush))
         .route_layer(middleware::from_fn_with_state(state.clone(), admit))
         .with_state(state.clone());
 
@@ -685,6 +690,43 @@ async fn search(
         Err(QueryError::Invalid { reason }) => {
             wire_response(WireError::new(ErrorCode::InvalidArgument, reason))
         }
+        Err(e) => wire_response(WireError::new(ErrorCode::BackendUnavailable, e.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /memory/flush — fact-vector readiness (ISI-6677)
+// ---------------------------------------------------------------------------
+
+/// Force the async stage-5b vector projection to CONVERGE for the caller's
+/// tenant, so a just-stored fact is deterministically searchable (a benchmark
+/// harness that writes then immediately queries would otherwise race the
+/// worker — empty hit set until stage 5b lands). OPT-IN: embedding stays off
+/// the default commit path; this is an explicit flush call. No request body;
+/// the tenant floor is the VERIFIED principal's (never client-asserted). The
+/// response reports how many facts the convergence scan embedded.
+async fn flush(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    let cx = http_transport_cx();
+    let result = state
+        .service
+        .flush_semantic(&principal.tenant_id)
+        .with_context(cx.clone())
+        .await;
+    cx.span().end();
+    match result {
+        Ok(embedded) => {
+            let body = serde_json::json!({ "tier": "fact_vector", "embedded": embedded });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        // Same seam as op-4: the module off is a 501 `feature_disabled`, never
+        // a silent "converged" that would let a harness query an empty tier.
+        Err(QueryError::FeatureDisabled { feature }) => wire_response(WireError::new(
+            ErrorCode::FeatureDisabled,
+            format!("semantic module disabled: {feature}"),
+        )),
         Err(e) => wire_response(WireError::new(ErrorCode::BackendUnavailable, e.to_string())),
     }
 }
