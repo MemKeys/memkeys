@@ -213,7 +213,7 @@ image instead of building locally.
 | `Deployment` (worker) | async-projection workers — **microservice profile only** |
 | `PodDisruptionBudget` | server availability during voluntary disruptions — **microservice profile only** |
 | `Service` (ClusterIP) | in-cluster access on `service.port` (health, default 8080) **and** `memoryTransport.port` (the `/memory/*` transport, default 3000); selects the server component |
-| `ConfigMap` | non-secret config: `MEMKEYS_DEPLOYMENT_ENV`, OTLP endpoint, service namespace, sampler ratio |
+| `ConfigMap` | non-secret config: `MEMKEYS_DEPLOYMENT_ENV`, OTLP endpoint, service namespace, sampler ratio; the embedder knobs (`MEMKEYS_SEMANTIC`, `MEMKEYS_EMBED_URL/MODEL/DIM`) when `semantic.enabled=true` |
 | `Secret` | `MEMKEYS_DATABASE_URL` (only when `database.url` is set and no `existingSecret`); `MEMKEYS_RUN_TOKEN_SECRET` (only when `memoryTransport.runTokenSecret.value` is set) |
 | `ServiceAccount` | dedicated identity (token automount off by default) |
 | `Deployment` + `Service` (inspector) | optional read-only Inspector UI SPA — **`frontend.enabled=true` only** |
@@ -247,6 +247,32 @@ Supported Postgres major versions: 14–18 (matching pgvector's support window).
 
 Set `otel.endpoint` to an OTLP/gRPC collector to enable exporters for all
 signals (traces, metrics, logs). Empty → no-op exporters (M4 default).
+
+## Semantic search / external embedder
+
+Semantic (fact-vector) search is wired only when `semantic.enabled=true`
+(`MEMKEYS_SEMANTIC=1`). With it on, the server defaults to a built-in
+deterministic `HashEmbedder` (dim 256, no model server). To use a real model,
+point `semantic.embedder.url` at an OpenAI-compatible `/embeddings` endpoint
+(Ollama, vLLM, text-embeddings-inference) — this is the bench/dogfood external
+embedder wiring (ISI-6671/ISI-6678), rendered into the shared `ConfigMap` so
+both the server and the microservice-profile projection worker see it:
+
+```sh
+helm install memkeys oci://ghcr.io/memkeys/charts/memkeys --version 0.5.0 \
+  --set database.url=... \
+  --set semantic.enabled=true \
+  --set semantic.embedder.url=http://tei.embed.svc:80/embeddings \
+  --set semantic.embedder.model=bge-small-en-v1.5 \
+  --set semantic.embedder.dim=384
+```
+
+| value | env | notes |
+|-------|-----|-------|
+| `semantic.enabled` | `MEMKEYS_SEMANTIC` | wire the fact-vector read path; the embedder knobs are inert unless this is on |
+| `semantic.embedder.url` | `MEMKEYS_EMBED_URL` | OpenAI-compatible endpoint; empty → built-in `HashEmbedder` (dim 256) |
+| `semantic.embedder.model` | `MEMKEYS_EMBED_MODEL` | request `model` + derivation stamp (a change backfills prior vectors) |
+| `semantic.embedder.dim` | `MEMKEYS_EMBED_DIM` | embedder output width (1..=2000); **must** match the endpoint or the server refuses to embed |
 
 ## ⚠ Current status — M1 bootstrap, no transport yet
 
