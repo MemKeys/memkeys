@@ -48,8 +48,9 @@ On boot each listener logs its own line (`memkeys.server.health.listen` /
 |---|---|---|
 | `MEMKEYS_SEMANTIC` | off | `1` (or `on` / `true`) enables the vector tier. Off → `/memory/search` and the `memory_search` tool return `feature_disabled` (501 over HTTP) rather than empty results. |
 | `MEMKEYS_SEMANTIC_DIGEST` | off | `1` additionally enables the digest tier (scope rollup summaries, projected today; they join the search path as the digest read path matures). See [Architecture — vector index](/memkeys/architecture/#vector-index-two-tiers-optional-module). |
-| `MEMKEYS_EMBED_URL` | — | Embedder endpoint. Both tiers must use the same embedder as the process that wrote the vectors. |
-| `MEMKEYS_EMBED_MODEL` | — | Embedder model id. |
+| `MEMKEYS_EMBED_URL` | — | OpenAI-compatible `/embeddings` endpoint (`POST` `{"model","input"}` → `{"data":[{"embedding":[…]}]}`; Ollama / vLLM / text-embeddings-inference all speak this). Set → the HTTP embedder; unset → the built-in deterministic 256-dim `HashEmbedder`. Both tiers must use the same embedder as the process that wrote the vectors. |
+| `MEMKEYS_EMBED_MODEL` | — | Embedder model id. Sent as the `/embeddings` request `model` **and** stamped as the derivation version (a change re-embeds prior vectors). Unset → the `model` field is omitted (single-model servers) and the stamp is derived from the URL. |
+| `MEMKEYS_EMBED_DIM` | `256` | Embedder output width. Must match the served model (e.g. `nomic-embed-text` = `768`). The fact-vector column is reconciled to this width at startup: widened in place on a fresh table, or a fail-fast error on a populated mismatch (truncate to let the reconciler re-embed). Max 2000 (HNSW ceiling). |
 | `MEMKEYS_GEN_URL` | — | Generative endpoint (summarizer) for digest rollups. |
 | `MEMKEYS_GEN_MODEL` | — | Summarizer model id. |
 

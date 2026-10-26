@@ -38,6 +38,89 @@ impl PgVectorIndex {
     }
 }
 
+/// Reconcile a pgvector embedding column to `dim` — the active embedder's width
+/// (ISI-6671). The query path casts generically to `::vector`, so the ONLY dim
+/// coupling is the declared column width (migration 0003/0004 = `vector(256)`)
+/// and its HNSW index. A benchmark/deploy that wires a wider external embedder
+/// (e.g. nomic-embed-text, 768) needs the column to match or every `upsert`
+/// hard-fails on the dim check.
+///
+/// - Column already `vector(dim)`: no-op (the common path).
+/// - Width differs AND the table is EMPTY: re-dimension in place — drop the
+///   HNSW index, `ALTER … TYPE vector(dim)`, rebuild the index. Safe because the
+///   vector tier is rebuildable derived state (§5.4.2); the reconciler re-embeds
+///   from the SoT off the hot path.
+/// - Width differs AND the table is NON-EMPTY: fail fast with a remediation
+///   message — we will not silently drop populated vectors.
+///
+/// `table`/`index` are internal constants (`fact_vectors` / `digests`), never
+/// user input, so formatting them and `dim` (validated `1..=MAX_EMBED_DIM`) into
+/// DDL is injection-safe.
+pub async fn ensure_vector_column_dim(
+    pool: &PgPool,
+    table: &str,
+    index: &str,
+    dim: usize,
+) -> Result<(), VectorError> {
+    // pgvector stores the declared dimension directly as the column's
+    // `atttypmod` (no VARHDRSZ offset); -1 means an unbounded `vector`.
+    let current: Option<i32> = sqlx::query_scalar(
+        "SELECT a.atttypmod FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         WHERE c.relname = $1 AND a.attname = 'embedding' AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| VectorError::Backend(e.to_string()))?;
+
+    let current = match current {
+        // Column absent (migrations own creation) ⇒ nothing to reconcile.
+        None => return Ok(()),
+        Some(m) => m,
+    };
+    if current == dim as i32 {
+        return Ok(());
+    }
+
+    let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| VectorError::Backend(e.to_string()))?;
+    if count > 0 {
+        return Err(VectorError::Backend(format!(
+            "{table}.embedding is vector({current}) but the active embedder emits {dim}-dim \
+             vectors and the table holds {count} rows; re-dimensioning would drop them. Truncate \
+             {table} (the reconciler re-embeds from the SoT) or set MEMKEYS_EMBED_DIM to {current}."
+        )));
+    }
+
+    tracing::warn!(
+        target: "memkeys",
+        "memkeys.vector.redimension: {table}.embedding vector({current}) -> vector({dim}) \
+         (table empty; rebuilding HNSW index {index})"
+    );
+    // Drop the index first — it is tied to the old width — then widen the column
+    // and rebuild. Done inside the caller's single-connection boot path.
+    sqlx::query(&format!("DROP INDEX IF EXISTS {index}"))
+        .execute(pool)
+        .await
+        .map_err(|e| VectorError::Backend(e.to_string()))?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({dim})"
+    ))
+    .execute(pool)
+    .await
+    .map_err(|e| VectorError::Backend(e.to_string()))?;
+    sqlx::query(&format!(
+        "CREATE INDEX {index} ON {table} USING hnsw (embedding vector_cosine_ops)"
+    ))
+    .execute(pool)
+    .await
+    .map_err(|e| VectorError::Backend(e.to_string()))?;
+    Ok(())
+}
+
 /// Render a vector as pgvector's text input form `[f0,f1,…]`. `f32::to_string`
 /// round-trips exactly (shortest decimal that parses back), so the stored
 /// vector equals the embedder's output.
