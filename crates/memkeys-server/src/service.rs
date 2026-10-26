@@ -189,6 +189,34 @@ impl MemKeysService {
         self.vector_worker.clone()
     }
 
+    /// Readiness / flush for the fact-vector tier (ISI-6677, benchmark
+    /// enablement #3). Stage 5b is async OFF the ack path (§6/R2): a
+    /// just-stored fact is not immediately searchable, which races a
+    /// single-agent harness that writes then queries. This forces the
+    /// projection to CONVERGE for the caller's tenant — after it returns,
+    /// every committed fact for the tenant has a current-model vector, so the
+    /// store→search round-trip is deterministic.
+    ///
+    /// This is OPT-IN — an explicit call a benchmark/test harness makes, never
+    /// on the default commit path (synchronous embedding would couple the hot
+    /// write path to the model server, defeating the point of stage 5b). It
+    /// runs the SoT convergence scan [`VectorProjectionWorker::catch_up`], so
+    /// it closes holes the lost-queue / module-just-enabled / cross-pod cases
+    /// leave behind (not merely the local in-process queue), and returns the
+    /// number of facts it embedded. [`QueryError::FeatureDisabled`] (→ 501,
+    /// same seam as op-4) when the semantic module is off.
+    pub async fn flush_semantic(&self, caller_tenant: &str) -> Result<usize, QueryError> {
+        let Some(worker) = &self.vector_worker else {
+            return Err(QueryError::FeatureDisabled {
+                feature: "memory.semantic",
+            });
+        };
+        worker
+            .catch_up(caller_tenant)
+            .await
+            .map_err(|e| QueryError::Semantic(e.to_string()))
+    }
+
     /// Write path (§6): stages 1-4 as one trace, `memkeys.fact.ingest`
     /// (SERVER) → normalize/key/temporalize (INTERNAL) → `memkeys.commit`
     /// (CLIENT, db.*). The receipt — the "ack" — is gated on stage 4 only.
