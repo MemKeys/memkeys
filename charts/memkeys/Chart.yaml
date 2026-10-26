@@ -6,7 +6,7 @@ description: |
   derived, rebuildable projections over a keyed/temporal source of truth.
 type: application
 # Chart version — bump on every chart change (SemVer).
-version: 0.4.0
+version: 0.5.0
 # The memkeys-server image version this chart defaults to.
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
@@ -38,3 +38,7 @@ annotations:
       description: Memory transport exposure (ISI-6233) — a second container/Service port for the /memory/* listener (MEMKEYS_MEMORY_HTTP_PORT, default 3000) with MEMKEYS_HTTP_HOST=0.0.0.0; the HTTPRoute backendRef now targets the memory port. The chart fails fast when the transport is enabled without a run-token issuer secret (mirroring the server's non-loopback bind gate); set memoryTransport.runTokenSecret.existingSecret (or .value), memoryTransport.allowInsecure=true (dev only), or memoryTransport.enabled=false.
     - kind: added
       description: Optional Inspector UI frontend (ISI-6395 B2) — frontend.enabled (default off) renders a Deployment + Service serving the read-only Inspector SPA (ghcr.io/memkeys/memkeys-inspector). HTTPRoute rules gain a per-rule backend selector (server|frontend) so the UI and the token-gated /memory/* API can share one external origin behind the memkeys-gw Gateway: / -> UI, /memory/* -> memory port (unchanged).
+    - kind: fixed
+      description: image.repository now defaults to the published image name ghcr.io/memkeys/memkeys-server (was ghcr.io/memkeys/memkeys, which never matched the ghcr-publish.yml image), so a reproducible bench/dogfood deploy no longer needs a manual --set image.repository override (ISI-6678).
+    - kind: added
+      description: External embedder wiring (ISI-6671/ISI-6678) — semantic.enabled (MEMKEYS_SEMANTIC) plus semantic.embedder.url/model/dim (MEMKEYS_EMBED_URL/MEMKEYS_EMBED_MODEL/MEMKEYS_EMBED_DIM) exposed as chart values on the shared config, so a bench/dogfood deploy wires an OpenAI-compatible embedding endpoint without a manual env patch. Empty url keeps the built-in deterministic HashEmbedder fallback (dim 256).

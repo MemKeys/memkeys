@@ -19,3 +19,19 @@ data:
   {{- with .Values.otel.tracesSamplerRatio }}
   MEMKEYS_TRACES_SAMPLER_RATIO: {{ . | quote }}
   {{- end }}
+  {{- if .Values.semantic.enabled }}
+  # Semantic search read path (ISI-6079). The embedder knobs below are honoured
+  # only when this is on — otherwise the fact vector is never read.
+  MEMKEYS_SEMANTIC: "1"
+  {{- end }}
+  {{- with .Values.semantic.embedder.url }}
+  # OpenAI-compatible external embedder (ISI-6671/ISI-6678). Unset → the server
+  # uses its built-in deterministic HashEmbedder (dim 256).
+  MEMKEYS_EMBED_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.semantic.embedder.model }}
+  MEMKEYS_EMBED_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.semantic.embedder.dim }}
+  MEMKEYS_EMBED_DIM: {{ . | quote }}
+  {{- end }}

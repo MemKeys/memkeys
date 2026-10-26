@@ -22,12 +22,15 @@ profile: single-node
 replicaCount: null
 
 image:
-  # Registry/repository for the memkeys-server image (built by the P0 docker.yml
-  # workflow — ISI-6097). Overridden per-environment.
-  repository: ghcr.io/memkeys/memkeys
+  # Registry/repository for the memkeys-server image. This is the name the
+  # ghcr-publish.yml workflow pushes (ISI-6304) — matching it here means a
+  # reproducible bench/dogfood deploy needs no --set image.repository override
+  # (ISI-6678). Overridden per-environment.
+  repository: ghcr.io/memkeys/memkeys-server
   # Pull policy. IfNotPresent is correct for pinned tags / kind-loaded images.
   pullPolicy: IfNotPresent
-  # Image tag. Defaults to the chart appVersion when empty.
+  # Image tag. Defaults to the chart appVersion (the released image tag, e.g.
+  # the v0.1.0 release → ghcr.io/memkeys/memkeys-server:0.1.0) when empty.
   tag: ""
 
 imagePullSecrets: []
@@ -236,6 +239,32 @@ otel:
   serviceNamespace: ""
   # Optional head-sampling ratio override (prod).
   tracesSamplerRatio: ""
+
+# --- Semantic search / embedder ---------------------------------------------
+# The fact-vector read path (semantic search) is wired only when
+# semantic.enabled is true (MEMKEYS_SEMANTIC=1). With it on, the embedder
+# defaults to the built-in deterministic HashEmbedder (dim 256, no model
+# server). Point embedder.url at an OpenAI-compatible /embeddings endpoint
+# (Ollama, vLLM, text-embeddings-inference) to use a real model instead — the
+# bench/dogfood external-embedder wiring (ISI-6671/ISI-6678). These values are
+# rendered into the shared config, so both the server and (microservice
+# profile) projection worker see them.
+semantic:
+  # MEMKEYS_SEMANTIC — wire the fact-vector read path. The embedder knobs below
+  # are inert unless this is true.
+  enabled: false
+  embedder:
+    # MEMKEYS_EMBED_URL — OpenAI-compatible endpoint: POST <url>
+    # {"model","input"} -> {"data":[{"embedding":[...]}]}. Empty → built-in
+    # HashEmbedder fallback (dim 256, no model server).
+    url: ""
+    # MEMKEYS_EMBED_MODEL — the `model` field sent to the endpoint; also the
+    # embedder derivation stamp (a change backfills prior vectors). Empty →
+    # omitted from the request; the stamp is derived from the URL.
+    model: ""
+    # MEMKEYS_EMBED_DIM — embedder output width (1..=2000). Empty → 256. MUST
+    # equal the width the endpoint returns or the server refuses to embed.
+    dim: ""
 
 # --- Extra environment ------------------------------------------------------
 # Free-form env vars and envFrom sources merged into the container.
