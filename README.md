@@ -15,6 +15,8 @@ The name is final: **MemKeys** (camelCase) was locked in on 2026-10-14 after a f
 
 **Keyed-first invariant:** attribute keys bound the candidate set before any vector/graph work; the keyed/temporal store is the single source of truth; graph and vector are derived, rebuildable projections.
 
+**Benchmarks:** on an agentic end-to-end benchmark (agents solving real tasks, scored on answer correctness), MemKeys ranks **#1 of 5** backends on the single-agent SRE scenario — highest warm accuracy and largest cold→warm memory payoff. Full results, methodology, and reproduction steps: [`BENCHMARKS.md`](BENCHMARKS.md).
+
 ## MemKeys is not MemPalace
 
 Despite the similar "mem-" naming, these are two different things:
