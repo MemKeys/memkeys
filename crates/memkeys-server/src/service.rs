@@ -19,7 +19,8 @@ use crate::pipeline::{
     key_stage, normalize, temporalize, CallerContext, EntityResolver, NoopResolver,
 };
 use crate::semantic::{
-    rrf_fuse, CandidateSet, Embedder, FusedHit, FusionSource, RankedList, VectorIndex,
+    hybrid_rerank, rrf_fuse, CandidateSet, Embedder, FusedHit, FusionSource, RankedList,
+    RecencyConfig, VectorIndex,
 };
 use crate::store::{CommitOutcome, FactStore};
 use crate::telemetry::{self, Instruments};
@@ -57,6 +58,11 @@ pub struct MemKeysService {
     /// the embedder produces query/fact vectors, the index stores+ranks them.
     embedder: Option<Arc<dyn Embedder>>,
     vector: Option<Arc<dyn VectorIndex>>,
+    /// Hybrid recency+semantic re-rank knobs (ADR-0002). Read from env in
+    /// `main.rs` and threaded into `semantic_search_inner`. Defaults
+    /// (α=0.6, λ=1e-6, N=200) make the fact tier recency-aware out of the box;
+    /// α=1.0 is the pure-cosine kill-switch.
+    recency: RecencyConfig,
     /// M5 stage-5b vector-projection worker (write path). `None` in unit
     /// contexts (no pg pool) — tests seed the index directly. Enqueued OFF the
     /// stage-4 ack path, alongside the stage-5a graph worker (§6/R2).
@@ -84,6 +90,7 @@ impl MemKeysService {
             worker: None,
             embedder: None,
             vector: None,
+            recency: RecencyConfig::default(),
             vector_worker: None,
             extract_worker: None,
             digest_worker: None,
@@ -108,6 +115,7 @@ impl MemKeysService {
             worker: Some(worker),
             embedder: None,
             vector: None,
+            recency: RecencyConfig::default(),
             vector_worker: None,
             extract_worker: None,
             digest_worker: None,
@@ -127,6 +135,14 @@ impl MemKeysService {
     ) -> Self {
         self.embedder = Some(embedder);
         self.vector = Some(vector);
+        self
+    }
+
+    /// ADR-0002: set the hybrid recency+semantic re-rank knobs (α, λ, N).
+    /// Fluent; defaults apply when unset. `main.rs` reads these from
+    /// `MEMKEYS_RECENCY_{ALPHA,LAMBDA,CANDIDATES}`.
+    pub fn with_recency(mut self, recency: RecencyConfig) -> Self {
+        self.recency = recency;
         self
     }
 
@@ -1092,26 +1108,49 @@ impl MemKeysService {
             CandidateSet::Only(rows.into_iter().map(|r| r.id).collect())
         };
 
-        // Step 2 — embed the query and ANN-rank the fact tier.
+        // Step 2 — embed the query and ANN-rank the fact tier. Oversample to
+        // `recency.candidates` (N, not k): the ANN pass is the HNSW-served
+        // cosine top-N pool the hybrid re-rank then re-orders (ADR-0002
+        // §Pipeline step 2). N is a recall ceiling — a genuinely-recent fact
+        // outside the cosine top-N can't be recovered.
         let qvec = embedder
             .embed(&req.query)
             .await
             .map_err(|e| QueryError::Semantic(e.to_string()))?;
         let scored = vector
-            .search(caller_tenant, &candidates, &qvec, k, req.as_of)
+            .search(
+                caller_tenant,
+                &candidates,
+                &qvec,
+                self.recency.candidates,
+                req.as_of,
+            )
             .await
             .map_err(|e| QueryError::Semantic(e.to_string()))?;
 
         // A semantic hit must carry actual signal: drop non-positive cosine
         // similarities (`<= 0` = orthogonal or anti-correlated — no shared
-        // direction, not a match). ANN backends return the k nearest rows
+        // direction, not a match). ANN backends return the nearest rows
         // regardless of similarity, so without this filter a zero-signal fact
         // surfaces as a hit and, worse, earns undeserved RRF credit in
         // `fused_search` — which let a single-path keyed fact tie out a genuine
         // cross-path agreement (ISI-6079 / CR ISI-6168 DB suite). Score is
         // cosine similarity on both backends (MemVectorIndex and PgVectorIndex's
-        // `1 - (embedding <=> q)`), so the predicate is backend-agnostic.
+        // `1 - (embedding <=> q)`), so the predicate is backend-agnostic. This
+        // runs BEFORE the hybrid re-rank (ADR-0002 §Pipeline step 3): re-ranking
+        // first would let a high-recency / zero-cosine fact earn recency credit
+        // it doesn't deserve — the exact failure this filter exists to prevent.
         let scored: Vec<_> = scored.into_iter().filter(|s| s.score > 0.0).collect();
+
+        // Step 3 — hybrid recency+semantic re-rank (ADR-0002, Option A2), then
+        // truncate to k. `reference_time = as_of.unwrap_or(now)`: a point-in-
+        // time read scores "recent" relative to its historical viewpoint, not
+        // wall-clock now (which would collapse every historical fact's decay to
+        // ≈0 and silently revert to pure cosine). `now` is computed HERE so the
+        // re-ranker stays pure/deterministic. α=1.0 ⇒ pure-cosine order (the
+        // kill-switch); the RRF fusion downstream is unchanged.
+        let reference_time = req.as_of.unwrap_or_else(chrono::Utc::now);
+        let scored = hybrid_rerank(scored, &self.recency, reference_time, k);
 
         // Step 4 — hydrate authoritative records (R1 resolve-to-ground-truth),
         // preserving ANN rank order. A vanished fact (retention sweep racing
