@@ -1113,11 +1113,32 @@ impl MemKeysService {
         // `1 - (embedding <=> q)`), so the predicate is backend-agnostic.
         let scored: Vec<_> = scored.into_iter().filter(|s| s.score > 0.0).collect();
 
+        // Step 3b — supersession collapse (ISI-6810). The vector tier keeps a
+        // superseded head's vector (upsert is idempotent on fact_id, not
+        // head-aware), so an ANN hit can resolve to a stale version — and which
+        // version ranks higher is phrasing-dependent, so fact-update recall is
+        // non-deterministic. Drop ids superseded as of the query's `as_of`
+        // using the SoT `supersedes` chain: the deterministic, as-of-aware twin
+        // of op 1's `Validity::Current` collapse (so an `as_of` in the old
+        // fact's live window still surfaces it — history preserved), not a
+        // fuzzy cosine near-dup threshold.
+        let superseded = self
+            .store
+            .superseded_ids(
+                caller_tenant,
+                &scored.iter().map(|s| s.fact_id).collect::<Vec<_>>(),
+                req.as_of,
+            )
+            .await?;
+
         // Step 4 — hydrate authoritative records (R1 resolve-to-ground-truth),
         // preserving ANN rank order. A vanished fact (retention sweep racing
         // the index) is skipped, not an error.
         let mut hits = Vec::with_capacity(scored.len());
         for s in scored {
+            if superseded.contains(&s.fact_id) {
+                continue;
+            }
             if let Some(record) = self.store.get_fact(caller_tenant, s.fact_id).await? {
                 hits.push(SemanticHit {
                     record,
@@ -1588,5 +1609,69 @@ mod tests {
         // undeserved RRF credit in fused_search (ISI-6079 regression guard).
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, Uuid::from_u128(1));
+    }
+
+    /// ISI-6810 regression: a fact update (v2 supersedes v1) must make the
+    /// semantic path return ONLY the live version. Before the op-4 collapse,
+    /// both vectors sat in the index and the query surfaced whichever ANN
+    /// ranked higher — non-deterministic fact-update recall (Set B factchange
+    /// 0.50 ±0.43). The collapse drops the superseded id deterministically.
+    #[tokio::test]
+    async fn semantic_search_drops_superseded_fact() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+        // Explicit, distinct ingest times so the as_of leg below is exact.
+        let t0 = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(10);
+        // v1: the old answer. Its tokens overlap the query, so under
+        // HashEmbedder it would out-rank v2 for a query phrased like it —
+        // exactly the stale-hit case the collapse must defeat.
+        let mut v1 = pf(1, "t", "r", "my favorite database is sqlite for storage");
+        v1.event_time = t0;
+        v1.ingested_at = t0;
+        seed(&store, &index, &embedder, &v1).await;
+        // v2: the update on the SAME head (same subject "db"), pointing at v1.
+        let mut v2 = pf(2, "t", "r", "my favorite database is postgres for storage");
+        v2.event_time = t1;
+        v2.ingested_at = t1;
+        v2.supersedes = Some(v1.id);
+        seed(&store, &index, &embedder, &v2).await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let req = SearchRequest {
+            query: "my favorite database for storage".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc.semantic_search("t", &req).await.unwrap();
+        // Only the live head surfaces; the superseded v1 is dropped.
+        assert_eq!(hits.len(), 1, "superseded version must not surface");
+        assert_eq!(hits[0].record.id, v2.id);
+        assert!(hits[0].record.body.contains("postgres"));
+
+        // History preserved: an as_of BETWEEN the two ingests still surfaces v1
+        // (the superseding fact is not yet "known"), so the collapse is
+        // as-of-aware, not a destructive delete.
+        let between = t0 + chrono::Duration::seconds(5);
+        let hist = svc
+            .semantic_search(
+                "t",
+                &SearchRequest {
+                    query: "my favorite database for storage".into(),
+                    scope: vec![],
+                    fact_type: None,
+                    k: 10,
+                    as_of: Some(between),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            hist.iter().any(|h| h.record.id == v1.id),
+            "as_of before the update must still surface the historical version"
+        );
     }
 }
