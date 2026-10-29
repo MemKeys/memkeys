@@ -507,6 +507,33 @@ impl FactStore for PgStore {
         Ok(row)
     }
 
+    /// Batch supersession probe (ISI-6810) — the set form of op 1's
+    /// `Validity::Current` collapse (`NOT EXISTS … s.supersedes = f.id`),
+    /// exposed so op 4 (semantic) can drop stale vector hits. An id is returned
+    /// iff some fact `s` in the tenant supersedes it and was ingested by
+    /// `as_of` (NULL `as_of` ⇒ live head). DISTINCT so each id appears once.
+    async fn superseded_ids(
+        &self,
+        tenant_id: &str,
+        ids: &[uuid::Uuid],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, QueryError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT s.supersedes FROM facts s \
+             WHERE s.tenant_id = $1 AND s.supersedes = ANY($2) \
+               AND ($3::timestamptz IS NULL OR s.ingested_at <= $3)",
+        )
+        .bind(tenant_id)
+        .bind(ids)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Operation 1 (§7.2): ANDed entity keys, optional type filter, as-of
     /// replay on BOTH bi-temporal axes, read-time supersession collapse
     /// (`valid=current`, the default), newest first, bounded limit. Keyed rows

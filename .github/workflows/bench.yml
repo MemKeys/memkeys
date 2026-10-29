@@ -41,8 +41,23 @@ jobs:
 
       - name: Run criterion benches (bencher format for tracking)
         run: |
+          # Start Criterion clean so every run is a first-run. Swatinem/rust-cache
+          # can partially restore target/criterion, leaving a stale/partial
+          # base/sample.json; Criterion then injects a
+          #   "Criterion.rs ERROR: ... base/sample.json: No such file or directory"
+          # line *between* the `test <name> ...` and `bench: <n> ns/iter` lines,
+          # which splits the single-line bencher format the report action parses
+          # and makes it report "No benchmark result was found" (ISI-6782).
+          rm -rf target/criterion
           cargo bench -p memkeys-bench --bench hot_paths -- --output-format bencher \
             | tee bench-output.txt
+          # Fail fast (loudly) if the benches produced no measurements at all, so a
+          # real "no output" problem is surfaced here rather than swallowed by the
+          # report step's continue-on-error below.
+          if ! grep -q 'ns/iter' bench-output.txt; then
+            echo "::error::No 'ns/iter' lines in bench-output.txt — benches produced no measurements." >&2
+            exit 1
+          fi
 
       # The comparable baseline/report artifact (criterion keeps full HTML +
       # estimates under target/criterion; bench-output.txt is the machine copy).
@@ -68,6 +83,10 @@ jobs:
             benchmark-data-
 
       - name: Compare against baseline + report regressions
+        # Report-only: a hiccup in the comparison/report step must never fail the
+        # job. The real "no measurements" case is already caught loudly above
+        # (ISI-6782 defense-in-depth).
+        continue-on-error: true
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: memkeys hot paths
