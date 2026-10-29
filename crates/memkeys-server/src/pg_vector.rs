@@ -201,10 +201,14 @@ impl VectorIndex for PgVectorIndex {
         // CandidateSet::All (unscoped) path too so a whole-tenant `as_of`
         // search is temporally bounded, not a silent newer-than-as_of read
         // (ISI-6172 / CR ISI-6168 B1).
-        let rows: Vec<(Uuid, f64)> = match candidates {
+        // `ingested_at` rides along on each row (ADR-0002): the hybrid recency
+        // re-rank in `semantic_search_inner` needs each candidate's age, and the
+        // column is already here for the `as_of` bound — no extra round-trip.
+        let rows: Vec<(Uuid, f64, DateTime<Utc>)> = match candidates {
             CandidateSet::All => {
                 sqlx::query_as(
-                    "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score \
+                    "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score, \
+                            ingested_at \
                      FROM fact_vectors WHERE tenant_id = $1 \
                        AND ($3::timestamptz IS NULL OR ingested_at <= $3) \
                      ORDER BY embedding <=> $2::vector LIMIT $4",
@@ -220,7 +224,8 @@ impl VectorIndex for PgVectorIndex {
                 // Empty candidate set ⇒ `= ANY('{}')` ⇒ no rows (the scope
                 // excluded everything) — same outcome as MemVectorIndex.
                 sqlx::query_as(
-                    "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score \
+                    "SELECT fact_id, (1.0 - (embedding <=> $2::vector))::float8 AS score, \
+                            ingested_at \
                      FROM fact_vectors WHERE tenant_id = $1 AND fact_id = ANY($3) \
                        AND ($4::timestamptz IS NULL OR ingested_at <= $4) \
                      ORDER BY embedding <=> $2::vector LIMIT $5",
@@ -238,9 +243,10 @@ impl VectorIndex for PgVectorIndex {
 
         Ok(rows
             .into_iter()
-            .map(|(fact_id, score)| ScoredId {
+            .map(|(fact_id, score, ingested_at)| ScoredId {
                 fact_id,
                 score: score as f32,
+                ingested_at,
             })
             .collect())
     }

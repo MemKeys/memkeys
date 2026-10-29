@@ -40,6 +40,23 @@ use memkeys_server::worker::VectorProjectionWorker;
 use memkeys_server::VectorIndex;
 use memkeys_server::{CategorizeWorker, DigestWorker, ExtractWorker};
 
+/// Read an `f64` env var, falling back to `default` when unset or unparseable
+/// (a malformed tuning knob should not fail boot — ADR-0002 §Config).
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read a `usize` env var, falling back to `default` when unset or unparseable.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // M4: providers + exporters + the tracing→OTel logs bridge. The guard is
@@ -84,10 +101,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             embedder.clone(),
             vector.clone(),
         ));
+        // ADR-0002: hybrid recency+semantic re-rank knobs, read at the scoring
+        // edge. α=1.0 reproduces pure-cosine order (the kill-switch); defaults
+        // α=0.6, λ=1e-6 (e-folding ≈ 11.6 d), N=200. Unparseable values fall
+        // back to the default rather than failing boot.
+        let recency = memkeys_server::semantic::RecencyConfig {
+            alpha: env_f64("MEMKEYS_RECENCY_ALPHA", 0.6),
+            lambda: env_f64("MEMKEYS_RECENCY_LAMBDA", 1e-6),
+            candidates: env_usize("MEMKEYS_RECENCY_CANDIDATES", 200),
+        };
         service = service
             .with_semantic(embedder, vector)
-            .with_semantic_worker(vworker);
-        tracing::info!(target: "memkeys", "memkeys.semantic.enabled: fact-vector tier + stage-5b worker on");
+            .with_semantic_worker(vworker)
+            .with_recency(recency);
+        tracing::info!(
+            target: "memkeys",
+            alpha = recency.alpha,
+            lambda = recency.lambda,
+            candidates = recency.candidates,
+            "memkeys.semantic.enabled: fact-vector tier + stage-5b worker + recency re-rank on"
+        );
     }
 
     // M6 (ADR-llm-pipeline): the LLM pipeline workers 5c-5e behind the

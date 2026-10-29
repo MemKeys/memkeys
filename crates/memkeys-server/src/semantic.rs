@@ -203,11 +203,17 @@ pub struct FactVector {
     pub model_id: String,
 }
 
-/// A similarity hit from the index: an id and its score (cosine, in `[-1, 1]`).
+/// A similarity hit from the index: an id, its cosine score (in `[-1, 1]`), and
+/// the fact's `ingested_at` time. The timestamp is carried so the hybrid
+/// recency re-rank ([`hybrid_rerank`], ADR-0002) can score each candidate's age
+/// without a second FactStore round-trip — both backends already hold it
+/// (`MemVectorIndex` on the [`FactVector`]; `PgVectorIndex` in the `ingested_at`
+/// column it already selects for the `as_of` bound).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredId {
     pub fact_id: Uuid,
     pub score: f32,
+    pub ingested_at: DateTime<Utc>,
 }
 
 /// The scope pre-filter applied *before* the ANN pass (§7.4 step 1). This is
@@ -319,6 +325,7 @@ impl VectorIndex for MemVectorIndex {
             .map(|fv| ScoredId {
                 fact_id: fv.fact_id,
                 score: cosine(query, &fv.embedding),
+                ingested_at: fv.ingested_at,
             })
             .collect();
         // Score desc; tiebreak on id so ordering is deterministic.
@@ -444,6 +451,88 @@ pub fn rrf_fuse(lists: &[RankedList]) -> Vec<FusedHit> {
             .then_with(|| a.fact_id.cmp(&b.fact_id))
     });
     fused
+}
+
+/// Deployment knobs for the hybrid recency+semantic re-rank (ADR-0002). Read
+/// once from env at the service edge (§2: the scoring edge "varies most across
+/// deployments") and threaded into the semantic read path — never baked into a
+/// migration. Per-tenant α/λ is a deliberate follow-up (YAGNI until a tenant
+/// needs a different half-life).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecencyConfig {
+    /// Semantic weight α ∈ [0, 1] in `α·cosine + (1−α)·decay`. **α = 1.0
+    /// reproduces pure-cosine order exactly** — the graceful kill-switch, no
+    /// separate feature flag needed (ADR-0002 §Config).
+    pub alpha: f64,
+    /// Decay rate λ per second in `exp(−λ·age_seconds)`. Default `1e-6`
+    /// (e-folding ≈ 11.6 days).
+    pub lambda: f64,
+    /// Oversample pool size N: how many cosine-ranked candidates the ANN pass
+    /// returns *before* the re-rank truncates to k. N is a recall ceiling — a
+    /// genuinely-recent fact outside the cosine top-N can't be recovered.
+    pub candidates: usize,
+}
+
+impl Default for RecencyConfig {
+    /// ADR-0002 §Config defaults: α=0.6, λ=1e-6 (e-folding ≈ 11.6 d), N=200.
+    fn default() -> Self {
+        Self {
+            alpha: 0.6,
+            lambda: 1e-6,
+            candidates: 200,
+        }
+    }
+}
+
+/// Hybrid recency+semantic re-rank (ADR-0002, Option A2). A **pure function** —
+/// no Postgres, no clock: `reference_time` is supplied by the caller (the
+/// service passes `req.as_of.unwrap_or(now)`), which keeps this core
+/// deterministic and CI-testable with no services.
+///
+/// For each candidate:
+/// ```text
+/// score       = α·cosine + (1−α)·exp(−λ·age_seconds)
+/// age_seconds = max(0, reference_time − ingested_at)
+/// ```
+/// Sorts by the hybrid score descending (deterministic `fact_id` tiebreak) and
+/// truncates to `k`. A fact ingested after `reference_time` clamps to age 0 ⇒
+/// full recency credit (decay never exceeds 1).
+///
+/// **`as_of` correctness (ADR-0002 §as_of):** age is measured from
+/// `reference_time`, so for a point-in-time read ("recent *as of* then") the
+/// caller passes `as_of` — not wall-clock now, which would collapse every
+/// historical fact's decay to ≈0 and silently revert to pure cosine.
+///
+/// **α = 1.0** collapses the formula to `score = cosine`, reproducing the ANN
+/// order exactly (the kill-switch). The caller is expected to have already
+/// dropped non-positive cosines (§Pipeline step 3) so a stale, zero-cosine fact
+/// can't earn recency credit it doesn't deserve.
+pub fn hybrid_rerank(
+    scored: Vec<ScoredId>,
+    cfg: &RecencyConfig,
+    reference_time: DateTime<Utc>,
+    k: usize,
+) -> Vec<ScoredId> {
+    let mut rescored: Vec<(f64, ScoredId)> = scored
+        .into_iter()
+        .map(|s| {
+            // age in seconds, clamped at 0 (a future-ingested fact — possible on
+            // an `as_of` read of a fact newer than the viewpoint, already
+            // excluded upstream — gets full recency credit, never decay > 1).
+            let age = (reference_time - s.ingested_at).num_seconds().max(0) as f64;
+            let decay = (-cfg.lambda * age).exp();
+            // α = 1.0 ⇒ (1−α) is exactly 0.0 ⇒ hybrid == cosine, bit-for-bit.
+            let hybrid = cfg.alpha * s.score as f64 + (1.0 - cfg.alpha) * decay;
+            (hybrid, s)
+        })
+        .collect();
+    rescored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.fact_id.cmp(&b.1.fact_id))
+    });
+    rescored.truncate(k);
+    rescored.into_iter().map(|(_, s)| s).collect()
 }
 
 #[cfg(test)]
@@ -647,5 +736,108 @@ mod tests {
         assert_eq!(fused[0].fact_id, id(1));
         assert_eq!(fused[0].sources.len(), 3, "keyed + graph + semantic");
         assert_eq!(fused.len(), 3);
+    }
+
+    // --- Hybrid recency+semantic re-rank (ADR-0002) -----------------------
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn scored_at(n: u128, score: f32, ingested: DateTime<Utc>) -> ScoredId {
+        ScoredId {
+            fact_id: id(n),
+            score,
+            ingested_at: ingested,
+        }
+    }
+
+    /// ADR-0002 assertion (a): with α < 1, a recent fact with *lower* cosine
+    /// outranks a stale fact with *higher* cosine once its age pushes decay
+    /// past the crossover — the exact SRE-recall failure the re-rank fixes.
+    #[test]
+    fn recency_beats_stale_higher_cosine_past_crossover() {
+        let cfg = RecencyConfig::default(); // α=0.6, λ=1e-6
+        let now = ts(100_000_000);
+        // stale: strong cosine but ingested ~30 days earlier.
+        let stale = scored_at(1, 0.90, ts(100_000_000 - 2_592_000));
+        // recent: weaker cosine but ingested right at the reference time.
+        let recent = scored_at(2, 0.70, now);
+
+        let out = hybrid_rerank(vec![stale, recent], &cfg, now, 2);
+        assert_eq!(
+            out[0].fact_id,
+            id(2),
+            "recent lower-cosine fact wins past the decay crossover"
+        );
+        assert_eq!(out[1].fact_id, id(1));
+    }
+
+    /// ADR-0002 assertion (b): α = 1.0 reproduces pure-cosine order exactly —
+    /// the graceful kill-switch. ingested_at varies wildly but must not matter.
+    #[test]
+    fn alpha_one_is_pure_cosine_order() {
+        let cfg = RecencyConfig {
+            alpha: 1.0,
+            ..RecencyConfig::default()
+        };
+        let now = ts(100_000_000);
+        // Recency order is the OPPOSITE of cosine order; α=1 must ignore it.
+        let a = scored_at(1, 0.90, ts(1_000)); // best cosine, oldest
+        let b = scored_at(2, 0.50, ts(50_000_000)); // mid cosine, mid age
+        let c = scored_at(3, 0.30, now); // worst cosine, newest
+
+        let out = hybrid_rerank(vec![c.clone(), a.clone(), b.clone()], &cfg, now, 3);
+        let by_cosine: Vec<Uuid> = vec![a.fact_id, b.fact_id, c.fact_id];
+        let got: Vec<Uuid> = out.iter().map(|s| s.fact_id).collect();
+        assert_eq!(got, by_cosine, "α=1.0 must match pure-cosine descending");
+        // And the hybrid score is bit-for-bit the cosine at α=1.0.
+        assert_eq!(out[0].score, 0.90);
+    }
+
+    /// ADR-0002 assertion (c): the age reference is `reference_time`, NOT
+    /// wall-clock now. Scoring the same candidates against an historical
+    /// `as_of` viewpoint vs a far-future "now" flips the winner — proving the
+    /// service must pass `as_of` (a now-based age would collapse all decay).
+    #[test]
+    fn reference_time_is_the_age_anchor_not_now() {
+        let cfg = RecencyConfig::default(); // α=0.6, λ=1e-6
+                                            // factA ingested at the as_of viewpoint; factB older but higher cosine.
+        let as_of = ts(10_000_000);
+        let fact_a = scored_at(1, 0.70, as_of); // young as of `as_of`
+        let fact_b = scored_at(2, 0.80, ts(10_000_000 - 2_592_000)); // ~30d older
+
+        // Scored AT the as_of viewpoint: factA is fresh → it wins.
+        let at_as_of = hybrid_rerank(vec![fact_a.clone(), fact_b.clone()], &cfg, as_of, 2);
+        assert_eq!(
+            at_as_of[0].fact_id,
+            id(1),
+            "as-of-anchored age makes the fresh fact win"
+        );
+
+        // Scored against a far-future wall-clock now: BOTH are ancient, their
+        // decays collapse toward 0, and higher cosine (factB) wins instead —
+        // the wrong answer for a point-in-time read, which is why the service
+        // anchors on `as_of`.
+        let now = ts(10_000_000 + 10 * 2_592_000);
+        let at_now = hybrid_rerank(vec![fact_a, fact_b], &cfg, now, 2);
+        assert_eq!(
+            at_now[0].fact_id,
+            id(2),
+            "now-anchored age collapses recency → cosine dominates (the bug as_of avoids)"
+        );
+    }
+
+    #[test]
+    fn hybrid_rerank_truncates_to_k() {
+        let cfg = RecencyConfig::default();
+        let now = ts(100_000_000);
+        let scored = vec![
+            scored_at(1, 0.9, now),
+            scored_at(2, 0.8, now),
+            scored_at(3, 0.7, now),
+        ];
+        let out = hybrid_rerank(scored, &cfg, now, 2);
+        assert_eq!(out.len(), 2, "re-rank truncates to k");
     }
 }

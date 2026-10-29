@@ -59,6 +59,27 @@ required. Every derived artifact is stamped with
 `(model_id, prompt_version)` so changing models triggers a clean rebuild of
 projections, never a silent mismatch.
 
+### Recency re-rank
+
+The fact-vector read path re-ranks the cosine candidates by a hybrid of
+semantic similarity and recency decay
+(`score = α·cosine + (1−α)·exp(−λ·age_seconds)`), so the most *recent* relevant
+fact is preferred over a stale-but-similar one — the signal that drove the
+keyed-path benchmark win. See
+[ADR-0002](https://github.com/MemKeys/memkeys/blob/main/docs/adr/ADR-0002-hybrid-recency-semantic-rerank.md).
+These knobs only take effect when `MEMKEYS_SEMANTIC` is on; an unparseable
+value falls back to the default rather than failing boot.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMKEYS_RECENCY_ALPHA` | `0.6` | Semantic weight α ∈ [0, 1]. **α = 1.0 reproduces pure-cosine order exactly** — the graceful kill-switch, no separate feature flag. Lower α weights recency more. |
+| `MEMKEYS_RECENCY_LAMBDA` | `1e-6` | Decay rate λ per second in `exp(−λ·age_seconds)`. Default e-folding ≈ 11.6 days; larger λ decays faster (e.g. `1.1e-6` ≈ 10.5 d, `2.7e-6` ≈ 4.3 d). |
+| `MEMKEYS_RECENCY_CANDIDATES` | `200` | Oversample pool size N: how many cosine-ranked candidates the HNSW pass returns before the re-rank truncates to `k`. N is a recall ceiling — a genuinely-recent fact outside the cosine top-N can't be recovered; raise it for large tenants. |
+
+Age is measured from the read's point-in-time viewpoint
+(`reference_time = as_of` when set, else now), so an `as_of` query scores
+"recent" as of that historical time — not relative to wall-clock now.
+
 ## Database pool
 
 | Variable | Default | Purpose |
