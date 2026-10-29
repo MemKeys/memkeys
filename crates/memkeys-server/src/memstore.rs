@@ -126,6 +126,25 @@ impl FactStore for MemStore {
         }
         Ok(rows)
     }
+
+    async fn superseded_ids(
+        &self,
+        _tenant_id: &str,
+        ids: &[uuid::Uuid],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, QueryError> {
+        // Single-tenant by construction (see module docs). An id is superseded
+        // iff some fact `s` points at it via `supersedes` and was known by
+        // `as_of` — the chain property op 1 collapses on (ISI-6810).
+        let facts = self.facts.read().expect("memstore lock");
+        let target: std::collections::HashSet<uuid::Uuid> = ids.iter().copied().collect();
+        Ok(facts
+            .values()
+            .filter(|s| as_of.is_none_or(|t| s.ingested_at <= t))
+            .filter_map(|s| s.supersedes)
+            .filter(|sup| target.contains(sup))
+            .collect())
+    }
 }
 
 #[cfg(test)]
