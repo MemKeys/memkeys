@@ -836,8 +836,14 @@ mod tests {
             "entity":{"service":"crew-session-42","project":"setb-scenario"},
             "fact":{"type":"context","subject":"task_state:analyst","body":{"task_title":"audit logs","next_step":"STEP_A_read_access_log"}}
         }}}}"#;
-        let r = handle_line(&svc, v, &admission(), save_v1).await.expect("reply");
-        assert!(r.result.as_ref().unwrap().get("isError").is_none(), "v1 store: {:?}", r.result);
+        let r = handle_line(&svc, v, &admission(), save_v1)
+            .await
+            .expect("reply");
+        assert!(
+            r.result.as_ref().unwrap().get("isError").is_none(),
+            "v1 store: {:?}",
+            r.result
+        );
 
         // Suspend #2: save task_state v2 (later event_time) — same service + subject.
         let save_v2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"envelope":{
@@ -845,19 +851,36 @@ mod tests {
             "entity":{"service":"crew-session-42","project":"setb-scenario"},
             "fact":{"type":"context","subject":"task_state:analyst","body":{"task_title":"audit logs","next_step":"STEP_B_write_findings"}}
         }}}}"#;
-        let r = handle_line(&svc, v, &admission(), save_v2).await.expect("reply");
-        assert!(r.result.as_ref().unwrap().get("isError").is_none(), "v2 store: {:?}", r.result);
+        let r = handle_line(&svc, v, &admission(), save_v2)
+            .await
+            .expect("reply");
+        assert!(
+            r.result.as_ref().unwrap().get("isError").is_none(),
+            "v2 store: {:?}",
+            r.result
+        );
 
         // Relaunch: restore = fetch newest context fact on the stable service anchor.
         let restore = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.service":"crew-session-42","type":"context","limit":1}}}"#;
-        let resp = handle_line(&svc, v, &admission(), restore).await.expect("reply");
+        let resp = handle_line(&svc, v, &admission(), restore)
+            .await
+            .expect("reply");
         let result = resp.result.expect("ok reply");
-        assert!(result.get("isError").is_none(), "restore should succeed: {result}");
+        assert!(
+            result.get("isError").is_none(),
+            "restore should succeed: {result}"
+        );
         let text = result["content"][0]["text"].as_str().unwrap();
         // The restored record is the latest suspend (v2), not the stale v1 —
         // the agent resumes from where it actually left off.
-        assert!(text.contains("STEP_B_write_findings"), "restore must recover newest state, got: {text}");
-        assert!(!text.contains("STEP_A_read_access_log"), "stale v1 must not be the restored state, got: {text}");
+        assert!(
+            text.contains("STEP_B_write_findings"),
+            "restore must recover newest state, got: {text}"
+        );
+        assert!(
+            !text.contains("STEP_A_read_access_log"),
+            "stale v1 must not be the restored state, got: {text}"
+        );
     }
 
     #[tokio::test]
