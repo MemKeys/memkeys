@@ -6,7 +6,9 @@ answers *correct*, not on raw retrieval recall@k.
 
 > **Status.** Set A (single-agent SRE investigation) is complete with all five
 > backends scored. Set B (multi-agent crew: build → suspend/resume → fact-change)
-> is scored across five backends, including MemKeys — see
+> is scored across five backends, including MemKeys — the MemKeys `resume`/`restart`
+> scores were **refreshed (N=3)** after the ADR-0003 task-state fix cleared the
+> suspend/resume design gap — see
 > [Set B](#set-b--multi-agent-crew-suspendresume--fact-change).
 >
 > These numbers come from the KubeCon memory-benchmark re-run (project *Talks*,
@@ -110,7 +112,7 @@ memory**), then probed with **fact-change** questions. Per-sub-scenario scores
 
 | Backend | build | resume | restart | factchange | Composite |
 |---------|:-----:|:------:|:-------:|:----------:|:---------:|
-| **MemKeys** | 0.00 | 0.00 | 0.00 | **1.00** | ≈0.25 |
+| **MemKeys** | 0.00 | **0.33** §§ | **0.33** §§ | **1.00** | ≈0.42 |
 | mempalace | 0.00 | **1.00** | 0.00 † | **1.00** | ≈0.50 |
 | zep (graphiti) | **1.00** | 0.55 | — | 0.00 ‡ | ≈0.52 |
 | mem0 | 0.00 | 0.00 | — | **1.00** | ≈0.33 |
@@ -123,16 +125,34 @@ the harness discriminates. Caveats are reported in the open, not hidden:
   recall failure.
 - ‡ zep's `factchange` 0.00 is a driver JSON bug (`memory_add` →
   `Expecting value: line 1 column 1`), not a capability verdict.
+- §§ MemKeys `resume`/`restart` are the **refreshed N=3 re-run** after the
+  task-state fix (see below); the other rows are from the earlier single-pass run.
+  Per-run N=3 means for every backend are in the ranking report
+  (`setb-ranking-nrun.md` / `setb-aggregate-nrun.json`).
 - **memos** was not scored in Set B (neo4j crash-loop in this environment); **graphiti**
   as an independent backend went **NO-GO** on the fail-closed gate (seeded fact not
   recalled within the async-ingestion window).
 
-**MemKeys row:** scored on the same crew harness (`setb-runner`, `deepseek-flash`).
-MemKeys **nails fact-change (4/4, score 1.00)** — all three probes correctly report
-that 5500 supersedes 5432, with verbatim recall of the stored fact — while build,
-resume, and restart score 0.00. The profile matches **mem0** (fact-change strong;
-no cross-session crew recall) and clears the memref control floor (0.06). Composite
-≈0.25. Tracking issue: ISI-6724.
+**MemKeys row (refreshed).** The first pass scored MemKeys at `resume`/`restart` =
+0.00 — a *design gap*, not a recall gap: the crew never surfaced an out-of-band,
+restart-stable session id, so suspend→relaunch had no anchor to re-key the prior
+work from. [ADR-0003](docs/adr/ADR-0003-task-state-resume-convention.md) closes that
+gap with a **task-state convention** (no new MCP tool): the crew's stable
+`CREW_SESSION_ID` is persisted as a `context`-typed fact under `entity.service` and
+restored on relaunch. Re-run **N=3** on the task-state adapter
+(`kagent-memory-mcp:isi6818`, ISI-6819): **`resume` 0.00 → 0.33** and **`restart`
+0.00 → 0.33** (0.33 ±0.58 — the same high-variance profile as mempalace's resume
+floor; infra-excluded restart = 1.00). Run 3 is the proof: on the fresh-context
+relaunch, with in-session history gone, MemKeys restored the task-state record and
+the crew answered *"Recalled from memory (no redesign): Framework Flask … Storage
+SQLite …"*, continuing the prior design rather than rebuilding — the exact capability
+that scored 0.00 at baseline. `factchange` stays at **1.00**, now hardened to
+**12/12 across N=3** by the resilient runner (ISI-6841, which ports the Set A
+A2A empty-turn retry into the Set B runner so transient `-32603`/timeout turns are
+retried instead of scored as hard zeros). `build` remains ~0.00 — a BMAD-crew
+behaviour (the orchestrator emits only a delegation/status line), independent of the
+memory backend. Composite ≈0.42. Tracking issues: ISI-6819 (resume gate),
+ISI-6838/ISI-6841 (factchange N=3); parent ISI-5581.
 
 ---
 
@@ -191,7 +211,9 @@ with a Postgres substrate for MemKeys. The pipeline is identical for every backe
 Deploy bundles, drivers, runner Jobs, raw `records.jsonl`, and the ranking reports
 live in the **memory-benchmark** workspace (project *Talks*), cross-referenced by the
 KubeCon talk materials. Set A rankings: `results/seta-ranking.{json,md}`. Set B:
-`two-pass-ranking-report.md` / `ISI-6184_SetB_Finalize_Report.md`.
+`two-pass-ranking-report.md` / `ISI-6184_SetB_Finalize_Report.md`, with the N=3
+re-run matrix in `setb-runner/results/setb-ranking-nrun.md` /
+`setb-aggregate-nrun.json`.
 
 ---
 
@@ -202,7 +224,15 @@ KubeCon talk materials. Set A rankings: `results/seta-ranking.{json,md}`. Set B:
 - Set A ran with MemKeys' built-in 256-dim hash embedder on the semantic tier and a
   **keyed-primary** recall path; a 768-dim embedder rebuild would exercise the
   semantic tier more heavily. The keyed path is MemKeys' source of truth, so the
-  result reflects its intended architecture.
+  result reflects its intended architecture. A separate **768-dim semantic-path**
+  validation confirmed the tier does not regress warm recall once the
+  [ADR-0002](docs/adr/ADR-0002-hybrid-recency-semantic-rerank.md) **recency re-rank**
+  (`α·cosine + (1−α)·exp(−λ·age)`, α=0.6) is enabled: a cosine-only semantic pass had
+  a *negative* warm payoff (cold 0.405 / warm 0.343, Δ **−0.062** — recalled-but-stale
+  context pulling the agent off course), and the recency re-rank reversed it to a
+  positive payoff (cold 0.642 / warm 0.650, Δ **+0.008**). The headline Set A table
+  above is the keyed-primary path and is unchanged by this; the recency fix hardens
+  the best-effort semantic tier (ISI-6809 / ISI-6852).
 - These are **relative** results on one agent model and one judge in one cluster.
   They show memory *helps* and that MemKeys' keyed+temporal design is competitive
   on an agentic task — they are not a universal ranking of memory products.
