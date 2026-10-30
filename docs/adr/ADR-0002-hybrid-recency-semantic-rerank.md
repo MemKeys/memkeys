@@ -132,6 +132,53 @@ Unit tests assert: (a) with α<1, a recent-lower-cosine fact outranks a stale-hi
 cosine fact past the decay crossover; (b) α=1.0 reproduces pure-cosine order exactly;
 (c) `as_of` uses as_of (not now) as the age reference.
 
+### ISI-6874 follow-on sweep — outcome: keep shipped defaults (stretch not met)
+
+ISI-6809's primary bar (warm Δ > 0) was met by ISI-6851 (warm Δ = +0.0083). ISI-6874
+chased the ≥0.10 stretch tier by sweeping λ then α (DevOps execution ISI-6876, env-only
+on `memkeys:isi6851-recency`, ISI-6851 harness). **Outcome: the stretch target is not
+cleanly reachable via α/λ on the semantic re-rank; the shipped defaults (α = 0.6,
+λ = 1e-6, N = 200) stand.**
+
+Set A `ingested_at` span was measured at ~56 min (21 facts, one entity, ~uniform), so
+the λ grid was well-calibrated to create real intra-session decay discrimination
+(exp(−λ·3335): 0.077 at 15 min … 0.997 at 11.6 d). Stage 1 (α = 0.4 fixed, one run/cell):
+
+| e-fold | λ (s⁻¹) | cold | warm | Δ = warm − cold |
+|---|---|---|---|---|
+| 15 min | 7.7e-4 | 0.260 | 0.508 | +0.248 |
+| 1 h | 2.8e-4 | 0.630 | 0.600 | −0.030 |
+| 6 h | 4.6e-5 | 0.533 | 0.617 | +0.083 |
+| 1 d | 1.2e-5 | 0.875 | 0.700 | −0.175 |
+| 11.6 d (default) | 1e-6 | 0.642 | 0.650 | +0.008 |
+
+Two findings closed the chase:
+
+1. **Δ = warm − cold is a confounded objective here.** The Step-0 premise that the cold
+   pass is invariant to the recency env was **falsified**: the cold pass stores facts
+   *live* over the ~56-min investigation, so mid-pass recall is itself re-ranked, and
+   cold swings 0.26–0.875 across λ. The only cell clearing Δ ≥ 0.10 (15 min, +0.248)
+   does so by *collapsing cold to 0.26*, and its absolute warm (0.508) is the **worst**
+   in the grid. That is cold degradation, not a recall gain. **When a tuning knob moves
+   the cold baseline, optimize absolute warm, not warm − cold.**
+2. **Weighting recency harder does not help warm.** By absolute warm, stronger recency
+   (faster λ) is *worse* (15 min → 0.508); the best warm (0.700, 1 d) sits at gentle
+   decay, and the shipped near-flat default (λ = 1e-6) already gives warm 0.650. The
+   "recency is under-weighted" hypothesis is not supported by the warm scores.
+
+Stage 2 (α sweep at a fixed λ) was **declined**: at a cold-preserving λ (1 h) cold is
+≈constant in α while more recency weight lowers warm, so no α cell can clear ~0.73 warm
+— the burn's expected value did not justify the DeepSeek cost. With one run per cell and
+cold ranging 0.26–0.875, signal-to-noise is also too low to justify a default change.
+The shipped default (warm 0.650 / cold 0.642 / Δ +0.008) is a stable, positive, modest
+payoff and remains the recommendation.
+
+The headline Set A result (BENCHMARKS.md) is the **keyed-primary** path (warm 0.867,
+Δ +0.300); this semantic-path re-rank is a secondary tier whose stretch optimization is
+now closed. A genuine further gain would require *session-aware* scoping of the warm
+pass (not reusing stale prior-session facts) rather than an α/λ env tune — a possible
+future design, out of scope here and non-blocking.
+
 ## Out of scope (separate sub-issue)
 
 The 2 A2A empty-answer warm failures (imagepull, oomkill; `tokens_in=0`) are **not** a
