@@ -13,6 +13,14 @@ description = "Known false positives: branding asset filename list in make_packa
 # generic-api-key rule flags one of those strings. The file is not a secret.
 paths = [
   '''branding/make_package\.py''',
+  # Deleted dogfood manifest (removed from the tree in a later commit, retained
+  # only in history). Commit 2fa5a582 (2026-10-22) embedded a Paperclip agent
+  # JWT for the SYNTHETIC SLO-test tenant "slo-6333" (sub testing-architect,
+  # run isi6333-slo). The token was ALREADY EXPIRED when committed
+  # (exp 2026-10-20T13:32:12Z) — a dead credential for a throwaway test tenant,
+  # not the production company, so not an active exposure. The full-history scan
+  # still flags it; allowlist the deleted path so CI passes. See ISI-6874.
+  '''deploy/k8squad-test/slo-job\.yaml''',
 ]
 
 # The canary/dogfood tenant floor is the PUBLIC Paperclip company UUID — it
@@ -22,4 +30,8 @@ paths = [
 # keyword. Allowlist the literal so documentation can show the real value.
 regexes = [
   '''615e9564-65df-4465-9b19-a5afb73446c6''',
+  # Docker image tag of the shipped recency build, referenced in benchmark docs
+  # (e.g. ADR-0002). The generic-api-key entropy rule flags the tag string
+  # "isi6851-recency" — it is an image tag, not a secret.
+  '''isi6851-recency''',
 ]
