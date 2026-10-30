@@ -132,6 +132,60 @@ Unit tests assert: (a) with α<1, a recent-lower-cosine fact outranks a stale-hi
 cosine fact past the decay crossover; (b) α=1.0 reproduces pure-cosine order exactly;
 (c) `as_of` uses as_of (not now) as the age reference.
 
+### ISI-6874 follow-on sweep — result (α/λ tuning for the ≥0.10 stretch tier)
+
+The ISI-6851 validation re-run met the primary bar (warm Δ = **+0.0083 > 0**, reversing
+the ISI-6742 baseline Δ = −0.062) but fell far short of the ≥0.10 stretch tier. ISI-6874
+ran a coordinate-descent sweep (DevOps ISI-6876, env-only on the shipped
+`memkeys:isi6851-recency` image, ISI-6851 harness pod `seta-runner-memkeys`). Stage 1
+fixed α=0.4 and swept λ across the measured Set A fact-ingestion span (**~56 min**, 21
+facts under one entity — confirming facts span a real session, not a batch seed):
+
+| e-fold | λ (s⁻¹) | α | cold | warm | Δ = warm − cold |
+|---|---|---|---|---|---|
+| 15 min | 7.7e-4 | 0.4 | 0.260 | 0.508 | +0.248 |
+| 1 h | 2.8e-4 | 0.4 | 0.630 | 0.600 | −0.030 |
+| 6 h | 4.6e-5 | 0.4 | 0.533 | 0.617 | +0.083 |
+| 1 d | 1.2e-5 | 0.4 | 0.875 | 0.700 | −0.175 |
+| 11.6 d (default, α=0.6) | 1e-6 | 0.6 | 0.642 | 0.650 | +0.008 |
+
+**Two findings, one decision.**
+
+1. **The λ hypothesis is confirmed.** Warm ordering *does* respond to λ — a session-scale
+   e-fold creates real recency discrimination (decay across the 56-min span: 0.077 at
+   15 min vs 0.997 at the 11.6 d default), exactly the lever predicted. The default
+   λ=1e-6 was flattening the recency term to ≈1, which is why the shipped Δ sat at
+   +0.008.
+
+2. **But the warm−cold Δ metric is confounded on Set A, so a large Δ is not a win.**
+   The initial assumption that the cold pass is λ-invariant (empty store ⇒ re-rank is a
+   no-op) is **falsified** by the data: cold ranges 0.260 → 0.875 across the λ grid.
+   Cause — Set A facts accumulate *during* the cold investigation pass, so mid-pass
+   searches already see aged facts; an aggressive λ degrades the *cold* pass too. The
+   headline +0.248 at 15 min is therefore driven by a **collapsed cold baseline**
+   (0.260), not by a better warm outcome — its *absolute* warm (0.508) is the **worst**
+   row and well below the default's 0.650. Reading absolute warm recall (the agent's
+   actual end-state quality) instead of the confounded Δ: every cell from 1 h to 11.6 d
+   sits in a noisy 0.60–0.70 band (single-run cells, stochastic DeepSeek judge), and
+   only aggressively-fast λ clearly *degrades* recall.
+
+**Decision: keep the shipped defaults (α=0.6, λ=1e-6).** No (α,λ) reaches Δ ≥ 0.10 with
+cold intact, and none improves absolute warm recall over the default's 0.650. The
+≥0.10 stretch tier is **not reachable by α/λ tuning on this metric/scenario** — it is a
+property of the warm−cold measure under live-fill cold passes, not an under-weighting
+of recency. Stage 2 (α sweep) was **not run**: a 4-cell single-run sweep cannot overcome
+the N=1 judge noise or the metric confound, and the stretch target was explicitly
+non-blocking (the primary Δ > 0 bar is long met). The recency re-rank remains valuable
+where the cold/warm split is a true memory-less baseline (the keyed-path +0.300 on a
+different measurement); for Set A SRE under this harness it is Δ-neutral at the default
+and should stay enabled with α=1.0 available as the kill-switch.
+
+**Follow-on (if the stretch is still wanted):** it requires a measurement change, not a
+knob change — either a Set A variant whose cold pass is a true empty-memory baseline
+(facts pre-seeded before the cold run, not accumulated during it), or replicated runs
+(N≥3 per cell) to separate signal from the ±0.1 judge noise seen here. Tracked as a
+possible benchmark-harness follow-up, not a retrieval-core change.
+
 ## Out of scope (separate sub-issue)
 
 The 2 A2A empty-answer warm failures (imagepull, oomkill; `tokens_in=0`) are **not** a
