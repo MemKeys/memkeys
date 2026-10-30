@@ -11,8 +11,8 @@ answers *correct*, not on raw retrieval recall@k.
 > suspend/resume design gap — see
 > [Set B](#set-b--multi-agent-crew-suspendresume--fact-change).
 >
-> These numbers come from the KubeCon memory-benchmark re-run (project *Talks*,
-> ISI-5581 plan rev 6). Methodology and raw records are reproducible — see
+> These numbers come from the KubeCon memory-benchmark re-run (project *Talks*).
+> Methodology and raw records are reproducible — see
 > [Reproducing the benchmark](#reproducing-the-benchmark).
 
 ## TL;DR
@@ -140,19 +140,18 @@ work from. [ADR-0003](docs/adr/ADR-0003-task-state-resume-convention.md) closes 
 gap with a **task-state convention** (no new MCP tool): the crew's stable
 `CREW_SESSION_ID` is persisted as a `context`-typed fact under `entity.service` and
 restored on relaunch. Re-run **N=3** on the task-state adapter
-(`kagent-memory-mcp:isi6818`, ISI-6819): **`resume` 0.00 → 0.33** and **`restart`
+(`kagent-memory-mcp:isi6818`): **`resume` 0.00 → 0.33** and **`restart`
 0.00 → 0.33** (0.33 ±0.58 — the same high-variance profile as mempalace's resume
 floor; infra-excluded restart = 1.00). Run 3 is the proof: on the fresh-context
 relaunch, with in-session history gone, MemKeys restored the task-state record and
 the crew answered *"Recalled from memory (no redesign): Framework Flask … Storage
 SQLite …"*, continuing the prior design rather than rebuilding — the exact capability
 that scored 0.00 at baseline. `factchange` stays at **1.00**, now hardened to
-**12/12 across N=3** by the resilient runner (ISI-6841, which ports the Set A
-A2A empty-turn retry into the Set B runner so transient `-32603`/timeout turns are
-retried instead of scored as hard zeros). `build` remains ~0.00 — a BMAD-crew
-behaviour (the orchestrator emits only a delegation/status line), independent of the
-memory backend. Composite ≈0.42. Tracking issues: ISI-6819 (resume gate),
-ISI-6838/ISI-6841 (factchange N=3); parent ISI-5581.
+**12/12 across N=3** by a resilient runner that ports the Set A A2A empty-turn retry
+into the Set B runner, so transient `-32603`/timeout turns are retried instead of
+scored as hard zeros. `build` remains ~0.00 — a BMAD-crew behaviour (the orchestrator
+emits only a delegation/status line), independent of the memory backend. Composite
+≈0.42.
 
 ---
 
@@ -211,9 +210,8 @@ with a Postgres substrate for MemKeys. The pipeline is identical for every backe
 Deploy bundles, drivers, runner Jobs, raw `records.jsonl`, and the ranking reports
 live in the **memory-benchmark** workspace (project *Talks*), cross-referenced by the
 KubeCon talk materials. Set A rankings: `results/seta-ranking.{json,md}`. Set B:
-`two-pass-ranking-report.md` / `ISI-6184_SetB_Finalize_Report.md`, with the N=3
-re-run matrix in `setb-runner/results/setb-ranking-nrun.md` /
-`setb-aggregate-nrun.json`.
+`two-pass-ranking-report.md`, with the N=3 re-run matrix in
+`setb-runner/results/setb-ranking-nrun.md` / `setb-aggregate-nrun.json`.
 
 ---
 
@@ -232,7 +230,7 @@ re-run matrix in `setb-runner/results/setb-ranking-nrun.md` /
   context pulling the agent off course), and the recency re-rank reversed it to a
   positive payoff (cold 0.642 / warm 0.650, Δ **+0.008**). The headline Set A table
   above is the keyed-primary path and is unchanged by this; the recency fix hardens
-  the best-effort semantic tier (ISI-6809 / ISI-6852).
+  the best-effort semantic tier.
 - These are **relative** results on one agent model and one judge in one cluster.
   They show memory *helps* and that MemKeys' keyed+temporal design is competitive
   on an agentic task — they are not a universal ranking of memory products.
