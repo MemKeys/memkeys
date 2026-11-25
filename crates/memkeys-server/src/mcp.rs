@@ -126,7 +126,7 @@ fn tool_list() -> Value {
                         "entity.run": {"type": "string"},
                         "entity.thread": {"type": "string"},
                         "entity.service": {"type": "string"},
-                        "type": {"type": "string", "enum": ["decision","outcome","observation","learning","context"]},
+                        "type": {"type": "string", "enum": ["decision","outcome","observation","learning","context","linter"]},
                         "as_of": {"type": "string", "description": "RFC3339 point-in-time replay (§7.2)"},
                         "limit": {"type": "integer", "default": 100},
                         "valid": {"type": "string", "enum": ["current","all"], "default": "current"}
@@ -175,7 +175,7 @@ fn tool_list() -> Value {
                                 "entity.run": {"type": "string"},
                                 "entity.thread": {"type": "string"},
                                 "entity.service": {"type": "string"},
-                                "fact.type": {"type": "string", "enum": ["decision","outcome","observation","learning","context"]},
+                                "fact.type": {"type": "string", "enum": ["decision","outcome","observation","learning","context","linter"]},
                                 "category": {"type": "string"}
                             }
                         },
@@ -911,5 +911,126 @@ mod tests {
         assert!(result.get("isError").is_none(), "should succeed: {result}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hits"), "got: {text}");
+    }
+
+    // --- Golden Path A: linter data model + storage (ISI-7811) -------------
+
+    /// The canonical MemKeys-native linter rule body (ADR-0004): the rule lives
+    /// in the structured `fact.body`, `fact.subject` is the stable `rule_id`.
+    fn linter_envelope(rule_id: &str, project: Option<&str>) -> Value {
+        let mut entity = serde_json::Map::new();
+        if let Some(p) = project {
+            entity.insert("project".into(), Value::String(p.into()));
+        }
+        // A context linter uses `entity.project`; a global linter carries NO
+        // entity key (unkeyed, tenant floor). Both ride the `telemetry_learning`
+        // source kind — the only kind whose anchor rule tolerates an unkeyed
+        // fact (pipeline.rs §3.1).
+        serde_json::json!({
+            "source": { "kind": "telemetry_learning", "emitted_at": "2026-11-25T10:00:00Z" },
+            "entity": entity,
+            "fact": {
+                "type": "linter",
+                "subject": rule_id,
+                "body": {
+                    "rule_id": rule_id,
+                    "title": "No console.log in committed code",
+                    "severity": "warn",
+                    "enabled": true,
+                    "scope": { "language": "typescript", "path": "src/**" },
+                    "match": { "kind": "regex", "pattern": "console\\.log\\(" },
+                    "source": "memkeys"
+                }
+            }
+        })
+    }
+
+    fn store_line(envelope: &Value, id: i64) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": "memory_store", "arguments": { "envelope": envelope } }
+        }))
+        .unwrap()
+    }
+
+    /// A project-scoped (context) linter round-trips through the four-op surface:
+    /// stored via `memory_store` (keyed on `entity.project`), read back via op-1
+    /// `memory_fetch` with `entity.project` + `type: linter`. This is the keyed
+    /// Golden-Path read the resolver children use for a project's linter set.
+    #[tokio::test]
+    async fn linter_context_scoped_round_trips_store_and_fetch() {
+        let svc = service();
+        let v = &*verifier("tenant-lint", i64::MAX);
+
+        let env = linter_envelope("no-console-log", Some("proj-alpha"));
+        let r = handle_line(&svc, v, &admission(), &store_line(&env, 1))
+            .await
+            .expect("reply");
+        let stored = r.result.unwrap();
+        assert!(stored.get("isError").is_none(), "store: {stored}");
+        // A project anchor makes the linter keyed.
+        assert_eq!(
+            stored["content"][0]["text"]
+                .as_str()
+                .map(|t| t.contains("\"keyed\":true")),
+            Some(true),
+            "context linter must be keyed, got: {stored}"
+        );
+
+        // Read back via op-1 keyed fetch, narrowed to the linter type.
+        let fetch = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.project":"proj-alpha","type":"linter"}}}"#;
+        let resp = handle_line(&svc, v, &admission(), fetch)
+            .await
+            .expect("reply");
+        let result = resp.result.expect("ok reply");
+        assert!(result.get("isError").is_none(), "fetch: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("no-console-log"),
+            "rule must round-trip, got: {text}"
+        );
+        assert!(
+            text.contains("\"linter\""),
+            "fact_type must be linter, got: {text}"
+        );
+
+        // The type filter is real: fetching a different type returns no linter.
+        let other = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.project":"proj-alpha","type":"decision"}}}"#;
+        let resp = handle_line(&svc, v, &admission(), other)
+            .await
+            .expect("reply");
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !text.contains("no-console-log"),
+            "type filter must exclude it, got: {text}"
+        );
+    }
+
+    /// A global linter carries NO `entity.*` key, so `memory_store` must persist
+    /// it unkeyed (tenant floor). The op-4 `memory_search` read path that reaches
+    /// unkeyed linters is covered at the service layer
+    /// (`service::tests::semantic_search_surfaces_unkeyed_global_linter`), where
+    /// the fact-vector tier is seedable in-process.
+    #[tokio::test]
+    async fn linter_global_stored_unkeyed_via_store() {
+        let svc = service();
+        let v = &*verifier("tenant-lint", i64::MAX);
+
+        let env = linter_envelope("no-unsafe-eval", None);
+        let r = handle_line(&svc, v, &admission(), &store_line(&env, 1))
+            .await
+            .expect("reply");
+        let stored = r.result.unwrap();
+        assert!(stored.get("isError").is_none(), "store: {stored}");
+        let text = stored["content"][0]["text"].as_str().unwrap();
+        // No entity key → unkeyed (global), stored over telemetry_learning (the
+        // only source kind whose anchor rule tolerates an unkeyed fact).
+        assert!(
+            text.contains("\"keyed\":false"),
+            "global linter must be unkeyed, got: {text}"
+        );
     }
 }

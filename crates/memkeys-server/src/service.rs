@@ -1569,6 +1569,58 @@ mod tests {
         assert_eq!(hits[0].via, vec![FusionSource::SemanticFact]);
     }
 
+    /// Golden Path A (ISI-7811): a *global* linter is unkeyed (no `entity.*`),
+    /// so op-1 keyed fetch cannot reach it — its read path is op-4 semantic
+    /// search, which runs over the whole tenant floor including unkeyed facts
+    /// (R6). Seed an unkeyed linter, search the tenant floor, and assert the
+    /// unkeyed linter is hydrated back with its `linter` fact type: proof the
+    /// global scope is both storable and readable within the four-op surface.
+    ///
+    /// NB (resolver follow-up, ISI-7813+): a `fact.type: linter` scope with NO
+    /// entity key does NOT narrow on the unscoped `CandidateSet::All` path —
+    /// `req.fact_type` is only applied via the keyed candidate fetch when a
+    /// scope key is present (`semantic_search_inner` step 1). The global-linter
+    /// resolver therefore filters hydrated hits by `fact_type == "linter"`
+    /// itself, or type-on-All-path narrowing is added as its own hot-path change.
+    #[tokio::test]
+    async fn semantic_search_surfaces_unkeyed_global_linter() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+
+        // An unkeyed (global) linter fact: no entity key, fact_type=Linter.
+        let mut linter = pf(
+            1,
+            "t",
+            "r",
+            "linter rule no-console-log: forbid console.log via regex",
+        );
+        linter.fact_type = FactType::Linter;
+        linter.entity = EntityKeys::default();
+        linter.keyed = false;
+        linter.subject = Some("no-console-log".into());
+        seed(&store, &index, &embedder, &linter).await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let req = SearchRequest {
+            query: "console.log regex rule".into(),
+            scope: vec![],
+            fact_type: None,
+            k: 10,
+            as_of: None,
+        };
+        let hits = svc.semantic_search("t", &req).await.unwrap();
+        let linter_hit = hits
+            .iter()
+            .find(|h| h.record.id == Uuid::from_u128(1))
+            .expect("the unkeyed global linter must surface via op-4 search");
+        assert_eq!(
+            linter_hit.record.fact_type, "linter",
+            "hydrated as a linter fact"
+        );
+        assert!(!linter_hit.record.keyed, "it is the global (unkeyed) one");
+    }
+
     #[tokio::test]
     async fn fused_search_combines_keyed_and_semantic() {
         let store = Arc::new(MemStore::new());
