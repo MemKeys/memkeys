@@ -115,6 +115,10 @@ The Memory Graph provides **graph traversal visualization**. Key features:
 
 The graph is a **derived projection** of the keyed store. Each fact projects edges (`entity_fact`, `supersedes`, `produced_by`, `temporal`, `a2a_participant`), and the traversal starts from a chosen node and follows these edges.
 
+### Linters
+
+The **Linters** view manages [Golden Path linters](golden-path-linters.md) — the advisory rules surfaced to agents alongside facts. It lists the tenant's global linters and a selected project's context linters with their scope and severity, and it can create, edit, or disable a rule. This is the one Inspector surface that writes: it uses the public linter fact ops (`memory_store` and keyed `memory_fetch` with `type=linter`), never the database directly.
+
 ## Screenshots
 
 The following screenshots show the Inspector UI in a local development run:
@@ -160,4 +164,5 @@ The production build outputs static assets to `frontend/dist/`, which can be ser
 - [What is MemKeys?](/memkeys/what-is-memkeys/) — Core concepts
 - [Architecture](/memkeys/architecture/) — Server architecture and retrieval contract
 - [Retrieval Contract](/memkeys/retrieval-contract/) — API reference
+- [Golden Path linters](golden-path-linters.md) — Authoring and reading linter rules
 - [Quickstart](/memkeys/quickstart/) — Store your first fact
