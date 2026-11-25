@@ -189,3 +189,106 @@ export interface SearchHit {
 export interface SearchResponse {
   hits: SearchHit[];
 }
+
+// --- linters (Golden Path F; ISI-7816 — the Inspector's first write surface) ---
+
+/**
+ * Linter severity grammar (UX spec §3). Advisory only in v1: the severity is
+ * reported to the agent alongside the rule, it never blocks a write.
+ */
+export type Severity = 'info' | 'warn' | 'error';
+
+/** Where a linter applies: `global` = tenant floor (unkeyed), `project` =
+ *  keyed on `entity.project` (the resolver's `context` scope). */
+export type LinterScopeKind = 'global' | 'project';
+
+/** Optional narrowing stored under `body.match` (ADR-0004 native shape). The
+ *  server stores it opaquely; both a single glob string and a list degrade
+ *  cleanly in {@link parseLinterBody}. */
+export interface LinterMatch {
+  language?: string;
+  path_glob?: string | string[];
+}
+
+/**
+ * The MemKeys-native linter rule body (plan `cc7ee655`, ADR-0004). Stored as
+ * the opaque `fact.body` JSON; `severity`/`enabled`/`match` are optional so an
+ * older or hand-written body never crashes the parser.
+ */
+export interface LinterRule {
+  rule: string;
+  severity?: Severity;
+  enabled?: boolean;
+  match?: LinterMatch;
+}
+
+/**
+ * A linter normalized for the management view. Sourced two ways — a keyed
+ * `type=linter` FactRecord (project scope, full detail) or an
+ * `applicable_linters` resolver entry (global scope, lean) — and unified here
+ * so the table and detail popup render one shape. Fields a given source does
+ * not carry (event_time on the resolver entry) degrade to null.
+ */
+export interface LinterRecord {
+  factId: string;
+  /** The slug (subject with the `linter:` prefix stripped). */
+  name: string;
+  /** The full `fact.subject`, e.g. `linter:no-new-rust-code`. */
+  subject: string;
+  scopeKind: LinterScopeKind;
+  /** Set for project scope; the keyed `entity.project`. */
+  project: string | null;
+  rule: string;
+  severity: Severity | null;
+  enabled: boolean;
+  match: LinterMatch | null;
+  /** The parsed rule body, or null when the body is not JSON. */
+  bodyJson: LinterRule | null;
+  /** The original `fact.body` string (shown verbatim in the detail popup). */
+  rawBody: string;
+  eventTime: string | null;
+  ingestedAt: string | null;
+  supersedes: string | null;
+  provenance: string | null;
+  /** Server-resolved entity keys present on the record, for display. */
+  entityKeys: Array<[string, string]>;
+}
+
+/**
+ * The editor's form state (mock 6). Maps to an op-1 `POST /memory/facts`
+ * envelope by {@link buildLinterEnvelope}. `supersedes` is set on edit and on
+ * enable/disable; null on create.
+ */
+export interface LinterDraft {
+  name: string;
+  scopeKind: LinterScopeKind;
+  /** Used only when `scopeKind === 'project'`. */
+  project: string;
+  severity: Severity;
+  enabled: boolean;
+  rule: string;
+  /** '' = any language. */
+  language: string;
+  /** Comma-separated path globs; '' = none. */
+  pathGlobs: string;
+  supersedes: string | null;
+}
+
+/** Receipt of a successful op-1 write (`IngestResponse`, http.rs). */
+export interface IngestReceipt {
+  fact_id: string;
+  keyed: boolean;
+  entity_keys_resolved: Record<string, string>;
+  duplicate: boolean;
+}
+
+/** One `applicable_linters` entry (ResolvedLinter::to_wire_json, service.rs). */
+export interface ApplicableLinter {
+  scope: 'global' | 'context';
+  severity: Severity | null;
+  'fact.id': string;
+  'fact.subject': string | null;
+  /** The rule: structured JSON when the body parses, else the raw string. */
+  'fact.body': unknown;
+  entity: Partial<Record<EntityKeyName, string>>;
+}

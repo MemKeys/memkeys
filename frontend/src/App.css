@@ -522,3 +522,465 @@
 .explore-disabled code {
   font-family: 'SFMono-Regular', Consolas, monospace;
 }
+
+/* --- Linters tab (ISI-7816 Golden Path F) ---------------------------------
+ * Grammar: severity info=accent / warn=gold / error=danger; scope global=gold
+ * (tenant floor) / project=blue. All colors from existing tokens. The table
+ * reuses .facts-table; the modals reuse .detail-overlay / .detail-popup. */
+
+.linters-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.linters-toolbar h2 {
+  font-size: 16px;
+  margin: 0;
+  align-self: center;
+}
+
+.linters-toolbar .count {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  align-self: center;
+}
+
+.linters-toolbar .grow {
+  flex: 1;
+  min-width: 180px;
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+.pill-group {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px;
+  align-self: center;
+}
+
+.pill {
+  background: none;
+  border: none;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pill.on {
+  background: rgba(79, 140, 255, 0.18);
+  color: var(--accent);
+}
+
+.pill .n {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 10px;
+  opacity: 0.75;
+  margin-left: 4px;
+}
+
+.advisory-note {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
+  margin: 8px 0 0;
+}
+
+.linters-empty {
+  text-align: center;
+  padding: 48px 0;
+}
+
+.linters-empty b {
+  color: var(--text);
+}
+
+/* Severity + scope badges (table + detail popup) */
+.sev {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sev-info {
+  background: rgba(79, 140, 255, 0.16);
+  color: var(--accent);
+}
+
+.sev-warn {
+  background: rgba(247, 201, 72, 0.14);
+  color: var(--gold);
+}
+
+.sev-error {
+  background: rgba(255, 107, 107, 0.14);
+  color: var(--danger);
+}
+
+.state-off {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.scope-badge {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+}
+
+.scope-global {
+  background: rgba(247, 201, 72, 0.12);
+  color: var(--gold);
+  border: 1px solid rgba(247, 201, 72, 0.35);
+}
+
+.scope-project {
+  background: rgba(79, 140, 255, 0.12);
+  color: #9fc0ff;
+  border: 1px solid rgba(79, 140, 255, 0.3);
+}
+
+.scope-project-text {
+  color: #9fc0ff;
+}
+
+/* Linter row name + rule preview + disabled dimming */
+.linter-name {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.rule-preview {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+tr.linter-off .linter-name,
+tr.linter-off .rule-preview {
+  opacity: 0.45;
+}
+
+.row-actions {
+  white-space: nowrap;
+}
+
+.row-actions button {
+  margin-right: 8px;
+}
+
+/* Enable/disable toggle */
+.toggle {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--ok);
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  flex: none;
+}
+
+.toggle::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 18px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.toggle.off {
+  background: var(--border);
+}
+
+.toggle.off::after {
+  left: 2px;
+}
+
+/* --- Linter editor / confirm modals (mock 6) --- */
+.detail-popup.small {
+  width: min(430px, calc(100vw - 48px));
+}
+
+.supersede-note {
+  background: rgba(247, 201, 72, 0.08);
+  border: 1px solid rgba(247, 201, 72, 0.35);
+  color: #e8d48a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.confirm-body {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 4px 0 14px;
+}
+
+.editor-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+
+.editor-field .req {
+  color: var(--danger);
+}
+
+.editor-field input[type='text'],
+.editor-field textarea {
+  width: 100%;
+  font-size: 13px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+.editor-form textarea {
+  min-height: 88px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.editor-form input.invalid,
+.editor-form textarea.invalid {
+  border-color: var(--danger);
+  outline: 1px solid rgba(255, 107, 107, 0.4);
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+
+.field-hint {
+  color: #6b7387;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+/* Segmented controls (scope / severity) */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+
+.seg button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  border-radius: 0;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.seg button.on {
+  background: rgba(79, 140, 255, 0.18);
+  color: var(--accent);
+}
+
+.sev-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.sev-dot-error {
+  background: var(--danger);
+}
+
+.sev-dot-warn {
+  background: var(--gold);
+}
+
+.sev-dot-info {
+  background: var(--accent);
+}
+
+.editor-match summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+
+.match-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 14px;
+  margin-top: 10px;
+}
+
+.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.checkbox-row input {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+
+/* Collapsible wire preview of the exact op-1 envelope */
+.wire {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.wire summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+
+.wire pre {
+  margin: 8px 0 2px;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #b8c6e8;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* Form footer + button variants */
+.editor-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.write-note {
+  margin-right: auto;
+  color: #6b7387;
+  font-size: 11px;
+  max-width: 320px;
+  line-height: 1.5;
+}
+
+.btn {
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.btn.ghost {
+  background: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Success toast (write receipt) */
+.toast {
+  position: fixed;
+  right: 26px;
+  bottom: 22px;
+  background: var(--panel);
+  border: 1px solid rgba(76, 175, 80, 0.55);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  z-index: 50;
+}
+
+.toast-title {
+  color: var(--ok);
+  font-weight: 700;
+  margin-bottom: 3px;
+}
+
+.toast-body {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.toast-close {
+  margin-top: 6px;
+}
