@@ -14,7 +14,13 @@ yanked = "deny"
 # unmaintained dependency declared directly in the workspace fails the
 # check. Real vulnerabilities and yanked crates always fail.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0543: chrono 0.4.x flagged unmaintained. chrono is a direct
+    # workspace dep (Cargo.toml), so `unmaintained = "workspace"` fails rather
+    # than warns. No patched release or drop-in replacement exists; a migration
+    # to `jiff` is a separate architectural decision, out of scope here (ISI-7824).
+    "RUSTSEC-2026-0543",
+]
 
 # --- bans -----------------------------------------------------------------
 [bans]
