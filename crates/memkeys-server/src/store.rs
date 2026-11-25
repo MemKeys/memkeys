@@ -59,4 +59,31 @@ pub trait FactStore: Send + Sync {
         ids: &[uuid::Uuid],
         as_of: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<std::collections::HashSet<uuid::Uuid>, QueryError>;
+
+    /// Golden Path B (ISI-7813, parent ISI-7787) — the applicable-linter read.
+    /// Returns the **live-head** linter facts (`fact_type = 'linter'`,
+    /// ADR-0004) that apply to a tenant and a set of in-scope `projects`, in
+    /// ONE round-trip, served by the partial `facts_linter_idx` (migration
+    /// 0008). Two scopes come back in the same result:
+    ///   * **global** linters — unkeyed (`entity_project IS NULL`, `keyed =
+    ///     false`): the tenant floor, always applicable;
+    ///   * **context** linters — keyed on `entity_project ∈ projects`.
+    ///
+    /// Supersession is collapsed on op-1's `Validity::Current` grain (newest
+    /// per `subject = rule_id` wins) and honored as of `as_of` (`None` = live
+    /// head). This read is deliberately OUTSIDE the op-4 semantic ranking path
+    /// (`semantic_search`): linters are policy, not recall — the resolver that
+    /// folds them into fetch/search responses as `applicable_linters` reads
+    /// them deterministically here, so they never pollute recall hits.
+    ///
+    /// An empty `projects` slice yields global linters only. Order is
+    /// unspecified here (newest-first per the index); the resolver
+    /// (`MemKeysService::resolve_applicable_linters`) imposes the
+    /// global-first-then-severity wire order.
+    async fn list_linters(
+        &self,
+        tenant_id: &str,
+        projects: &[String],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<FactRecord>, QueryError>;
 }

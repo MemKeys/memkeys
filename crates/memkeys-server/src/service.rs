@@ -928,10 +928,148 @@ impl SemanticHit {
     }
 }
 
+/// Distinct, sorted non-empty `entity.project` values from a set of records —
+/// the in-scope project set the context-linter resolver narrows on (ISI-7813).
+/// Shared by both transports so the `applicable_linters` block is byte-for-byte
+/// identical over HTTP and MCP (WS-5 §2.3).
+pub(crate) fn distinct_projects<'a>(
+    projects: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for p in projects.flatten() {
+        set.insert(p.to_string());
+    }
+    set.into_iter().collect()
+}
+
+/// Scope of a resolved linter (Golden Path B, ISI-7813). Serializes to the
+/// `scope` facet of an `applicable_linters` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinterScope {
+    /// Unkeyed tenant-floor rule — always applies.
+    Global,
+    /// Rule keyed on a project present among the returned facts.
+    Context,
+}
+
+impl LinterScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinterScope::Global => "global",
+            LinterScope::Context => "context",
+        }
+    }
+}
+
+/// One resolved linter folded into a fetch/search response (ISI-7813,
+/// ADR-0004). It is the live-head linter fact plus two resolver-computed
+/// conveniences: its [`LinterScope`] and the `severity` lifted out of the rule
+/// body for ordering. The rule itself is the fact body — structured JSON when
+/// it parses, the raw string otherwise (advisory v1 stores the body opaquely,
+/// ADR-0004 §3).
+#[derive(Debug, Clone)]
+pub struct ResolvedLinter {
+    pub scope: LinterScope,
+    pub record: FactRecord,
+    /// `severity` lifted from the body (`error`|`warn`|`info`); `None` when the
+    /// body is not JSON or omits it.
+    severity: Option<String>,
+}
+
+impl ResolvedLinter {
+    /// Order rank for the global-first-then-severity wire order: error < warn <
+    /// info < unknown. Lower sorts first.
+    fn severity_rank(&self) -> u8 {
+        match self.severity.as_deref() {
+            Some("error") => 0,
+            Some("warn") => 1,
+            Some("info") => 2,
+            _ => 3,
+        }
+    }
+
+    /// The `applicable_linters` entry shape. Additive + backward-compatible: a
+    /// caller ignoring the block is unaffected. `fact.subject` is the stable
+    /// `rule_id` (ADR-0004 §3); `fact.body` is the rule, structured when it
+    /// parses so a non-JSON body is never dropped.
+    pub fn to_wire_json(&self) -> serde_json::Value {
+        let rule: serde_json::Value = serde_json::from_str(&self.record.body)
+            .unwrap_or_else(|_| serde_json::Value::String(self.record.body.clone()));
+        let entity: serde_json::Map<String, serde_json::Value> = self
+            .record
+            .entity_keys()
+            .resolved()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::json!({
+            "scope": self.scope.as_str(),
+            "severity": self.severity,
+            "fact.id": self.record.id,
+            "fact.subject": self.record.subject,
+            "fact.body": rule,
+            "entity": entity,
+        })
+    }
+}
+
 /// M5 retrieval: op-4 semantic search (§7.4) and RRF fusion across the keyed +
 /// semantic paths (§7.4 step 3). The tenant floor is SERVER-SET from the
 /// verified caller on every call (WS-4 Invariant T / §7.4 R6).
 impl MemKeysService {
+    /// Golden Path B (ISI-7813, parent ISI-7787) — resolve the
+    /// `applicable_linters` block for a read: the union of GLOBAL linters
+    /// (tenant floor, always applicable) and CONTEXT linters whose project is
+    /// among `projects` (the distinct `entity.project` of the returned facts).
+    /// One store round-trip ([`FactStore::list_linters`]) fetches both scopes;
+    /// this method de-dups by fact id and imposes the wire order: global first,
+    /// then by severity (error → warn → info → unknown), then by `rule_id` for
+    /// determinism. Advisory-only v1 — nothing here blocks or enforces, and the
+    /// block is additive so callers ignoring it are unaffected.
+    pub async fn resolve_applicable_linters(
+        &self,
+        caller_tenant: &str,
+        projects: &[String],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<ResolvedLinter>, QueryError> {
+        let rows = self
+            .store
+            .list_linters(caller_tenant, projects, as_of)
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut linters: Vec<ResolvedLinter> = rows
+            .into_iter()
+            .filter(|r| seen.insert(r.id)) // de-dup by fact id
+            .map(|record| {
+                let scope = if record.keyed {
+                    LinterScope::Context
+                } else {
+                    LinterScope::Global
+                };
+                let severity = serde_json::from_str::<serde_json::Value>(&record.body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("severity")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    });
+                ResolvedLinter {
+                    scope,
+                    record,
+                    severity,
+                }
+            })
+            .collect();
+        linters.sort_by(|a, b| {
+            // Global (Context == false) sorts before context (== true).
+            (a.scope == LinterScope::Context)
+                .cmp(&(b.scope == LinterScope::Context))
+                .then_with(|| a.severity_rank().cmp(&b.severity_rank()))
+                .then_with(|| a.record.subject.cmp(&b.record.subject))
+        });
+        Ok(linters)
+    }
+
     /// True when the `memory.semantic` module is wired (embedder + index).
     pub fn semantic_enabled(&self) -> bool {
         self.embedder.is_some() && self.vector.is_some()
@@ -1182,6 +1320,15 @@ impl MemKeysService {
         let mut hits = Vec::with_capacity(scored.len());
         for s in scored {
             if let Some(record) = self.store.get_fact(caller_tenant, s.fact_id).await? {
+                // ISI-7813: linters are policy, not recall — keep them OUT of
+                // the op-4 ranking path. A linter's body IS embedded (so the
+                // resolver's `list_linters` can find global linters), but it
+                // must never surface as a recall hit mixed with real facts.
+                // The `applicable_linters` block is resolved deterministically
+                // by `resolve_applicable_linters`, not from these hits.
+                if record.fact_type == FactType::Linter.as_str() {
+                    continue;
+                }
                 hits.push(SemanticHit {
                     record,
                     score: s.score as f64,
@@ -1569,21 +1716,17 @@ mod tests {
         assert_eq!(hits[0].via, vec![FusionSource::SemanticFact]);
     }
 
-    /// Golden Path A (ISI-7811): a *global* linter is unkeyed (no `entity.*`),
-    /// so op-1 keyed fetch cannot reach it — its read path is op-4 semantic
-    /// search, which runs over the whole tenant floor including unkeyed facts
-    /// (R6). Seed an unkeyed linter, search the tenant floor, and assert the
-    /// unkeyed linter is hydrated back with its `linter` fact type: proof the
-    /// global scope is both storable and readable within the four-op surface.
-    ///
-    /// NB (resolver follow-up, ISI-7813+): a `fact.type: linter` scope with NO
-    /// entity key does NOT narrow on the unscoped `CandidateSet::All` path —
-    /// `req.fact_type` is only applied via the keyed candidate fetch when a
-    /// scope key is present (`semantic_search_inner` step 1). The global-linter
-    /// resolver therefore filters hydrated hits by `fact_type == "linter"`
-    /// itself, or type-on-All-path narrowing is added as its own hot-path change.
+    /// Golden Path B (ISI-7813) refines ISI-7811's storage round-trip: a global
+    /// linter is *policy, not recall*, so it must NOT surface as an op-4 search
+    /// hit mixed with real facts — even though its body is embedded (the
+    /// resolver relies on that to find it). Seed a global linter whose body is
+    /// highly relevant to the query PLUS one ordinary fact; assert the ordinary
+    /// fact is the recall hit and the linter is absent from `hits`. The linter
+    /// is instead reachable deterministically via the `applicable_linters`
+    /// resolver (`resolve_applicable_linters` → `list_linters`), exercised by
+    /// `resolve_applicable_linters_*` below.
     #[tokio::test]
-    async fn semantic_search_surfaces_unkeyed_global_linter() {
+    async fn semantic_search_excludes_global_linter_from_recall() {
         let store = Arc::new(MemStore::new());
         let index = Arc::new(MemVectorIndex::new());
         let embedder = Arc::new(HashEmbedder::new());
@@ -1600,6 +1743,14 @@ mod tests {
         linter.keyed = false;
         linter.subject = Some("no-console-log".into());
         seed(&store, &index, &embedder, &linter).await;
+        // An ordinary fact that shares query vocabulary — this is the recall.
+        seed(
+            &store,
+            &index,
+            &embedder,
+            &pf(2, "t", "r", "console.log regex added to the logger module"),
+        )
+        .await;
 
         let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
         let req = SearchRequest {
@@ -1610,15 +1761,73 @@ mod tests {
             as_of: None,
         };
         let hits = svc.semantic_search("t", &req).await.unwrap();
-        let linter_hit = hits
-            .iter()
-            .find(|h| h.record.id == Uuid::from_u128(1))
-            .expect("the unkeyed global linter must surface via op-4 search");
-        assert_eq!(
-            linter_hit.record.fact_type, "linter",
-            "hydrated as a linter fact"
+        assert!(
+            hits.iter().all(|h| h.record.fact_type != "linter"),
+            "linters are policy, not recall — must be excluded from op-4 hits"
         );
-        assert!(!linter_hit.record.keyed, "it is the global (unkeyed) one");
+        assert!(
+            hits.iter().any(|h| h.record.id == Uuid::from_u128(2)),
+            "the ordinary fact is still recalled normally"
+        );
+    }
+
+    /// Golden Path B (ISI-7813): the resolver returns the union of global
+    /// (tenant-floor, unkeyed) and context (keyed on an in-scope project)
+    /// linters in one round-trip, de-duped, ordered global-first then by
+    /// severity. A context linter for a project NOT in scope is excluded.
+    #[tokio::test]
+    async fn resolve_applicable_linters_unions_and_orders() {
+        let store = Arc::new(MemStore::new());
+        let index = Arc::new(MemVectorIndex::new());
+        let embedder = Arc::new(HashEmbedder::new());
+
+        // Global linter, severity=info (should sort first by scope, last by sev).
+        let mut g = pf(1, "t", "r", r#"{"rule_id":"g-info","severity":"info"}"#);
+        g.fact_type = FactType::Linter;
+        g.entity = EntityKeys::default();
+        g.keyed = false;
+        g.subject = Some("g-info".into());
+        seed(&store, &index, &embedder, &g).await;
+
+        // Context linter on proj-a, severity=error.
+        let mut c = pf(2, "t", "r", r#"{"rule_id":"c-err","severity":"error"}"#);
+        c.fact_type = FactType::Linter;
+        c.entity = EntityKeys {
+            project: Some("proj-a".into()),
+            ..Default::default()
+        };
+        c.keyed = true;
+        c.subject = Some("c-err".into());
+        seed(&store, &index, &embedder, &c).await;
+
+        // Context linter on proj-b (NOT in scope) — must be excluded.
+        let mut other = pf(3, "t", "r", r#"{"rule_id":"c-other","severity":"error"}"#);
+        other.fact_type = FactType::Linter;
+        other.entity = EntityKeys {
+            project: Some("proj-b".into()),
+            ..Default::default()
+        };
+        other.keyed = true;
+        other.subject = Some("c-other".into());
+        seed(&store, &index, &embedder, &other).await;
+
+        let svc = MemKeysService::new(store.clone()).with_semantic(embedder.clone(), index.clone());
+        let linters = svc
+            .resolve_applicable_linters("t", &["proj-a".to_string()], None)
+            .await
+            .unwrap();
+
+        assert_eq!(linters.len(), 2, "global + in-scope context only");
+        assert_eq!(linters[0].scope, LinterScope::Global, "global sorts first");
+        assert_eq!(linters[0].record.subject.as_deref(), Some("g-info"));
+        assert_eq!(linters[1].scope, LinterScope::Context);
+        assert_eq!(linters[1].record.subject.as_deref(), Some("c-err"));
+        assert!(
+            linters
+                .iter()
+                .all(|l| l.record.subject.as_deref() != Some("c-other")),
+            "an out-of-scope project's linter must not resolve"
+        );
     }
 
     #[tokio::test]
