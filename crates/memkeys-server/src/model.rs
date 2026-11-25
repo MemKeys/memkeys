@@ -17,6 +17,20 @@ pub enum FactType {
     Learning,
     #[serde(rename = "context")]
     Context,
+    /// A Golden Path linter rule stored as a first-class fact (ISI-7811, parent
+    /// ISI-7787). A linter is advisory config, not an observation of the world:
+    /// the structured `fact.body` carries the rule (see
+    /// `docs/adr/ADR-0004-linter-data-model.md`), `fact.subject` is the stable
+    /// `rule_id` (its supersession grain — re-storing a rule_id versions it),
+    /// and the **scope** is read off the entity keys. A *global* linter is
+    /// unkeyed (tenant floor, no `entity.*`), reached via op-4 `memory_search`
+    /// over the tenant floor; a *context* linter is keyed on `entity.project`,
+    /// reached via op-1 `memory_fetch` with `entity.project` + `type: linter`.
+    /// Both are written over the existing `telemetry_learning` source kind (the
+    /// only kind whose anchor requirement tolerates an unkeyed, i.e. global,
+    /// fact — pipeline.rs §3.1). No 5th operation, no new source kind.
+    #[serde(rename = "linter")]
+    Linter,
 }
 
 impl FactType {
@@ -27,6 +41,7 @@ impl FactType {
             FactType::Observation => "observation",
             FactType::Learning => "learning",
             FactType::Context => "context",
+            FactType::Linter => "linter",
         }
     }
 }
@@ -217,4 +232,25 @@ pub struct KeyedQuery {
 impl KeyedQuery {
     pub const DEFAULT_LIMIT: i64 = 100;
     pub const MAX_LIMIT: i64 = 500;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FactType::Linter` round-trips its wire name through both serde (the
+    /// write/query parse path) and `as_str` (the store bind path) — the two
+    /// seams a new fact type must pass to be storable and fetchable (ISI-7811).
+    #[test]
+    fn linter_fact_type_round_trips() {
+        let parsed: FactType =
+            serde_json::from_value(serde_json::Value::String("linter".into())).unwrap();
+        assert_eq!(parsed, FactType::Linter);
+        assert_eq!(FactType::Linter.as_str(), "linter");
+        // Round the other way via the string the store persists.
+        let reparsed: FactType =
+            serde_json::from_value(serde_json::Value::String(FactType::Linter.as_str().into()))
+                .unwrap();
+        assert_eq!(reparsed, FactType::Linter);
+    }
 }

@@ -784,6 +784,7 @@ mod tests {
             (FactType::Observation, "observation"),
             (FactType::Learning, "learning"),
             (FactType::Context, "context"),
+            (FactType::Linter, "linter"),
         ] {
             assert_eq!(t.as_str(), s);
         }
