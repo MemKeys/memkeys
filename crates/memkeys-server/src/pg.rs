@@ -595,6 +595,71 @@ impl FactStore for PgStore {
         for b in &binds {
             q = match b {
                 Bind::Text(s) => q.bind(s),
+                Bind::TextArray(a) => q.bind(a),
+                Bind::Timestamptz(t) => q.bind(*t),
+                Bind::I64(i) => q.bind(*i),
+            };
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn list_linters(
+        &self,
+        tenant_id: &str,
+        projects: &[String],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<FactRecord>, QueryError> {
+        // Golden Path B resolver read (ISI-7813), served by the partial
+        // `facts_linter_idx` (migration 0008). One scan returns both scopes:
+        //   * global  — unkeyed (entity_project IS NULL, NOT keyed);
+        //   * context — keyed on entity_project = ANY(projects).
+        // Live-head collapse (NOT EXISTS supersedes chain) + as-of are the op-1
+        // twins (§5.1), so a re-stored rule_id reads back as its newest version.
+        let mut sql = format!(
+            "SELECT {} FROM facts f \
+             WHERE f.tenant_id = $1 AND f.fact_type = 'linter' \
+             AND ( (f.entity_project IS NULL AND f.keyed = false) \
+                   OR (f.keyed = true AND f.entity_project = ANY($2)) )",
+            FACT_COLUMNS_ALIAS
+        );
+        let mut binds: Vec<Bind> = vec![
+            Bind::Text(tenant_id.to_string()),
+            Bind::TextArray(projects.to_vec()),
+        ];
+        let mut next = 3usize;
+
+        if let Some(as_of) = as_of {
+            // §5.3: event-time ≤ as_of AND we actually knew it by then.
+            sql.push_str(&format!(
+                " AND f.event_time <= ${n} AND f.ingested_at <= ${n}",
+                n = next
+            ));
+            binds.push(Bind::Timestamptz(as_of));
+            next += 1;
+
+            // Read-time supersession collapse, as-of aware (op-1 twin).
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM facts s \
+                 WHERE s.supersedes = f.id AND s.tenant_id = f.tenant_id \
+                 AND s.ingested_at <= ${})",
+                next
+            ));
+            binds.push(Bind::Timestamptz(as_of));
+        } else {
+            // Live head — drop any fact another fact supersedes.
+            sql.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM facts s \
+                 WHERE s.supersedes = f.id AND s.tenant_id = f.tenant_id)",
+            );
+        }
+        sql.push_str(" ORDER BY f.event_time DESC, f.id DESC");
+
+        let mut q = sqlx::query_as::<_, FactRecord>(&sql);
+        for b in &binds {
+            q = match b {
+                Bind::Text(s) => q.bind(s),
+                Bind::TextArray(a) => q.bind(a),
                 Bind::Timestamptz(t) => q.bind(*t),
                 Bind::I64(i) => q.bind(*i),
             };
@@ -608,6 +673,7 @@ impl FactStore for PgStore {
 #[derive(Debug)]
 enum Bind {
     Text(String),
+    TextArray(Vec<String>),
     Timestamptz(chrono::DateTime<chrono::Utc>),
     I64(i64),
 }

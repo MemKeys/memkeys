@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::error::{IngestError, QueryError};
-use crate::model::{EntityKey, FactRecord, KeyedQuery, ProcessedFact, Validity};
+use crate::model::{EntityKey, FactRecord, FactType, KeyedQuery, ProcessedFact, Validity};
 use crate::store::{CommitOutcome, FactStore};
 
 /// Append-only in-memory store. One instance is single-tenant by convention
@@ -144,6 +144,49 @@ impl FactStore for MemStore {
             .filter_map(|s| s.supersedes)
             .filter(|sup| target.contains(sup))
             .collect())
+    }
+
+    async fn list_linters(
+        &self,
+        _tenant_id: &str,
+        projects: &[String],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<FactRecord>, QueryError> {
+        // Single-tenant by construction (see module docs). This is the
+        // in-memory twin of the partial `facts_linter_idx` read (ISI-7813):
+        // linter facts of two scopes — global (unkeyed) + context (keyed on an
+        // in-scope project) — collapsed to live heads on the op-1 grain.
+        let facts = self.facts.read().expect("memstore lock");
+        let in_scope: std::collections::HashSet<&str> =
+            projects.iter().map(|s| s.as_str()).collect();
+
+        let mut rows: Vec<FactRecord> = facts
+            .values()
+            .filter(|r| r.fact_type == FactType::Linter.as_str())
+            .filter(|r| {
+                if r.keyed {
+                    // Context linter: keyed on a project that is in scope.
+                    r.entity_project
+                        .as_deref()
+                        .is_some_and(|p| in_scope.contains(p))
+                } else {
+                    // Global linter: unkeyed, the tenant floor — always applies.
+                    true
+                }
+            })
+            .filter(|r| as_of.is_none_or(|t| r.event_time <= t && r.ingested_at <= t))
+            .cloned()
+            .collect();
+
+        // Newest event first (same contract as the Postgres read).
+        rows.sort_by_key(|r| std::cmp::Reverse(r.event_time));
+
+        // Read-time supersession collapse: a re-stored rule_id versions the
+        // rule (ADR-0004 §3), so drop any head another visible fact supersedes.
+        let superseded: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().filter_map(|r| r.supersedes).collect();
+        rows.retain(|r| !superseded.contains(&r.id));
+        Ok(rows)
     }
 }
 

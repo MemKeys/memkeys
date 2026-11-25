@@ -53,7 +53,9 @@ use crate::graph::{
     DEFAULT_NODE_BUDGET,
 };
 use crate::model::{EntityKey, FactType, KeyedQuery, Validity};
-use crate::service::{IngestReceipt, MemKeysService, SearchRequest, SemanticHit};
+use crate::service::{
+    distinct_projects, IngestReceipt, MemKeysService, SearchRequest, SemanticHit,
+};
 use crate::telemetry::{self, TRANSPORT_HTTP};
 use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, TraceContextExt};
@@ -392,6 +394,12 @@ async fn fetch(
                 .into_response();
         }
     };
+    // Golden Path B (ISI-7813): fold linters in by default; opt out with
+    // `applicable_linters=false`. Skip when the caller is reading linters
+    // themselves (`type=linter`) — management, not the golden-path read.
+    let want_linters = params.get("applicable_linters").map(|s| s.as_str()) != Some("false")
+        && query.fact_type != Some(FactType::Linter);
+    let as_of = query.as_of;
     // Transport span created on the served path (after argument validation),
     // attached via `with_context` to stay `Send` across `.await` (see `ingest`).
     // The tenant floor is the VERIFIED principal's, never client-asserted.
@@ -405,11 +413,34 @@ async fn fetch(
     match result {
         // §7.2/§7.5 response-shape invariant: wrap in `{ facts: [ … ] }`,
         // never a bare array (ISI-6134 B3).
-        Ok(records) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "facts": records })),
-        )
-            .into_response(),
+        Ok(records) => {
+            let linters = if want_linters {
+                let projects =
+                    distinct_projects(records.iter().map(|r| r.entity_project.as_deref()));
+                match state
+                    .service
+                    .resolve_applicable_linters(&principal.tenant_id, &projects, as_of)
+                    .await
+                {
+                    Ok(ls) => Some(ls),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e.to_string()})),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                None
+            };
+            let mut body = serde_json::json!({ "facts": records });
+            if let Some(ls) = linters {
+                body["applicable_linters"] =
+                    serde_json::Value::Array(ls.iter().map(|l| l.to_wire_json()).collect());
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(QueryError::Invalid { reason }) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": reason})),
@@ -582,6 +613,10 @@ struct SearchReqWire {
     tiers: Option<String>,
     #[serde(default)]
     as_of: Option<String>,
+    /// Golden Path B (ISI-7813): include the additive `applicable_linters`
+    /// block. Default on (`None` → on); set false to opt out.
+    #[serde(default)]
+    applicable_linters: Option<bool>,
 }
 
 /// The parsed §7.4 scope: ANDed `entity.*` keys + an optional `fact.type`.
@@ -649,6 +684,10 @@ async fn search(
     // a later milestone, so it degrades to the fact tier with a warning header
     // rather than a 501 (§7.4). `auto`/`fact` run the fact tier silently.
     let digest_requested = matches!(body.tiers.as_deref(), Some("digest"));
+    // Golden Path B (ISI-7813): fold linters in by default; opt out with
+    // `applicable_linters:false`. Skip a linter-scoped search (management).
+    let want_linters =
+        body.applicable_linters != Some(false) && fact_type != Some(FactType::Linter);
 
     let req = SearchRequest {
         query: body.query,
@@ -667,9 +706,29 @@ async fn search(
     cx.span().end();
     match result {
         Ok(hits) => {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "hits": hits.iter().map(SemanticHit::to_wire_json).collect::<Vec<_>>(),
             });
+            if want_linters {
+                let projects =
+                    distinct_projects(hits.iter().map(|h| h.record.entity_project.as_deref()));
+                match state
+                    .service
+                    .resolve_applicable_linters(&principal.tenant_id, &projects, req.as_of)
+                    .await
+                {
+                    Ok(ls) => {
+                        body["applicable_linters"] =
+                            serde_json::Value::Array(ls.iter().map(|l| l.to_wire_json()).collect());
+                    }
+                    Err(e) => {
+                        return wire_response(WireError::new(
+                            ErrorCode::BackendUnavailable,
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
             let mut resp = (StatusCode::OK, Json(body)).into_response();
             if digest_requested {
                 resp.headers_mut().insert(
@@ -1006,6 +1065,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Golden Path B transport parity (ISI-7813, WS-5 §2.3): the HTTP read
+    /// surface folds in the same additive `applicable_linters` block as MCP.
+    /// Store a global linter, then fetch — even on an empty recall the global
+    /// (tenant-floor) linter resolves, proving the block is wired on HTTP and
+    /// read deterministically (not via query-relevant recall).
+    #[tokio::test]
+    async fn http_fetch_folds_in_applicable_linters() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let secret = b"s3cr3t";
+        let app = verified_router(secret);
+        let token = mint_jwt(
+            secret,
+            &serde_json::json!({"sub":"agent-a","company_id":"tenant-a","exp":9_999_999_999i64}),
+        );
+
+        // Store a global (unkeyed) linter over the HTTP ingest surface.
+        let env = r#"{"source":{"kind":"telemetry_learning","emitted_at":"2026-11-25T10:00:00Z"},
+            "entity":{},"fact":{"type":"linter","subject":"no-unsafe-eval",
+            "body":{"rule_id":"no-unsafe-eval","severity":"error"}}}"#;
+        let store = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/memory/facts")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(env))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.status(), StatusCode::OK, "linter store over HTTP");
+
+        // Fetch (empty recall) — the global linter still resolves into the block.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let linters = payload["applicable_linters"]
+            .as_array()
+            .expect("applicable_linters present over HTTP");
+        assert_eq!(linters.len(), 1, "the global linter, got: {payload}");
+        assert_eq!(linters[0]["scope"], "global");
+        assert_eq!(linters[0]["fact.subject"], "no-unsafe-eval");
+        assert_eq!(linters[0]["severity"], "error");
+
+        // Opt-out parity: `applicable_linters=false` omits the block.
+        let app2 = verified_router(secret);
+        // (re-store on the fresh router so the fetch has a linter to ignore)
+        let _ = app2
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/memory/facts")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(env))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let opt_out = app2
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/memory/facts?entity.issue=I1&applicable_linters=false")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(opt_out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.get("applicable_linters").is_none(),
+            "opt-out must omit the block over HTTP, got: {payload}"
+        );
     }
 
     // -- ISI-6476: nginx-free Inspector UI on the memory-transport listener --

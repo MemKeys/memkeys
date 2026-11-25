@@ -35,7 +35,7 @@ use crate::graph::{
     DEFAULT_NODE_BUDGET,
 };
 use crate::model::{EntityKey, FactType, KeyedQuery, Validity};
-use crate::service::{MemKeysService, SearchRequest, SemanticHit};
+use crate::service::{distinct_projects, MemKeysService, SearchRequest, SemanticHit};
 use crate::telemetry::{self, TRANSPORT_STDIO};
 use crate::wire::{ErrorCode, WireError};
 use opentelemetry::trace::{FutureExt, Status, TraceContextExt};
@@ -114,7 +114,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "memory_fetch",
-                "description": "Fetch facts by entity keys. At least one entity.* key is required. The tenant floor is the launch-bound principal's (§2.1).",
+                "description": "Fetch facts by entity keys. At least one entity.* key is required. The tenant floor is the launch-bound principal's (§2.1). Also returns an additive `applicable_linters` block (global + context linters for the returned facts' projects) unless `applicable_linters` is false (ISI-7813).",
                 "inputSchema": {
                     "type": "object",
                     "required": [],
@@ -129,7 +129,8 @@ fn tool_list() -> Value {
                         "type": {"type": "string", "enum": ["decision","outcome","observation","learning","context","linter"]},
                         "as_of": {"type": "string", "description": "RFC3339 point-in-time replay (§7.2)"},
                         "limit": {"type": "integer", "default": 100},
-                        "valid": {"type": "string", "enum": ["current","all"], "default": "current"}
+                        "valid": {"type": "string", "enum": ["current","all"], "default": "current"},
+                        "applicable_linters": {"type": "boolean", "default": true, "description": "Include the additive applicable_linters block (Golden Path B, ISI-7813). Default on; set false to opt out."}
                     }
                 }
             },
@@ -158,7 +159,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "memory_search",
-                "description": "Semantic search over the fact-vector tier (op-4, §7.4). The tenant floor is the launch-bound principal's (§2.1) — never a tool argument. Returns feature_disabled when memory.semantic is off.",
+                "description": "Semantic search over the fact-vector tier (op-4, §7.4). The tenant floor is the launch-bound principal's (§2.1) — never a tool argument. Returns feature_disabled when memory.semantic is off. Linter facts are excluded from recall hits (policy, not recall) and instead returned in an additive `applicable_linters` block unless `applicable_linters` is false (ISI-7813).",
                 "inputSchema": {
                     "type": "object",
                     "required": ["query"],
@@ -181,7 +182,8 @@ fn tool_list() -> Value {
                         },
                         "k": {"type": "integer", "default": 10},
                         "tiers": {"type": "string", "enum": ["auto","fact","digest"], "default": "auto"},
-                        "as_of": {"type": "string", "description": "RFC3339 point-in-time scoping (§7.4)"}
+                        "as_of": {"type": "string", "description": "RFC3339 point-in-time scoping (§7.4)"},
+                        "applicable_linters": {"type": "boolean", "default": true, "description": "Include the additive applicable_linters block (Golden Path B, ISI-7813). Default on; set false to opt out."}
                     }
                 }
             }
@@ -320,12 +322,32 @@ async fn tool_fetch(
         limit,
     };
 
+    // Golden Path B (ISI-7813): fold linters into the read by default; opt out
+    // with `applicable_linters: false`. Skip when the caller is itself reading
+    // linters (`type: linter`) — that is linter *management*, not the
+    // golden-path read, and would recurse into the resolver's own source.
+    let want_linters =
+        args["applicable_linters"].as_bool().unwrap_or(true) && fact_type != Some(FactType::Linter);
+
     match service.fetch_by_keys(&tenant_id, &query).await {
         // §7.2/§7.5 response-shape invariant: `{ facts: [ … ] }`, not a bare
         // array — parity with the HTTP surface (ISI-6134 B3).
-        Ok(records) => Ok(serde_json::json!({
-            "facts": serde_json::to_value(records).unwrap_or(Value::Array(vec![])),
-        })),
+        Ok(records) => {
+            let linters = if want_linters {
+                let projects =
+                    distinct_projects(records.iter().map(|r| r.entity_project.as_deref()));
+                resolve_linters_block(service, &tenant_id, &projects, as_of).await?
+            } else {
+                None
+            };
+            let mut body = serde_json::json!({
+                "facts": serde_json::to_value(records).unwrap_or(Value::Array(vec![])),
+            });
+            if let Some(linters) = linters {
+                body["applicable_linters"] = linters;
+            }
+            Ok(body)
+        }
         Err(QueryError::Invalid { reason }) => Err(WireError::new(
             ErrorCode::InvalidArgument,
             format!("invalid query: {reason}"),
@@ -333,6 +355,31 @@ async fn tool_fetch(
         Err(e) => Err(WireError::new(
             ErrorCode::BackendUnavailable,
             format!("store error: {e}"),
+        )),
+    }
+}
+
+/// Resolve the `applicable_linters` wire block (ISI-7813): global linters
+/// (always) + context linters for `projects`, ordered global-first then by
+/// severity. A resolver store error is surfaced (never a silently-dropped
+/// block) so an opted-in caller sees the failure rather than a false "no
+/// linters apply". Returns the JSON array value to splice into the response.
+async fn resolve_linters_block(
+    service: &MemKeysService,
+    tenant_id: &str,
+    projects: &[String],
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<Value>, WireError> {
+    match service
+        .resolve_applicable_linters(tenant_id, projects, as_of)
+        .await
+    {
+        Ok(linters) => Ok(Some(Value::Array(
+            linters.iter().map(|l| l.to_wire_json()).collect(),
+        ))),
+        Err(e) => Err(WireError::new(
+            ErrorCode::BackendUnavailable,
+            format!("linter resolve error: {e}"),
         )),
     }
 }
@@ -500,11 +547,29 @@ async fn tool_search(
         as_of,
     };
 
+    // Golden Path B (ISI-7813): fold linters into the read by default; opt out
+    // with `applicable_linters: false`. Skip when the search is itself scoped
+    // to linters (`fact.type: linter`) — linter management, not the read.
+    let want_linters = args["applicable_linters"].as_bool().unwrap_or(true)
+        && req.fact_type != Some(FactType::Linter);
+
     match service.semantic_search(&tenant_id, &req).await {
         Ok(hits) => {
             let mut body = serde_json::json!({
                 "hits": hits.iter().map(SemanticHit::to_wire_json).collect::<Vec<_>>(),
             });
+            if want_linters {
+                // Context scope narrows on the projects of the recall hits (R6:
+                // the returned facts' resolved `entity.project`), unioned with
+                // the always-applicable global linters.
+                let projects =
+                    distinct_projects(hits.iter().map(|h| h.record.entity_project.as_deref()));
+                if let Some(linters) =
+                    resolve_linters_block(service, &tenant_id, &projects, as_of).await?
+                {
+                    body["applicable_linters"] = linters;
+                }
+            }
             if digest_requested {
                 body["warnings"] = serde_json::json!([
                     "digest tier unavailable (memory.semantic.digest off); served fact tier"
@@ -1010,10 +1075,10 @@ mod tests {
     }
 
     /// A global linter carries NO `entity.*` key, so `memory_store` must persist
-    /// it unkeyed (tenant floor). The op-4 `memory_search` read path that reaches
-    /// unkeyed linters is covered at the service layer
-    /// (`service::tests::semantic_search_surfaces_unkeyed_global_linter`), where
-    /// the fact-vector tier is seedable in-process.
+    /// it unkeyed (tenant floor). The resolver read path that surfaces unkeyed
+    /// linters as `applicable_linters` is covered at the service layer
+    /// (`service::tests::resolve_applicable_linters_unions_and_orders`), where
+    /// the store is seedable in-process.
     #[tokio::test]
     async fn linter_global_stored_unkeyed_via_store() {
         let svc = service();
@@ -1032,5 +1097,139 @@ mod tests {
             text.contains("\"keyed\":false"),
             "global linter must be unkeyed, got: {text}"
         );
+    }
+
+    // --- Golden Path B: retrieval augmentation / applicable_linters (ISI-7813)
+
+    /// A decision fact keyed on a project, so an op-1 fetch returns a non-linter
+    /// fact whose `entity.project` the resolver narrows context linters on.
+    fn decision_envelope(subject: &str, project: &str) -> Value {
+        serde_json::json!({
+            "source": { "kind": "telemetry_learning", "emitted_at": "2026-11-25T10:00:00Z" },
+            "entity": { "project": project },
+            "fact": { "type": "decision", "subject": subject, "body": "chose postgres" }
+        })
+    }
+
+    /// Golden Path B: `memory_fetch` returns facts PLUS an additive
+    /// `applicable_linters` block — the union of the global (tenant-floor)
+    /// linter and the context linter for the returned fact's project, ordered
+    /// global-first. A caller gets the golden path alongside the recall in one
+    /// round-trip.
+    #[tokio::test]
+    async fn fetch_folds_in_applicable_linters() {
+        let svc = service();
+        let v = &*verifier("tenant-lint", i64::MAX);
+
+        // Seed: a global linter, a context linter on proj-alpha, and a plain
+        // decision fact on proj-alpha (the recall the resolver keys off).
+        for line in [
+            store_line(&linter_envelope("no-unsafe-eval", None), 1),
+            store_line(&linter_envelope("no-console-log", Some("proj-alpha")), 2),
+            store_line(&decision_envelope("db-choice", "proj-alpha"), 3),
+        ] {
+            let r = handle_line(&svc, v, &admission(), &line)
+                .await
+                .expect("reply");
+            assert!(
+                r.result.unwrap().get("isError").is_none(),
+                "seed store failed"
+            );
+        }
+
+        // Fetch the decision — not the linters themselves — so the fold-in runs.
+        let fetch = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.project":"proj-alpha","type":"decision"}}}"#;
+        let resp = handle_line(&svc, v, &admission(), fetch)
+            .await
+            .expect("reply");
+        let result = resp.result.expect("ok reply");
+        assert!(result.get("isError").is_none(), "fetch: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+
+        // Facts carry the decision, not a linter (linters are not recall).
+        assert_eq!(payload["facts"][0]["fact_type"], "decision", "got: {text}");
+        // The additive block resolves both scopes, global first.
+        let linters = payload["applicable_linters"]
+            .as_array()
+            .expect("applicable_linters present");
+        assert_eq!(linters.len(), 2, "global + context, got: {text}");
+        assert_eq!(linters[0]["scope"], "global");
+        assert_eq!(linters[0]["fact.subject"], "no-unsafe-eval");
+        assert_eq!(linters[1]["scope"], "context");
+        assert_eq!(linters[1]["fact.subject"], "no-console-log");
+        // The rule body round-trips structured (severity is lifted for order).
+        assert_eq!(linters[0]["severity"], "warn");
+        assert_eq!(linters[1]["fact.body"]["match"]["kind"], "regex");
+    }
+
+    /// The fold-in is default-on but honors the opt-out flag: a caller passing
+    /// `applicable_linters: false` gets facts only — backward-compatible for
+    /// callers that never want the block.
+    #[tokio::test]
+    async fn fetch_opt_out_omits_applicable_linters() {
+        let svc = service();
+        let v = &*verifier("tenant-lint", i64::MAX);
+        for line in [
+            store_line(&linter_envelope("no-unsafe-eval", None), 1),
+            store_line(&decision_envelope("db-choice", "proj-alpha"), 2),
+        ] {
+            handle_line(&svc, v, &admission(), &line)
+                .await
+                .expect("reply");
+        }
+
+        let fetch = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_fetch","arguments":{"entity.project":"proj-alpha","type":"decision","applicable_linters":false}}}"#;
+        let resp = handle_line(&svc, v, &admission(), fetch)
+            .await
+            .expect("reply");
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            payload.get("applicable_linters").is_none(),
+            "opt-out must omit the block, got: {text}"
+        );
+        assert!(
+            payload.get("facts").is_some(),
+            "facts still returned: {text}"
+        );
+    }
+
+    /// `memory_search` folds in `applicable_linters` too, in the same round-trip.
+    /// The global linter resolves even with an empty recall set (it is the
+    /// tenant floor, not query-relevance-gated) — proving the resolver reads it
+    /// deterministically, not from the semantic ranking path (ISI-7813).
+    #[tokio::test]
+    async fn search_folds_in_global_applicable_linters() {
+        let svc = service_semantic();
+        let v = &*verifier("tenant-a", i64::MAX);
+
+        let r = handle_line(
+            &svc,
+            v,
+            &admission(),
+            &store_line(&linter_envelope("no-unsafe-eval", None), 1),
+        )
+        .await
+        .expect("reply");
+        assert!(r.result.unwrap().get("isError").is_none(), "store failed");
+
+        let search = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"anything","k":5}}}"#;
+        let resp = handle_line(&svc, v, &admission(), search)
+            .await
+            .expect("reply");
+        let result = resp.result.expect("ok reply");
+        assert!(result.get("isError").is_none(), "search: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        let linters = payload["applicable_linters"]
+            .as_array()
+            .expect("applicable_linters present on search");
+        assert_eq!(linters.len(), 1, "the global linter, got: {text}");
+        assert_eq!(linters[0]["scope"], "global");
+        assert_eq!(linters[0]["fact.subject"], "no-unsafe-eval");
     }
 }

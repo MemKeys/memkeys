@@ -131,3 +131,22 @@ Migration `0008`:
 - **Enforcement deferred.** v1 is read-only/advisory. A blocking hook, write-time
   schema validation, and the fetch/search `applicable_linters` fold-in are
   children B–G (ISI-7813+) and build on this model additively.
+
+### Golden Path B refinement (ISI-7813)
+
+Child B (the resolver) refines the §2 read-path table: it reads **both** scopes
+through a single dedicated store op, [`FactStore::list_linters`], served by
+`facts_linter_idx` — global (`entity_project IS NULL`, unkeyed) + context
+(`entity_project ∈` the returned facts' projects), live-head-collapsed and
+as-of-aware, in **one round-trip**. The resolver then de-dups by fact id and
+orders **global-first, then by severity** (error → warn → info → unknown) for
+the additive `applicable_linters` block on `memory_fetch` / `memory_search`
+(default on; opt out with `applicable_linters: false`). Both transports (HTTP +
+MCP) emit the identical block (WS-5 §2.3).
+
+This supersedes the table's "global read via op-4 `memory_search`" as the
+*resolver's* path: §2 remains true that a global linter is reachable over op-4
+(its body is embedded), but ISI-7813 deliberately **excludes `fact_type =
+'linter'` from op-4 recall hits** — linters are policy, not recall, and must not
+pollute a user's search results nor be gated on query relevance. The resolver's
+`list_linters` read is the authoritative, deterministic linter source.
