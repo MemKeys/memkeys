@@ -1,0 +1,31 @@
+MemKeys
+Copyright the MemKeys authors.
+
+This product includes work that builds on ideas and a rule schema
+contributed by third parties, acknowledged here.
+
+--------------------------------------------------------------------------------
+Golden Path linters — concept and Solisol CLI rule schema
+--------------------------------------------------------------------------------
+
+The "linter-to-agent" concept in MemKeys — surfacing a project's guardrails to
+agents as a first-class part of memory retrieval (the `applicable_linters`
+block returned alongside facts on memory_fetch / memory_search) — originates
+with:
+
+    Jessica Andersson (Solisol)
+    https://github.com/Solisol
+
+The MemKeys-native linter rule shape (see docs/golden-path-linters.md and
+docs/adr/ADR-0004-linter-data-model.md) is designed to round-trip with the
+Solisol CLI rule schema. Specifically, the fact `body` of a `linter` fact is a
+superset-aligned structure: the `match` block (including `match.solisol_rule`),
+the `severity` / `message` / `fix_hint` fields, and verbatim preservation of
+unknown rule keys exist so that a Solisol ruleset can be represented in MemKeys
+without loss.
+
+This is a body-shape alignment and acknowledgement, not a code dependency on
+Solisol. No Solisol source code is vendored into this repository. If a formal
+bidirectional converter between the Solisol CLI rule format and the MemKeys
+linter body is added in the future, it will be coordinated with Jessica
+Andersson and credited at that time.
