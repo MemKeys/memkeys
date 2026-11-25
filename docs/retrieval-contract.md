@@ -56,6 +56,11 @@ facts whose event time is ≤ `as_of` **and** that had been recorded by then.
 This operation is deterministic: the same keys return the same set. No
 embeddings, no ranking, no drift.
 
+Fetch responses also carry an additive
+[`applicable_linters`](#golden-path-linters--the-applicable_linters-block)
+block by default (the golden-path rules for the returned facts' projects); opt
+out with `?applicable_linters=false`.
+
 ## 3 — Semantic search (optional module, scoped)
 
 ```
@@ -91,6 +96,11 @@ When the semantic module is disabled, the server answers
 gracefully. Digest-only requests with the digest flag off degrade to the fact
 tier with a warning header.
 
+Like fetch, search responses carry an additive
+[`applicable_linters`](#golden-path-linters--the-applicable_linters-block)
+block by default (opt out with `"applicable_linters": false`). Linter facts are
+excluded from the `hits` themselves — they are policy, not recall.
+
 ## 4 — Graph traversal
 
 ```
@@ -109,6 +119,147 @@ POST /memory/graph/traverse
 Walk relationships from a start node: supersession chains, entity links,
 producer attribution. `hydrate: false` returns structure only (ids + edge
 topology) for cheap introspection.
+
+## Golden Path linters — the `applicable_linters` block
+
+A **linter** is an advisory rule that describes part of a project's "golden
+path" — a convention an agent should follow while it works. Linters are not a
+fifth operation: they are ordinary facts, typed `linter`, stored and read over
+the same four ops (see [storing a linter](#storing-a-linter) below). What the
+retrieval contract adds is that **fetch (op 2) and search (op 3) also return the
+linters that apply to the facts they return**, so an agent gets the golden path
+in the same round-trip as the memory it asked for.
+
+Both responses carry an **additive** `applicable_linters` array alongside their
+normal payload (`facts` for fetch, `hits` for search). It is purely additive and
+backward-compatible: a caller that ignores the field is unaffected.
+
+```jsonc
+// GET /memory/facts?entity.issue=I1   (and likewise POST /memory/search)
+{
+  "facts": [ … ],                      // or "hits": [ … ] for search
+  "applicable_linters": [
+    {
+      "scope":        "global",        // "global" | "context"
+      "severity":     "error",         // "error" | "warn" | "info" | null
+      "fact.id":      "…",
+      "fact.subject": "no-console-log", // the rule_id
+      "fact.body":    { … },            // the rule (structured JSON; raw string if unparseable)
+      "entity":       { }               // resolved entity keys ({} for a global linter)
+    }
+  ]
+}
+```
+
+**What gets resolved.** The block is the union of two scopes, in one store
+round-trip, de-duplicated by `fact.id`:
+
+- **global** linters — unkeyed, tenant-floor rules that always apply; and
+- **context** linters — rules keyed on an `entity.project` that appears among
+  the returned facts/hits (the distinct `entity.project` set of the payload).
+
+The entries are ordered **global-first, then by severity** (`error` → `warn` →
+`info` → unknown), then by `rule_id` for a stable, deterministic wire order.
+Both transports (HTTP and MCP) emit the byte-for-byte identical block.
+
+**Linters never appear as search hits.** Op 4 recall deliberately excludes
+`fact.type = linter` from its `hits`: linters are policy, not recall, and must
+not be gated on query relevance or pollute a user's results. They reach callers
+*only* through the deterministic `applicable_linters` resolver. (A global
+linter's body is still embedded, so it remains addressable by op 4 in principle,
+but recall filters it out.)
+
+**Opt out.** The block is on by default. To get the legacy facts-only / hits-only
+shape, set the flag:
+
+| Transport | Operation | How to opt out |
+|-----------|-----------|----------------|
+| HTTP  | fetch  | query param `?applicable_linters=false` |
+| HTTP  | search | body field `"applicable_linters": false` |
+| MCP   | `memory_fetch` / `memory_search` | argument `"applicable_linters": false` (boolean, default `true`) |
+
+The resolver is also **skipped automatically when the read is itself scoped to
+linters** (`type=linter` on fetch, `fact.type=linter` on search) — that is a
+management read of the rules themselves, not a golden-path read, so it is never
+augmented with a second linter block.
+
+**Advisory only (v1).** The block *reports* the applicable rules; nothing here
+blocks, enforces, or validates against them. Enforcement hooks are a later,
+additive change.
+
+### Storing a linter
+
+A linter is written with `memory_store` like any other fact — the only
+distinguishing choices are the fact **type**, the **scope** (expressed through
+entity keys), and the **body** (the rule itself). Its lineage: the rule shape
+and storage model are **ADR-0004**; the `applicable_linters` resolver is Golden
+Path B (ISI-7813). The Solisol CLI rule schema this body aligns with is credited
+to **Jessica Andersson (Solisol)**.
+
+- **Type** — `fact.type` is `"linter"`.
+- **Subject** — `fact.subject` is the stable `rule_id`. Subject is the
+  supersession grain, so re-storing the same `rule_id` at the same scope
+  **versions** the rule (newest is the live head; history replays via
+  `valid=all` / `as_of`).
+- **Scope** — read off the entity keys, *not* a separate field:
+  - **global** (applies tenant-wide): store **unkeyed** — no `entity.*` keys.
+  - **context** (applies to one project): key the fact on `entity.project`.
+- **Source kind** — both scopes are written over `telemetry_learning`; it is the
+  one source kind whose anchoring tolerates an unkeyed fact, which a global
+  linter needs, and it equally accepts the `entity.project` of a context linter.
+- **Body** — the rule, as structured JSON (below). Stored opaquely in v1: the
+  server neither validates nor enforces the shape, and unknown fields
+  (e.g. extra Solisol keys) are preserved verbatim.
+
+Store a **global** linter (MCP `memory_store`, or `POST /memory/facts`):
+
+```jsonc
+{
+  "source":   { "kind": "telemetry_learning" },
+  "entity":   { },                     // no entity.* keys → global / tenant-floor
+  "fact": {
+    "type":    "linter",
+    "subject": "no-console-log",        // == rule_id; supersession grain
+    "body": {
+      "rule_id":     "no-console-log",  // == fact.subject
+      "title":       "No console.log in committed code",
+      "description": "Use the structured logger; console.log bypasses redaction.",
+      "severity":    "warn",            // error | warn | info  (advisory in v1)
+      "enabled":     true,
+      "scope": {                         // narrowing facets for the resolver/consumer
+        "language":      "typescript",   // omit or "*" = any language
+        "path":          "src/**",       // glob; omit = whole repo
+        "paths_exclude": ["**/*.test.ts"]
+      },
+      "message":  "console.log found — route through logger.info()",
+      "match": {                         // Solisol-compatible matcher block
+        "kind":         "regex",         // regex | ast | semgrep-ref | solisol-ref
+        "pattern":      "console\\.log\\(",
+        "solisol_rule": null             // optional ref into an external Solisol ruleset
+      },
+      "source":   "memkeys",             // "memkeys" | "solisol" — provenance of the rule
+      "fix_hint": "Replace with logger.info(...)."
+    }
+  }
+}
+```
+
+Store a **context** linter by adding the project key; everything else is the
+same:
+
+```jsonc
+{
+  "source": { "kind": "telemetry_learning" },
+  "entity": { "project": "billing-service" },   // keyed → applies to this project
+  "fact":   { "type": "linter", "subject": "require-idempotency-key", "body": { … } }
+}
+```
+
+`severity` is the only body field the resolver interprets (it is lifted out for
+the wire ordering and echoed on each entry); everything else in `body` is
+carried through to consumers untouched. Read a project's linters back directly
+with op 2 (`GET /memory/facts?entity.project=…&type=linter`) — this is the
+management read that is *not* augmented with a second `applicable_linters` block.
 
 **Addressing rule:** `start.id` is the *composite node id*
 `<tenant>|<dotted-kind>|<value>` — for example
