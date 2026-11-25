@@ -2,6 +2,7 @@ import { useState } from 'react';
 import FactsBrowser from './components/FactsBrowser';
 import MemoryGraph from './components/MemoryGraph';
 import ExploreBrowser from './components/ExploreBrowser';
+import LintersBrowser from './components/LintersBrowser';
 import IdentityChip from './components/IdentityChip';
 import LoginPage from './components/LoginPage';
 import { ConfigProvider } from './services/config';
@@ -11,7 +12,7 @@ import './App.css';
 
 // ISI-6581: 'explore' (keyless POST /memory/search) is the default landing
 // tab; the keyed Facts Browser stays as the advanced 'facts' tab.
-type Tab = 'explore' | 'facts' | 'graph';
+type Tab = 'explore' | 'facts' | 'graph' | 'linters';
 
 function AppShell() {
   const { auth } = useAuth();
@@ -47,6 +48,12 @@ function AppShell() {
         >
           Memory Graph
         </button>
+        <button
+          className={`nav-tab ${activeTab === 'linters' ? 'active' : ''}`}
+          onClick={() => setActiveTab('linters')}
+        >
+          Linters
+        </button>
       </nav>
 
       <main className="content">
@@ -55,6 +62,7 @@ function AppShell() {
         )}
         {activeTab === 'facts' && <FactsBrowser />}
         {activeTab === 'graph' && <MemoryGraph />}
+        {activeTab === 'linters' && <LintersBrowser />}
       </main>
     </div>
   );
