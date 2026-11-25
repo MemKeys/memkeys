@@ -3,8 +3,9 @@
 //! graph projection (stage-5a worker dispatch + the bounded graph reads
 //! behind `GraphView`).
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::envelope::Envelope;
 use crate::error::{IngestError, QueryError};
@@ -41,6 +42,104 @@ pub struct IngestReceipt {
     pub duplicate: bool,
 }
 
+/// Default TTL for the resolved-linter cache (ISI-7814, Golden Path C).
+/// Linters change rarely relative to the read rate, so a few-second window
+/// collapses the per-read `list_linters` round-trip into an in-memory lookup
+/// while bounding staleness to the TTL.
+pub const DEFAULT_LINTER_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Soft ceiling on distinct resolved-linter cache entries. When reached, an
+/// insert first sweeps expired entries — a safety valve against unbounded
+/// growth under high project-set cardinality, without a background reaper.
+const LINTER_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Cache key: the verified tenant floor plus the distinct, sorted in-scope
+/// project set (as produced by [`distinct_projects`]). The tenant floor is part
+/// of the key so one tenant can never read another's resolved linters from the
+/// cache (WS-4 Invariant T).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LinterCacheKey {
+    tenant: String,
+    projects: Vec<String>,
+}
+
+struct LinterCacheEntry {
+    linters: Arc<Vec<ResolvedLinter>>,
+    expires_at: Instant,
+}
+
+/// Short-TTL cache of resolved `applicable_linters` sets (ISI-7814, Golden
+/// Path C). Live-head only: a read with an explicit `as_of` is a historical
+/// query and bypasses the cache entirely. Advisory-only v1 (ADR-0004) makes a
+/// block stale by at most the TTL acceptable — nothing blocks on it, so there
+/// is no explicit invalidation on linter writes; the TTL bounds staleness.
+/// `ttl == Duration::ZERO` disables caching (every read resolves fresh).
+struct LinterCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<LinterCacheKey, LinterCacheEntry>>,
+}
+
+impl LinterCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.ttl > Duration::ZERO
+    }
+
+    /// A live, unexpired entry for `(tenant, projects)`, cloning out the shared
+    /// `Arc`. An expired entry is evicted on access so a cold key never lingers.
+    fn get(
+        &self,
+        tenant: &str,
+        projects: &[String],
+        now: Instant,
+    ) -> Option<Arc<Vec<ResolvedLinter>>> {
+        let key = LinterCacheKey {
+            tenant: tenant.to_string(),
+            projects: projects.to_vec(),
+        };
+        let mut map = self.entries.lock().expect("linter cache lock");
+        match map.get(&key) {
+            Some(e) if e.expires_at > now => Some(e.linters.clone()),
+            Some(_) => {
+                map.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(
+        &self,
+        tenant: &str,
+        projects: &[String],
+        linters: Arc<Vec<ResolvedLinter>>,
+        now: Instant,
+    ) {
+        let mut map = self.entries.lock().expect("linter cache lock");
+        // When large, sweep expired entries before inserting so a churn of
+        // distinct project sets cannot grow the map without bound.
+        if map.len() >= LINTER_CACHE_MAX_ENTRIES {
+            map.retain(|_, e| e.expires_at > now);
+        }
+        map.insert(
+            LinterCacheKey {
+                tenant: tenant.to_string(),
+                projects: projects.to_vec(),
+            },
+            LinterCacheEntry {
+                linters,
+                expires_at: now + self.ttl,
+            },
+        );
+    }
+}
+
 /// The M1 service. One instance serves many tenants — the tenant is a per-call
 /// attribute (WS-4 Invariant T), never process state.
 pub struct MemKeysService {
@@ -74,6 +173,10 @@ pub struct MemKeysService {
     extract_worker: Option<Arc<ExtractWorker>>,
     digest_worker: Option<Arc<DigestWorker>>,
     categorize_worker: Option<Arc<CategorizeWorker>>,
+    /// ISI-7814 (Golden Path C): short-TTL cache of resolved `applicable_linters`
+    /// sets so the augmented read adds in-memory lookup time, not a store
+    /// round-trip, to the common live-head fetch/search. See [`LinterCache`].
+    linter_cache: LinterCache,
 }
 
 impl MemKeysService {
@@ -95,6 +198,7 @@ impl MemKeysService {
             extract_worker: None,
             digest_worker: None,
             categorize_worker: None,
+            linter_cache: LinterCache::new(DEFAULT_LINTER_CACHE_TTL),
         }
     }
 
@@ -120,6 +224,7 @@ impl MemKeysService {
             extract_worker: None,
             digest_worker: None,
             categorize_worker: None,
+            linter_cache: LinterCache::new(DEFAULT_LINTER_CACHE_TTL),
         }
     }
 
@@ -143,6 +248,15 @@ impl MemKeysService {
     /// `MEMKEYS_RECENCY_{ALPHA,LAMBDA,CANDIDATES}`.
     pub fn with_recency(mut self, recency: RecencyConfig) -> Self {
         self.recency = recency;
+        self
+    }
+
+    /// ISI-7814 (Golden Path C): set the resolved-linter cache TTL. `main.rs`
+    /// reads `MEMKEYS_LINTER_CACHE_TTL_MS` (default
+    /// [`DEFAULT_LINTER_CACHE_TTL`]); `Duration::ZERO` disables the cache so
+    /// every augmented read resolves fresh. Fluent.
+    pub fn with_linter_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.linter_cache = LinterCache::new(ttl);
         self
     }
 
@@ -1026,7 +1140,47 @@ impl MemKeysService {
     /// then by severity (error → warn → info → unknown), then by `rule_id` for
     /// determinism. Advisory-only v1 — nothing here blocks or enforces, and the
     /// block is additive so callers ignoring it are unaffected.
+    ///
+    /// ISI-7814 (Golden Path C): the live-head resolution (`as_of = None`) is
+    /// served through a short-TTL [`LinterCache`] so the augmented read adds an
+    /// in-memory lookup — not a store round-trip — to the common fetch/search.
+    /// A historical read (`as_of = Some`) always resolves fresh.
     pub async fn resolve_applicable_linters(
+        &self,
+        caller_tenant: &str,
+        projects: &[String],
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<ResolvedLinter>, QueryError> {
+        // Only the live head is cacheable: a historical `as_of` is a distinct,
+        // rare query whose result must not be keyed by time into the cache.
+        let cacheable = as_of.is_none() && self.linter_cache.enabled();
+        if cacheable {
+            let now = Instant::now();
+            if let Some(hit) = self.linter_cache.get(caller_tenant, projects, now) {
+                self.instruments.linter_cache_hit();
+                return Ok((*hit).clone());
+            }
+        }
+        let linters = self
+            .resolve_applicable_linters_uncached(caller_tenant, projects, as_of)
+            .await?;
+        if cacheable {
+            self.instruments.linter_cache_miss();
+            self.linter_cache.put(
+                caller_tenant,
+                projects,
+                Arc::new(linters.clone()),
+                Instant::now(),
+            );
+        }
+        Ok(linters)
+    }
+
+    /// The uncached resolution — one [`FactStore::list_linters`] round-trip plus
+    /// the de-dup and global-first-then-severity ordering. Split out so the
+    /// cache wrapper in [`resolve_applicable_linters`](Self::resolve_applicable_linters)
+    /// stays legible; benches call it directly to measure the cold overhead.
+    pub async fn resolve_applicable_linters_uncached(
         &self,
         caller_tenant: &str,
         projects: &[String],
@@ -1828,6 +1982,63 @@ mod tests {
                 .all(|l| l.record.subject.as_deref() != Some("c-other")),
             "an out-of-scope project's linter must not resolve"
         );
+    }
+
+    /// Golden Path C (ISI-7814): the live-head resolution is cached per
+    /// (tenant, project-set) for the TTL, so a linter stored *after* the first
+    /// resolve is not seen until the entry expires — proving the second read
+    /// served from cache without a fresh `list_linters`. A `Duration::ZERO` TTL
+    /// disables the cache (every read is fresh), and a historical `as_of` read
+    /// bypasses the cache entirely.
+    #[tokio::test]
+    async fn linter_cache_serves_live_head_within_ttl() {
+        let store = Arc::new(MemStore::new());
+
+        let mut g1 = pf(1, "t", "r", r#"{"rule_id":"g1","severity":"warn"}"#);
+        g1.fact_type = FactType::Linter;
+        g1.entity = EntityKeys::default();
+        g1.keyed = false;
+        g1.subject = Some("g1".into());
+        store.commit_fact(&g1).await.unwrap();
+
+        // Default (5 s) cache: first resolve populates the entry.
+        let svc = MemKeysService::new(store.clone());
+        let first = svc
+            .resolve_applicable_linters("t", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1, "one global linter at first resolve");
+
+        // A second global linter lands AFTER the first resolve cached its set.
+        let mut g2 = pf(2, "t", "r", r#"{"rule_id":"g2","severity":"error"}"#);
+        g2.fact_type = FactType::Linter;
+        g2.entity = EntityKeys::default();
+        g2.keyed = false;
+        g2.subject = Some("g2".into());
+        store.commit_fact(&g2).await.unwrap();
+
+        // Within the TTL the cached (stale) set is served — no store round-trip.
+        let cached = svc
+            .resolve_applicable_linters("t", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(cached.len(), 1, "live-head read served the cached set");
+
+        // A historical read (`as_of = Some`) bypasses the cache: it sees both.
+        let historical = svc
+            .resolve_applicable_linters("t", &[], Some(Utc::now() + chrono::Duration::hours(1)))
+            .await
+            .unwrap();
+        assert_eq!(historical.len(), 2, "historical read bypasses the cache");
+
+        // A cache-disabled service (TTL 0) over the same store always resolves
+        // fresh — it sees both global linters.
+        let fresh_svc = MemKeysService::new(store.clone()).with_linter_cache_ttl(Duration::ZERO);
+        let fresh = fresh_svc
+            .resolve_applicable_linters("t", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.len(), 2, "disabled cache resolves fresh every read");
     }
 
     #[tokio::test]
