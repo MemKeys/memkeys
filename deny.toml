@@ -14,7 +14,13 @@ yanked = "deny"
 # unmaintained dependency declared directly in the workspace fails the
 # check. Real vulnerabilities and yanked crates always fail.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  # chrono is unmaintained (RUSTSEC-2026-0543). It is a direct workspace
+  # dependency and used pervasively across memkeys-server, so there is no
+  # feasible migration right now; accept the unmaintained advisory rather
+  # than fail the build. Same posture as the async-std note above.
+  "RUSTSEC-2026-0543",
+]
 
 # --- bans -----------------------------------------------------------------
 [bans]
