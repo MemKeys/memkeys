@@ -80,6 +80,18 @@ Age is measured from the read's point-in-time viewpoint
 (`reference_time = as_of` when set, else now), so an `as_of` query scores
 "recent" as of that historical time — not relative to wall-clock now.
 
+## Linter cache
+
+The augmented read (ISI-7813) folds an `applicable_linters` block into
+fetch/search responses. The resolved set per `(tenant, in-scope project set)`
+is cached for a short TTL so the attachment adds an in-memory lookup — not a
+`list_linters` store round-trip — to the common live-head read (Golden Path C,
+ISI-7814).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMKEYS_LINTER_CACHE_TTL_MS` | `5000` | TTL (milliseconds) for the resolved-linter cache. Linters change rarely relative to the read rate, so a few-second window bounds staleness while removing the per-read round-trip. Advisory-only v1 (ADR-0004) tolerates a block stale by at most the TTL — nothing blocks on it, so there is no write-time invalidation. `0` disables the cache (every read resolves fresh). Historical reads (`as_of` set) always bypass the cache. |
+
 ## Database pool
 
 | Variable | Default | Purpose |

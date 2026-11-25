@@ -250,6 +250,9 @@ const ALLOWED_ATTR_KEYS: &[&str] = &[
     "memkeys.projection.kind",
     "memkeys.graph.depth",
     "memkeys.graph.truncate.reason",
+    // ISI-7814 (Golden Path C): resolved-linter cache outcome — a bounded enum
+    // `hit|miss`, never a tenant/project value (the deny-list still holds).
+    "memkeys.linter.cache.result",
     // M3 protocol surface (WS-5 §2/§7): the transport the request arrived on
     // and the MCP tool name. Kinds/names only — never argument VALUES (the
     // deny-list still holds: no bodies, no entity-key values, no query text).
@@ -435,6 +438,10 @@ pub struct Instruments {
     memory_recall_top_similarity: opentelemetry::metrics::Histogram<f64>,
     memory_items: opentelemetry::metrics::Counter<u64>,
     memory_bytes: opentelemetry::metrics::Counter<u64>,
+    /// ISI-7814: resolved-linter cache outcomes (`result = hit|miss`). The
+    /// hit-rate observes whether the short TTL is holding the augmented-read
+    /// overhead off the `list_linters` store round-trip.
+    linter_cache_ops: opentelemetry::metrics::Counter<u64>,
 }
 
 impl Instruments {
@@ -575,7 +582,29 @@ impl Instruments {
                      memory_bytes_total.",
                 )
                 .build(),
+            linter_cache_ops: meter
+                .u64_counter("memkeys.linter.cache.ops")
+                .with_unit("{operation}")
+                .with_description(
+                    "Resolved-linter cache lookups, labelled result=hit|miss \
+                     (ISI-7814 Golden Path C). A high hit rate confirms the \
+                     short TTL is keeping the augmented read off the \
+                     list_linters store round-trip.",
+                )
+                .build(),
         }
+    }
+
+    /// ISI-7814: record one resolved-linter cache lookup outcome.
+    pub fn linter_cache_hit(&self) {
+        self.linter_cache_ops
+            .add(1, &[attr("memkeys.linter.cache.result", "hit")]);
+    }
+
+    /// ISI-7814: record one resolved-linter cache miss (resolved fresh).
+    pub fn linter_cache_miss(&self) {
+        self.linter_cache_ops
+            .add(1, &[attr("memkeys.linter.cache.result", "miss")]);
     }
 
     pub fn write_operation(&self, entity_kind: &'static str, outcome: &'static str) {
