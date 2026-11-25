@@ -1,14 +1,24 @@
 import axios, { AxiosInstance } from 'axios';
 import {
   APIError,
+  ApplicableLinter,
   FactsQuery,
   FactsResponse,
+  IngestReceipt,
+  LinterDraft,
+  LinterRecord,
   TraverseRequest,
   TraverseResult,
   SearchQuery,
   SearchResponse,
 } from '../types/api';
 import { buildQueryParams, buildSearchBody } from '../lib/transform';
+import {
+  applicableToLinter,
+  buildLinterEnvelope,
+  factRecordToLinter,
+  mergeLinters,
+} from '../lib/linters';
 
 // All reads go through the `/memory` prefix. In dev, vite proxies this to the
 // server (see vite.config.ts); in a deployed build the SPA is served from the
@@ -97,6 +107,92 @@ export const factsAPI = {
       return data;
     } catch (error) {
       throw toAPIError(error, 'Failed to fetch facts');
+    }
+  },
+};
+
+export const lintersAPI = {
+  /**
+   * List the linters a management view shows. The four-op HTTP surface has no
+   * keyless linter listing (op-2 rejects a keyless query; op-4 excludes linters
+   * as policy-not-recall, ISI-7813), so listing is keyed on a project:
+   *
+   *   - **project scope** — `GET /memory/facts?type=linter&entity.project=P`
+   *     returns the project's linter facts as full {@link FactRecord}s.
+   *   - **global (tenant-floor) scope** — reachable only through the
+   *     `applicable_linters` resolver block, folded into a non-`type=linter`
+   *     keyed read; we take the `scope:"global"` entries from it.
+   *
+   * Both calls key on `project`, so a project context is required to enumerate
+   * (the global linters returned are the tenant floor, independent of P). The
+   * two sources are de-duplicated by fact id (FactRecords win) and merged.
+   */
+  async fetchLinters(project: string, auth: AuthConfig): Promise<LinterRecord[]> {
+    const p = project.trim();
+    if (p === '') {
+      throw {
+        error:
+          'A project is required to list linters: the four-op surface has no keyless linter listing (op-2 rejects a keyless query; op-4 excludes linters). Enter a project to key the fetch; global linters are returned via its applicable_linters block.',
+        code: '400',
+        retriable: false,
+      } as APIError;
+    }
+
+    // Project linters (full FactRecord detail).
+    const projectRecords = await (async () => {
+      try {
+        const { data } = await client.get<FactsResponse>('/facts', {
+          params: { type: 'linter', valid: 'current', limit: '100', 'entity.project': p },
+          headers: authHeaders(auth),
+        });
+        return data.facts.map(factRecordToLinter);
+      } catch (error) {
+        throw toAPIError(error, 'Failed to load project linters');
+      }
+    })();
+
+    // Global linters via the applicable_linters resolver. A tiny untyped keyed
+    // read triggers the fold-in; its own facts are ignored. Global linters are
+    // always in the resolver output regardless of the probe's returned records.
+    const globalRecords = await (async () => {
+      try {
+        const { data } = await client.get<{ applicable_linters?: ApplicableLinter[] }>('/facts', {
+          params: { valid: 'current', limit: '1', 'entity.project': p },
+          headers: authHeaders(auth),
+        });
+        return (data.applicable_linters ?? [])
+          .filter((e) => e.scope === 'global')
+          .map(applicableToLinter);
+      } catch (error) {
+        throw toAPIError(error, 'Failed to load global linters');
+      }
+    })();
+
+    return mergeLinters(projectRecords, globalRecords);
+  },
+
+  /**
+   * Create / edit / enable-disable a linter (op-1 `POST /memory/facts`). The
+   * draft's `supersedes` (set on edit and on enable-disable) versions the rule;
+   * `now`/`idemSuffix` make a retried write idempotent. Surfaces the server's
+   * {error, code, retriable} on 4xx (422 validation, 409 stale supersedes, 401
+   * clears the session via the shared interceptor).
+   */
+  async storeLinter(
+    draft: LinterDraft,
+    now: string,
+    idemSuffix: string,
+    auth: AuthConfig,
+  ): Promise<IngestReceipt> {
+    try {
+      const { data } = await client.post<IngestReceipt>(
+        '/facts',
+        buildLinterEnvelope(draft, now, idemSuffix),
+        { headers: authHeaders(auth) },
+      );
+      return data;
+    } catch (error) {
+      throw toAPIError(error, 'Failed to store linter');
     }
   },
 };
