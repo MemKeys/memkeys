@@ -75,6 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         graph.clone(),
     );
 
+    // ISI-7814 (Golden Path C): short-TTL cache of resolved `applicable_linters`
+    // sets. Linters change rarely vs the read rate, so a few-second window keeps
+    // the augmented read off the `list_linters` round-trip. `..._MS = 0` disables
+    // the cache (resolve fresh every read); default 5 s.
+    let linter_cache_ttl = std::time::Duration::from_millis(env_usize(
+        "MEMKEYS_LINTER_CACHE_TTL_MS",
+        memkeys_server::service::DEFAULT_LINTER_CACHE_TTL.as_millis() as usize,
+    ) as u64);
+    service = service.with_linter_cache_ttl(linter_cache_ttl);
+    tracing::info!(
+        target: "memkeys",
+        ttl_ms = linter_cache_ttl.as_millis() as u64,
+        "memkeys.linter.cache: resolved applicable_linters cached per (tenant, project-set)"
+    );
+
     // M5: the optional semantic module (§5.4.2 "optional, activates on demand").
     // `MEMKEYS_SEMANTIC` truthy wires the fact-vector read path (embedder +
     // pgvector index) AND the stage-5b projection worker; otherwise op-4 keeps

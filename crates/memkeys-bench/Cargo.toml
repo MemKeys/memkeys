@@ -25,6 +25,12 @@ criterion = "0.5"
 name = "hot_paths"
 harness = false
 
+# ISI-7814 (Golden Path C): the augmented-read SLO bench — proves the
+# `applicable_linters` attachment adds < 10 ms p95 over the base fetch/search.
+[[bench]]
+name = "augmented_read"
+harness = false
+
 [[bin]]
 name = "write-bench"
 path = "src/bin/write-bench.rs"
